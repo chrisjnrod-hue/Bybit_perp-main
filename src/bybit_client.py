@@ -1,17 +1,21 @@
+"""
+Bybit REST client with robust GET handling, v5/v2 symbol fallbacks,
+rate-limited requests, and retries/backoff.
 
+Ready-to-paste file: src/bybit_client.py
+"""
 import time
 import hmac
 import hashlib
-import urllib.parse
 from typing import List, Dict, Any, Optional
 import asyncio
 import aiohttp
-from decimal import Decimal
 from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS
 from .logger import get_logger
 from .ratelimiter import TokenBucket
 
 logger = get_logger("bybit")
+
 
 class BybitClient:
     def __init__(self, rate_limiter: Optional[TokenBucket] = None):
@@ -27,7 +31,11 @@ class BybitClient:
         self._max_retries = 4
         self._backoff_base = 1.0  # seconds
         # rate limiter: if not provided, create one from RATE_LIMIT_RPS
-        self.rate_limiter = rate_limiter or TokenBucket(max(1.0, float(RATE_LIMIT_RPS)))
+        try:
+            rate_val = float(RATE_LIMIT_RPS)
+        except Exception:
+            rate_val = 5.0
+        self.rate_limiter = rate_limiter or TokenBucket(max(1.0, rate_val))
 
     async def _session_obj(self):
         if not self._session:
@@ -40,6 +48,9 @@ class BybitClient:
             self._session = None
 
     async def _get(self, path: str, params: Dict[str, Any] = None, timeout=15):
+        """
+        Robust GET with rate-limiting, retries, backoff, and detailed logging on non-JSON bodies.
+        """
         session = await self._session_obj()
         url = self.rest_base + path
         for attempt in range(self._max_retries):
@@ -47,20 +58,24 @@ class BybitClient:
             await self.rate_limiter.acquire()
             try:
                 async with session.get(url, params=params, timeout=timeout) as resp:
-                    text = await resp.text()
                     status = resp.status
+                    text = await resp.text()
+                    # handle rate limit / server errors with backoff
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
                         logger.warning("HTTP %s from %s, backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
                         await asyncio.sleep(wait)
                         continue
+                    # Attempt JSON decode but on failure log full body for debugging
                     try:
                         data = await resp.json()
                     except Exception:
-                        logger.debug("Non-json response from %s: %s", url, text[:400])
+                        logger.warning("Non-JSON or unexpected response from %s (status=%s). Body:\n%s",
+                                       url, status, (text[:2000] + '...') if len(text) > 2000 else text)
+                        # Raise so caller can decide fallback behavior
                         raise
                     if status >= 400:
-                        logger.error("GET %s returned %s: %s", url, status, text[:400])
+                        logger.error("GET %s returned %s: %s", url, status, (text[:400] + "...") if len(text) > 400 else text)
                         raise Exception(f"HTTP {status}")
                     return data
             except asyncio.CancelledError:
@@ -75,11 +90,19 @@ class BybitClient:
         raise Exception("unreachable")
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
+        """
+        Return list of instruments/symbols.
+        Try v5 first (preferred), then fallback to v2.
+        """
+        # Try v5 endpoint using params (don't embed querystring in path)
         try:
-            data = await self._get("/v5/market/instruments?category=linear&instrumentType=PERPETUAL")
+            params = {"category": "linear", "instrumentType": "PERPETUAL"}
+            data = await self._get("/v5/market/instruments", params=params)
             if data and isinstance(data, dict):
+                # some v5 responses have ret_code / result
                 if data.get("ret_code", 0) == 0 and "result" in data:
                     res = data["result"]
+                    # result can be dict with 'list' or a list directly
                     if isinstance(res, dict) and isinstance(res.get("list"), list):
                         instruments = res.get("list", [])
                     elif isinstance(res, list):
@@ -88,16 +111,27 @@ class BybitClient:
                         instruments = []
                     logger.info("Found %d instruments via v5", len(instruments))
                     return instruments
-        except Exception:
-            logger.debug("v5 instruments endpoint failed; falling back to v2 symbols.")
+                # sometimes BYBIT returns different success shape, try to extract 'result' anyway
+                if "result" in data and isinstance(data["result"], (list, dict)):
+                    logger.info("Found instruments via v5 (non-standard shape)")
+                    return data["result"]
+            # If data is None or unexpected, log and fall through to v2
+            logger.debug("v5 instruments response unexpected: %s", str(data)[:400])
+        except Exception as e:
+            logger.debug("v5 instruments endpoint failed: %s", e)
+
+        # Fallback to v2
         try:
             data = await self._get("/v2/public/symbols")
             if data and isinstance(data, dict) and "result" in data:
                 symbols = data["result"] or []
                 logger.info("Found %d symbols via v2", len(symbols))
                 return symbols
-        except Exception:
-            logger.exception("Failed to fetch symbols from v2 endpoint.")
+            # If the response is not as expected, log the raw response for debugging
+            logger.debug("v2 symbols response unexpected: %s", str(data)[:800])
+        except Exception as e:
+            logger.exception("Failed to fetch symbols from v2 endpoint: %s", e)
+
         return []
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:

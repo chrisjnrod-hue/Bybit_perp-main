@@ -1,6 +1,7 @@
 """
 Async Telegram helper for sending messages and simple health checks.
-Uses aiohttp and supports retries + backoff and clear logging of 401 Unauthorized.
+Provides a module-level async send_message(...) function so other modules
+can import `send_message` directly: `from src.telegram import send_message`.
 """
 import asyncio
 import aiohttp
@@ -36,9 +37,6 @@ class TelegramClient:
         return f"https://api.telegram.org/bot{self.token}"
 
     async def get_me(self) -> Dict[str, Any]:
-        """
-        Call getMe to validate the bot token. Returns parsed JSON on success.
-        """
         session = await self._session_obj()
         url = f"{self._base_url()}/getMe"
         async with session.get(url, timeout=10) as resp:
@@ -66,17 +64,14 @@ class TelegramClient:
                     try:
                         j = await resp.json()
                     except Exception:
-                        # log the non-json body for diagnosis
                         logger.warning("Telegram non-JSON response status=%s body=%s", status, text_body[:1000])
                         raise
                     if status == 401:
-                        # Unauthorized: bad token
                         logger.error("Telegram unauthorized (401). Check TELEGRAM_BOT_TOKEN.")
                         raise Exception("Telegram Unauthorized (401)")
                     if status >= 400:
                         logger.error("Telegram send failed status=%s response=%s", status, j)
                         raise Exception(f"Telegram send failed: {j}")
-                    # success
                     logger.info("Telegram message sent to %s", cid)
                     return j
             except asyncio.CancelledError:
@@ -90,7 +85,8 @@ class TelegramClient:
                 await asyncio.sleep(wait)
         raise Exception("unreachable")
 
-# convenience module-level client
+
+# module-level convenience client + function so other modules can import send_message directly
 _client: Optional[TelegramClient] = None
 
 
@@ -99,3 +95,12 @@ def get_client() -> TelegramClient:
     if _client is None:
         _client = TelegramClient()
     return _client
+
+
+async def send_message(text: str, chat_id: Optional[str] = None, parse_mode: str = "MarkdownV2") -> Dict[str, Any]:
+    """
+    Module-level async function for backwards compatibility:
+      from src.telegram import send_message
+    """
+    client = get_client()
+    return await client.send_message(text, chat_id=chat_id, parse_mode=parse_mode)

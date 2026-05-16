@@ -1,3 +1,4 @@
+# core dependencies pinned for Python 3.11 (wheels available)
 aiohttp==3.8.4
-python-dotenv==1.0.0
 websockets==11.0.3
+python-dotenv==1.0.0

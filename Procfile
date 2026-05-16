@@ -1,2 +1,1 @@
-
-web: python -m src.main
+worker: python -m src.main

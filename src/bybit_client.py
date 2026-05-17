@@ -1,17 +1,17 @@
 """
-BybitClient with REST + WebSocket kline support.
+BybitClient with REST + resilient WebSocket kline support.
 
-Features:
-- REST: get_symbols, get_klines, get_latest_price, get_symbol_info, get_balance, create_order (defensive).
-- WS: start_kline_ws(), stop_kline_ws(), subscribe_klines_for_symbols(symbols, tfs) [used for ROOT_TFS],
-      subscribe_mtf_for_symbol(symbol, mtfs) for on-demand MTF subscription,
-      get_ws_klines(symbol, tf) and get_ws_latest_kline(symbol, tf) for accessing in-memory cache.
+This version tolerates handshake 404s by trying multiple WS endpoints,
+logs clearly when WS can't connect, and keeps retrying with backoff.
+REST methods (get_symbols, get_klines, get_latest_price, get_symbol_info)
+are unchanged and defensive.
 """
 import asyncio
 import json
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import aiohttp
+from aiohttp import client_exceptions
 from collections import defaultdict, deque
 import traceback
 
@@ -33,8 +33,13 @@ class BybitClient:
             mainnet_flag = True
 
         self.rest_base = "https://api.bybit.com" if mainnet_flag else "https://api-testnet.bybit.com"
-        self.ws_public = "wss://stream.bybit.com/realtime_public" if mainnet_flag else "wss://stream-testnet.bybit.com/realtime_public"
-        logger.info("BybitClient rest_base=%s ws_public=%s", self.rest_base, self.ws_public)
+        # base host for WS; actual path variants will be tried
+        host = "stream.bybit.com" if mainnet_flag else "stream-testnet.bybit.com"
+        self.ws_hosts = [
+            f"wss://{host}/realtime_public",
+            f"wss://{host}/realtime",
+        ]
+        logger.info("BybitClient rest_base=%s ws_hosts=%s", self.rest_base, self.ws_hosts)
 
         self.api_key = BYBIT_API_KEY
         self.api_secret = BYBIT_API_SECRET
@@ -47,21 +52,18 @@ class BybitClient:
             rate_val = 5.0
         self.rate_limiter = rate_limiter or TokenBucket(max(1.0, rate_val))
 
-        # WS state
+        # WS runtime
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_session: Optional[aiohttp.ClientSession] = None
         self._pending_subscribe: asyncio.Queue = asyncio.Queue()
-        # cache: symbol -> tf -> deque of normalized klines
         self._kline_cache: Dict[str, Dict[str, deque]] = defaultdict(dict)
-        # requested subscriptions set (symbol,tf)
         self._requested_subs: set = set()
-        # mtf subscriptions per symbol to avoid re-queuing
         self._mtf_subscribed: set = set()
         self._ws_stop = False
         self._ws_backoff = 1.0
 
-    # ---------------- REST helpers ----------------
+    # ---------------- REST helpers (unchanged) ----------------
     async def _session_obj(self) -> aiohttp.ClientSession:
         if not self._session:
             self._session = aiohttp.ClientSession()
@@ -303,7 +305,7 @@ class BybitClient:
         logger.error("create_order: API keys present but create_order is not implemented for live orders. Implement signing or disable.")
         raise NotImplementedError("create_order is not implemented for live orders in BybitClient. Implement signed order placement.")
 
-    # ---------------- WebSocket support ----------------
+    # ---------------- WebSocket support (resilient) ----------------
     async def start_kline_ws(self) -> None:
         if self._ws_task and not self._ws_task.done():
             logger.debug("WS task already running")
@@ -340,9 +342,6 @@ class BybitClient:
         logger.info("Stopped Bybit WS")
 
     async def subscribe_klines_for_symbols(self, symbols: List[str], tfs: List[str]) -> None:
-        """
-        Queue subscribe requests for symbol x tf combinations (used for ROOT_TFS at startup).
-        """
         if not symbols or not tfs:
             return
         for sym in symbols:
@@ -355,9 +354,6 @@ class BybitClient:
         logger.info("Queued subscribe requests for %d symbols x %d tfs", len(symbols), len(tfs))
 
     async def subscribe_mtf_for_symbol(self, symbol: str, mtfs: List[str]) -> None:
-        """
-        Subscribe to MTFs for a single symbol on-demand. Avoids re-subscribing same symbol/mtf pair.
-        """
         symbol = symbol.upper()
         if not mtfs:
             return
@@ -402,51 +398,9 @@ class BybitClient:
                 out.append(t)
         return out
 
-    async def _send_subscribe(self, op: str, topic: str) -> bool:
-        if not self._ws:
-            return False
-        try:
-            msg = {"op": "subscribe", "args": [topic]} if op == "subscribe" else {"op": "unsubscribe", "args": [topic]}
-            await self._ws.send_json(msg)
-            return True
-        except Exception:
-            logger.debug("Failed to send subscribe/unsubscribe %s", topic, exc_info=True)
-            return False
-
-    def _ensure_cache_slot(self, symbol: str, tf: str):
-        symbol = symbol.upper()
-        if tf not in self._kline_cache.get(symbol, {}):
-            maxlen = max(100, int(KLINE_SEED_LIMIT) if isinstance(KLINE_SEED_LIMIT, int) and KLINE_SEED_LIMIT > 0 else 300)
-            self._kline_cache.setdefault(symbol, {})[tf] = deque(maxlen=maxlen)
-
-    def _normalize_ws_kline_item(self, raw: Dict[str, Any], tf: str) -> Optional[Dict[str, Any]]:
-        if not isinstance(raw, dict):
-            return None
-        start = raw.get("start_at") or raw.get("start") or raw.get("t") or raw.get("open_time") or raw.get("timestamp")
-        close = raw.get("close") or raw.get("close_price") or raw.get("c") or raw.get("last_price")
-        vol = raw.get("volume") or raw.get("vol") or raw.get("v") or raw.get("turnover")
-        is_closed = raw.get("is_closed") or raw.get("isClosed") or raw.get("isFinal") or raw.get("confirm")
-        try:
-            if start is not None:
-                start = int(start)
-        except Exception:
-            start = None
-        try:
-            if close is not None:
-                close = float(close)
-        except Exception:
-            close = None
-        try:
-            if vol is not None:
-                vol = float(vol)
-        except Exception:
-            vol = None
-        return {"start_at": start, "close": close, "volume": vol, "is_closed": is_closed}
-
     async def _handle_ws_message(self, msg: Dict[str, Any]):
         try:
             if msg.get("success") is not None and "request" in msg:
-                # subscription ack etc
                 return
             if "ping" in msg:
                 try:
@@ -492,83 +446,133 @@ class BybitClient:
         except Exception:
             logger.exception("Error handling WS message: %s", traceback.format_exc())
 
+    def _ensure_cache_slot(self, symbol: str, tf: str):
+        symbol = symbol.upper()
+        if tf not in self._kline_cache.get(symbol, {}):
+            maxlen = max(100, int(KLINE_SEED_LIMIT) if isinstance(KLINE_SEED_LIMIT, int) and KLINE_SEED_LIMIT > 0 else 300)
+            self._kline_cache.setdefault(symbol, {})[tf] = deque(maxlen=maxlen)
+
+    def _normalize_ws_kline_item(self, raw: Dict[str, Any], tf: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        start = raw.get("start_at") or raw.get("start") or raw.get("t") or raw.get("open_time") or raw.get("timestamp")
+        close = raw.get("close") or raw.get("close_price") or raw.get("c") or raw.get("last_price")
+        vol = raw.get("volume") or raw.get("vol") or raw.get("v") or raw.get("turnover")
+        is_closed = raw.get("is_closed") or raw.get("isClosed") or raw.get("isFinal") or raw.get("confirm")
+        try:
+            if start is not None:
+                start = int(start)
+        except Exception:
+            start = None
+        try:
+            if close is not None:
+                close = float(close)
+        except Exception:
+            close = None
+        try:
+            if vol is not None:
+                vol = float(vol)
+        except Exception:
+            vol = None
+        return {"start_at": start, "close": close, "volume": vol, "is_closed": is_closed}
+
     async def _ws_loop(self):
+        """
+        Connect attempts:
+         - Try each host/path in self.ws_hosts in order.
+         - If handshake (404 or other) occurs, try next host.
+         - If none succeed, back off and retry.
+        """
         while not self._ws_stop:
-            try:
-                if not self._ws_session:
-                    self._ws_session = aiohttp.ClientSession()
-                logger.info("Connecting to Bybit WS %s", self.ws_public)
-                async with self._ws_session.ws_connect(self.ws_public, heartbeat=30) as ws:
-                    self._ws = ws
-                    self._ws_backoff = 1.0
-                    logger.info("Bybit WS connected")
-                    # drain pending_subscribe
-                    pending = []
-                    while not self._pending_subscribe.empty():
-                        try:
-                            pending.append(self._pending_subscribe.get_nowait())
-                        except Exception:
-                            break
-                    # ensure requested_subs are also queued
-                    for (sym, tf) in list(self._requested_subs):
-                        pending.append(("subscribe", sym, tf))
-                    # build topics and send subscribe messages
-                    for op, sym, tf in pending:
-                        for topic in self._candidate_topics(sym, tf):
-                            try:
-                                await ws.send_json({"op": op, "args": [topic]})
-                                logger.debug("Sent WS %s request for topic=%s", op, topic)
-                            except Exception:
-                                logger.debug("Failed sending subscribe for %s", topic, exc_info=True)
+            connected = False
+            for ws_url in self.ws_hosts:
+                try:
+                    if not self._ws_session:
+                        self._ws_session = aiohttp.ClientSession()
+                    logger.info("Attempting WS connect to %s", ws_url)
+                    async with self._ws_session.ws_connect(ws_url, heartbeat=30) as ws:
+                        self._ws = ws
+                        self._ws_backoff = 1.0
+                        connected = True
+                        logger.info("Bybit WS connected to %s", ws_url)
 
-                    async def ping_loop():
-                        try:
-                            while True:
-                                await asyncio.sleep(20)
+                        # drain pending subscriptions and send subscribe requests
+                        pending = []
+                        while not self._pending_subscribe.empty():
+                            try:
+                                pending.append(self._pending_subscribe.get_nowait())
+                            except Exception:
+                                break
+                        for (sym, tf) in list(self._requested_subs):
+                            pending.append(("subscribe", sym, tf))
+                        for op, sym, tf in pending:
+                            for topic in self._candidate_topics(sym, tf):
                                 try:
-                                    await ws.send_json({"op": "ping"})
+                                    await ws.send_json({"op": op, "args": [topic]})
+                                    logger.debug("Sent WS %s request for topic=%s", op, topic)
                                 except Exception:
-                                    break
-                        except asyncio.CancelledError:
-                            return
+                                    logger.debug("Failed sending subscribe for %s", topic, exc_info=True)
 
-                    ping_task = asyncio.create_task(ping_loop())
-
-                    async for raw in ws:
-                        if raw.type == aiohttp.WSMsgType.TEXT:
+                        async def ping_loop():
                             try:
-                                msg = json.loads(raw.data)
-                            except Exception:
-                                logger.debug("Non-JSON WS message: %s", raw.data[:400])
-                                continue
-                            await self._handle_ws_message(msg)
-                        elif raw.type == aiohttp.WSMsgType.ERROR:
-                            logger.error("WS error frame: %s", raw)
-                            break
-                        elif raw.type == aiohttp.WSMsgType.CLOSED:
-                            logger.info("WS closed by server")
-                            break
+                                while True:
+                                    await asyncio.sleep(20)
+                                    try:
+                                        await ws.send_json({"op": "ping"})
+                                    except Exception:
+                                        break
+                            except asyncio.CancelledError:
+                                return
 
+                        ping_task = asyncio.create_task(ping_loop())
+
+                        async for raw in ws:
+                            if raw.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    msg = json.loads(raw.data)
+                                except Exception:
+                                    logger.debug("Non-JSON WS message: %s", raw.data[:400])
+                                    continue
+                                await self._handle_ws_message(msg)
+                            elif raw.type == aiohttp.WSMsgType.ERROR:
+                                logger.error("WS error frame: %s", raw)
+                                break
+                            elif raw.type == aiohttp.WSMsgType.CLOSED:
+                                logger.info("WS closed by server")
+                                break
+
+                        try:
+                            ping_task.cancel()
+                        except Exception:
+                            pass
+                except client_exceptions.WSServerHandshakeError as wh:
+                    # handshake failure (e.g. 404); try next url
+                    logger.warning("Bybit WS handshake failed for %s: %s", ws_url, getattr(wh, 'message', repr(wh)))
+                    continue
+                except asyncio.CancelledError:
+                    logger.info("WS loop cancelled")
+                    return
+                except Exception:
+                    logger.exception("Bybit WS connection error when connecting to %s", ws_url)
+                    continue
+                finally:
                     try:
-                        ping_task.cancel()
+                        if self._ws and not self._ws.closed:
+                            await self._ws.close()
                     except Exception:
                         pass
+                    self._ws = None
 
-            except asyncio.CancelledError:
-                logger.info("WS loop cancelled")
-                break
-            except Exception:
-                logger.exception("Bybit WS connection error, backing off %.1fs", self._ws_backoff)
+                if connected:
+                    # exited cleanly from connection loop; break host trial loop and retry connecting same hosts after backoff if necessary
+                    break
+
+            if not connected:
+                logger.error("Bybit WS: none of the WS endpoints accepted connection; backing off %.1fs before retrying", self._ws_backoff)
                 await asyncio.sleep(self._ws_backoff)
                 self._ws_backoff = min(self._ws_backoff * 2.0, 120.0)
                 continue
-            finally:
-                try:
-                    if self._ws and not self._ws.closed:
-                        await self._ws.close()
-                except Exception:
-                    pass
-                self._ws = None
+
         logger.info("Exiting WS loop")
 
     # ------------- WS cache accessors -------------
@@ -582,7 +586,6 @@ class BybitClient:
             return []
 
     def get_ws_latest_kline(self, symbol: str, tf: str) -> Optional[Dict[str, Any]]:
-        # synchronous accessor (safe to call from sync code)
         try:
             c = self._kline_cache.get(symbol.upper(), {}).get(tf, None)
             if not c:

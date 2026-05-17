@@ -1,16 +1,13 @@
 """
-Bybit REST client updated to use v5 /v5/market/instruments-info per docs screenshot,
-and automatically chooses mainnet vs testnet from MAINNET config.
-
-Provides robust _get with rate-limiter, retries, JSON/body logging, and a safe get_symbols.
+Defensive Bybit client using v5 /v5/market/instruments-info (per your docs) with v2 fallback.
+- Automatically picks mainnet/testnet from MAINNET env.
+- _get returns parsed JSON dict or None on non-JSON / error (does NOT raise),
+  so callers can gracefully fallback and scanner won't exit.
+- get_symbols returns list (possibly empty) rather than raising.
 """
-import time
-import hmac
-import hashlib
 import asyncio
 from typing import List, Dict, Any, Optional
 import aiohttp
-
 from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS
 from .logger import get_logger
 from .ratelimiter import TokenBucket
@@ -20,8 +17,6 @@ logger = get_logger("bybit_client")
 
 class BybitClient:
     def __init__(self, rate_limiter: Optional[TokenBucket] = None):
-        # choose base automatically
-        # Accept MAINNET as bool or string ('true'/'false')
         try:
             if isinstance(MAINNET, str):
                 mainnet_flag = MAINNET.strip().lower() in ("1", "true", "yes", "y")
@@ -29,16 +24,13 @@ class BybitClient:
                 mainnet_flag = bool(MAINNET)
         except Exception:
             mainnet_flag = True
-        if mainnet_flag:
-            self.rest_base = "https://api.bybit.com"
-        else:
-            self.rest_base = "https://api-testnet.bybit.com"
-        logger.info("BybitClient using rest_base=%s RATE_LIMIT_RPS=%s", self.rest_base, RATE_LIMIT_RPS)
+        self.rest_base = "https://api.bybit.com" if mainnet_flag else "https://api-testnet.bybit.com"
+        logger.info("BybitClient rest_base=%s", self.rest_base)
+
         self.api_key = BYBIT_API_KEY
         self.api_secret = BYBIT_API_SECRET
         self._session: Optional[aiohttp.ClientSession] = None
-        self._symbol_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._max_retries = 4
+        self._max_retries = 3
         self._backoff_base = 1.0
         try:
             rate_val = float(RATE_LIMIT_RPS)
@@ -56,7 +48,10 @@ class BybitClient:
             await self._session.close()
             self._session = None
 
-    async def _get(self, path: str, params: Dict[str, Any] = None, timeout: int = 15):
+    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Optional[Dict[str, Any]]:
+        """
+        Return parsed JSON dict on success, or None on failure/non-JSON so callers can fallback.
+        """
         session = await self._session_obj()
         url = self.rest_base + path
         for attempt in range(self._max_retries):
@@ -65,115 +60,70 @@ class BybitClient:
                 async with session.get(url, params=params, timeout=timeout) as resp:
                     status = resp.status
                     text = await resp.text()
+                    # retry on rate-limit/server errors
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
-                        logger.warning("HTTP %s from %s, backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
+                        logger.warning("HTTP %s from %s — backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
                         await asyncio.sleep(wait)
                         continue
                     try:
                         data = await resp.json()
                     except Exception:
-                        logger.warning("Non-JSON or unexpected response from %s (status=%s). Body:\n%s", url, status, (text[:2000] + '...') if len(text) > 2000 else text)
-                        raise
+                        snippet = (text[:2000] + '...') if len(text) > 2000 else text
+                        logger.warning("Bybit returned non-JSON (status=%s) from %s. Body:\n%s", status, url, snippet)
+                        return None
                     if status >= 400:
-                        logger.error("GET %s returned %s: %s", url, status, (text[:400] + "...") if len(text) > 400 else text)
-                        raise Exception(f"HTTP {status}")
+                        snippet = (text[:400] + '...') if len(text) > 400 else text
+                        logger.error("Bybit GET %s returned %s: %s", url, status, snippet)
+                        return None
                     return data
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 if attempt + 1 >= self._max_retries:
-                    logger.exception("REST GET failed for %s after %d attempts: %s", url, attempt + 1, e)
-                    raise
+                    logger.exception("GET %s failed after %d attempts: %s", url, attempt + 1, e)
+                    return None
                 wait = self._backoff_base * (2 ** attempt)
-                logger.warning("Request error %s; retrying in %.1fs (attempt %d/%d)", e, wait, attempt + 1, self._max_retries)
+                logger.warning("Request error for %s: %s. Retrying in %.1fs (attempt %d/%d)", url, e, wait, attempt + 1, self._max_retries)
                 await asyncio.sleep(wait)
-        raise Exception("unreachable")
+        return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
         """
-        Use v5 instruments-info endpoint (preferred). Fallback to v2/public/symbols.
-        v5 path per docs: /v5/market/instruments-info with required param 'category'
+        Try v5 instruments-info first, then fallback to v2 public symbols. Return list (or empty list).
         """
-        # Try v5 with instruments-info
+        # try v5 /v5/market/instruments-info
         try:
             params = {"category": "linear", "instrumentType": "PERPETUAL"}
             data = await self._get("/v5/market/instruments-info", params=params)
-            if data and isinstance(data, dict):
-                # v5 success shape: ret_code==0 and 'result' may contain 'list' or dict/array
+            if isinstance(data, dict):
+                # expected v5 success shape
                 if data.get("ret_code", 0) == 0 and "result" in data:
                     res = data["result"]
-                    # 'result' may be dict with 'list'
                     if isinstance(res, dict) and isinstance(res.get("list"), list):
                         instruments = res.get("list", [])
-                    elif isinstance(res, list):
-                        instruments = res
-                    else:
-                        # some v5 shapes return a dict of results
-                        instruments = []
-                    logger.info("Found %d instruments via v5 instruments-info", len(instruments))
-                    return instruments
-                # fallback attempt to extract result
+                        logger.info("Found %d instruments via v5", len(instruments))
+                        return instruments
+                    if isinstance(res, list):
+                        logger.info("Found %d instruments via v5", len(res))
+                        return res
+                # fallback if result exists but unexpected shape
                 if "result" in data and isinstance(data["result"], (list, dict)):
                     logger.info("Found instruments via v5 (non-standard shape)")
-                    return data["result"]
-            logger.debug("v5 instruments-info response unexpected: %s", str(data)[:400])
+                    return data["result"] if isinstance(data["result"], list) else list(data["result"])  # safe coercion
         except Exception as e:
-            logger.debug("v5 instruments-info failed: %s", e)
+            logger.debug("v5 instruments-info attempt failed: %s", e)
 
-        # Fallback to v2 public symbols
+        # fallback to v2 /v2/public/symbols
         try:
             data = await self._get("/v2/public/symbols")
-            if data and isinstance(data, dict) and "result" in data:
+            if isinstance(data, dict) and "result" in data:
                 symbols = data["result"] or []
-                logger.info("Found %d symbols via v2/public/symbols", len(symbols))
+                logger.info("Found %d symbols via v2", len(symbols))
                 return symbols
-            logger.debug("v2 symbols response unexpected: %s", str(data)[:800])
+            logger.debug("v2 symbols returned unexpected payload.")
         except Exception as e:
-            logger.exception("Failed to fetch symbols from v2 endpoint: %s", e)
+            logger.debug("v2 symbols attempt failed: %s", e)
 
+        logger.warning("No symbols retrieved from Bybit; returning empty list.")
         return []
-
-    async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        sym = symbol.upper()
-        if sym in self._symbol_info_cache:
-            return self._symbol_info_cache[sym]
-        items = await self.get_symbols()
-        info: Dict[str, Any] = {"step": None, "min_qty": None, "contract_size": None}
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            # unify name detection across v5/v2
-            name = it.get("symbol") or it.get("name") or it.get("instrumentName") or it.get("instrument_name") or it.get("symbolName")
-            if not name:
-                base = it.get("baseCoin") or it.get("base")
-                quote = it.get("quoteCoin") or it.get("quote")
-                if base and quote:
-                    name = f"{base}{quote}"
-            if not name:
-                continue
-            if name.upper() != sym:
-                continue
-            # lot/filters parsing (v5/v2 shapes)
-            lot = it.get("lotSizeFilter") or it.get("lot_size_filter") or it.get("lot") or {}
-            if isinstance(lot, dict):
-                step = lot.get("qtyStep") or lot.get("qty_step") or lot.get("stepSize") or lot.get("step")
-                min_qty = lot.get("min_trading_qty") or lot.get("minTradingQty") or lot.get("minQty")
-                try:
-                    if step is not None:
-                        info["step"] = float(step)
-                    if min_qty is not None:
-                        info["min_qty"] = float(min_qty)
-                except Exception:
-                    pass
-            # contract size
-            cs = it.get("contractSize") or it.get("contract_size") or it.get("contract")
-            try:
-                if cs is not None:
-                    info["contract_size"] = float(cs)
-            except Exception:
-                pass
-            break
-        self._symbol_info_cache[sym] = info
-        logger.debug("Symbol info %s => %s", sym, info)
-        return info

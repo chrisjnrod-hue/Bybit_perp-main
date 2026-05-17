@@ -1,3 +1,4 @@
+# scanner.py
 import asyncio
 import time
 from collections import defaultdict
@@ -25,24 +26,17 @@ logger = get_logger("scanner")
 
 class Scanner:
     def __init__(self):
-        # create a token-bucket limiter and pass to client
-        # use configured RATE_LIMIT_RPS inside BybitClient as a fallback; here we ensure at least 1 token
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
-        # normalized store: kline_store[symbol][tf] -> list of dicts with keys: start_at, close, volume, optionally is_closed
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
-
-        # minimal callback/event system
         self._callbacks: List[Callable[[str, Any], Any]] = []
 
-    # minimal event system so other parts can listen
     def register_callback(self, cb: Callable[[str, Any], Any]):
-        """Register a callback that accepts (event_name, payload). Callback may be async or sync."""
         if not callable(cb):
             raise TypeError("callback must be callable")
         self._callbacks.append(cb)
@@ -60,7 +54,6 @@ class Scanner:
                 logger.exception("Callback for event %s failed", event)
 
     async def _call_client_method(self, names: List[str], *args, **kwargs):
-        """Try several method names on the client defensively and return first non-exception result."""
         for name in names:
             try:
                 fn = getattr(self.client, name, None)
@@ -77,7 +70,6 @@ class Scanner:
         return None
 
     async def _get_symbols(self):
-        """Defensively fetch symbols using possible names returned by different Bybit clients/versions."""
         items = None
         try:
             items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])
@@ -91,19 +83,16 @@ class Scanner:
             self.symbols = []
             return []
 
-        # If API returns a dict with data/result field
         if isinstance(items, dict):
             if "data" in items and isinstance(items["data"], (list, dict)):
                 items = items["data"]
             elif "result" in items and isinstance(items["result"], (list, dict)):
                 items = items["result"]
 
-        # If items is a single string, normalize to list
         if isinstance(items, (str,)):
             items = [items]
 
         syms = []
-        # log a sample payload to help debugging of payload shapes
         try:
             if isinstance(items, (list, tuple)) and len(items) > 0:
                 logger.debug("Sample instrument payload (first entry): %s", items[0])
@@ -112,12 +101,10 @@ class Scanner:
 
         for it in items:
             try:
-                # string shaped entry
                 if isinstance(it, str):
                     sym = it.strip().upper()
                     syms.append(sym)
                     continue
-
                 if not isinstance(it, dict):
                     try:
                         v = str(it)
@@ -126,7 +113,6 @@ class Scanner:
                         continue
                     continue
 
-                # dict-shaped responses: try many fields
                 symbol = (
                     it.get("name")
                     or it.get("symbol")
@@ -145,14 +131,12 @@ class Scanner:
                     continue
                 symbol = str(symbol).upper()
 
-                # ignore expired / delivery / futures with expiry unless marked perpetual
                 expiry = it.get("expiry_time") or it.get("deliveryTime") or it.get("expiry") or it.get("expireTime")
                 if expiry:
                     is_perp = it.get("is_perpetual") or it.get("isPerpetual") or it.get("perpetual")
                     if not is_perp:
                         continue
 
-                # prefer USDT perpetuals
                 if not symbol.endswith("USDT"):
                     quote = it.get("quoteCoin") or it.get("quote")
                     if quote and str(quote).upper() != "USDT":
@@ -176,7 +160,6 @@ class Scanner:
         return syms
 
     async def discover_symbols(self):
-        """Public symbol discovery entry"""
         try:
             return await self._get_symbols()
         except Exception:
@@ -320,14 +303,12 @@ class Scanner:
 
     async def seed_all(self):
         logger.info("Seeding klines for all symbols (concurrent=%d)", CONCURRENCY)
-
         async def worker(sym: str):
             await self.concurrent_sem.acquire()
             try:
                 await self.seed_klines_for_symbol(sym)
             finally:
                 self.concurrent_sem.release()
-
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         await asyncio.gather(*tasks)
 
@@ -343,7 +324,6 @@ class Scanner:
         if include_price is not None:
             closes = closes + [float(include_price)]
         macd_line, signal_line, hist = macd_histogram(closes)
-        # coerce to python list of floats/None just in case macd returns numpy types
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
@@ -455,7 +435,6 @@ class Scanner:
                 logger.exception("Error in root scan loop")
             elapsed = time.time() - start
 
-            # scheduling: either use config interval, or if not set/empty, run at open of every 5m candle
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 await asyncio.sleep(to_sleep)

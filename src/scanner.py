@@ -1,9 +1,11 @@
 import asyncio
 import time
 from collections import defaultdict
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Callable
 from decimal import Decimal, ROUND_DOWN, getcontext
 import math
+import inspect
+import logging
 
 from .logger import get_logger
 from .bybit_client import BybitClient
@@ -20,6 +22,7 @@ from .ratelimiter import TokenBucket
 getcontext().prec = 28
 logger = get_logger("scanner")
 
+
 class Scanner:
     def __init__(self):
         # create a token-bucket limiter and pass to client
@@ -27,37 +30,273 @@ class Scanner:
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
+        # normalized store: kline_store[symbol][tf] -> list of dicts with keys: start_at, close, volume, optionally is_closed
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
 
-    async def discover_symbols(self):
-        logger.info("Discovering symbols from Bybit...")
-        items = await self.client.get_symbols()
+        # minimal callback/event system
+        self._callbacks: List[Callable[[str, Any], Any]] = []
+
+    # minimal event system so other parts can listen
+    def register_callback(self, cb: Callable[[str, Any], Any]):
+        """Register a callback that accepts (event_name, payload). Callback may be async or sync."""
+        if not callable(cb):
+            raise TypeError("callback must be callable")
+        self._callbacks.append(cb)
+
+    async def _emit_event(self, event: str, payload: Any):
+        for cb in list(self._callbacks):
+            try:
+                if inspect.iscoroutinefunction(cb):
+                    await cb(event, payload)
+                else:
+                    # allow sync callbacks without blocking the loop too long
+                    res = cb(event, payload)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception:
+                logger.exception("Callback for event %s failed", event)
+
+    async def _call_client_method(self, names: List[str], *args, **kwargs):
+        """Try several method names on the client defensively and return first non-exception result."""
+        for name in names:
+            try:
+                fn = getattr(self.client, name, None)
+                if not fn:
+                    continue
+                res = fn(*args, **kwargs)
+                if inspect.isawaitable(res):
+                    res = await res
+                return res
+            except Exception:
+                logger.debug("Client method %s failed", name, exc_info=True)
+                # continue trying other names
+                continue
+        logger.debug("No client method among %s succeeded", names)
+        return None
+
+    async def _get_symbols(self):
+        """Defensively fetch symbols using possible names returned by different Bybit clients/versions."""
+        names = ["get_symbols", "getSymbols", "get_symbols_v2", "get_symbol_list", "symbols", "get_symbol_info"]
+        try:
+            items = await self._call_client_method(names)
+        except Exception:
+            logger.exception("Error calling client symbol methods")
+            items = None
+
+        if not items:
+            logger.info("No symbols returned from client")
+            return []
+
+        # if API returns a dict with data field
+        if isinstance(items, dict) and ("data" in items and isinstance(items["data"], (list, dict))):
+            items = items["data"]
+
+        # If items is a single string or something, normalize to list
+        if isinstance(items, (str,)):
+            items = [items]
+
         syms = []
         for it in items:
-            if not isinstance(it, dict):
-                continue
-            symbol = it.get("name") or it.get("symbol") or (it.get("baseCoin") and it.get("quoteCoin") and f"{it.get('baseCoin')}{it.get('quoteCoin')}")
-            if not symbol:
-                symbol = it.get("instrument_name") or it.get("symbolName")
-            if not symbol:
-                continue
-            expiry = it.get("expiry_time") or it.get("deliveryTime") or it.get("expiry")
-            if expiry:
-                continue
-            symbol = symbol.upper()
-            if not symbol.endswith("USDT"):
-                continue
-            base = symbol.replace("USDT", "")
-            if base in [s.upper() for s in EXCLUDE_STABLECOINS]:
-                continue
-            syms.append(symbol)
+            try:
+                # If it's a plain symbol string
+                if isinstance(it, str):
+                    sym = it.strip().upper()
+                    # try to filter to USDT perpetuals later
+                    syms.append(sym)
+                    continue
+
+                if not isinstance(it, dict):
+                    # unknown shape, try to stringify
+                    try:
+                        v = str(it)
+                        syms.append(v.upper())
+                    except Exception:
+                        continue
+                    continue
+
+                # dict-shaped responses: try many fields from v2/v5
+                symbol = (
+                    it.get("name")
+                    or it.get("symbol")
+                    or it.get("symbolName")
+                    or it.get("instrument_name")
+                    or it.get("id")
+                    or it.get("instrumentId")
+                )
+                if not symbol:
+                    # try composing from base/quote
+                    base = it.get("baseCoin") or it.get("base")
+                    quote = it.get("quoteCoin") or it.get("quote")
+                    if base and quote:
+                        symbol = f"{base}{quote}"
+
+                if not symbol:
+                    continue
+                symbol = symbol.upper()
+
+                # ignore expired / delivery / futures with expiry
+                expiry = it.get("expiry_time") or it.get("deliveryTime") or it.get("expiry") or it.get("contractType")
+                if expiry:
+                    # Some APIs provide expiry info even for perpetuals in a different field; try to check "is_perpetual" or type
+                    is_perp = it.get("is_perpetual") or it.get("isPerpetual") or it.get("perpetual")
+                    if not is_perp:
+                        # if expiry exists and it's not marked perpetual, skip
+                        continue
+
+                # check market: prefer USDT perp by ending or quote field
+                if not symbol.endswith("USDT"):
+                    # sometimes quote exists
+                    quote = it.get("quoteCoin") or it.get("quote")
+                    if quote and str(quote).upper() != "USDT":
+                        continue
+                    # other shape: instrument type
+                    inst_type = it.get("type") or it.get("instrumentType") or it.get("category")
+                    if inst_type and "PERP" not in str(inst_type).upper() and "PERPETUAL" not in str(inst_type).upper():
+                        continue
+
+                base = symbol.replace("USDT", "")
+                if base in [s.upper() for s in EXCLUDE_STABLECOINS]:
+                    continue
+
+                syms.append(symbol)
+            except Exception:
+                logger.exception("Error normalizing symbol entry: %s", it)
+
         syms = sorted(set(syms))
         logger.info("Discovered %d USDT perpetual symbols", len(syms))
+        await self._emit_event("symbols", syms)
         self.symbols = syms
         return syms
+
+    async def discover_symbols(self):
+        """Public symbol discovery entry (keeps backward compatibility)."""
+        try:
+            return await self._get_symbols()
+        except Exception:
+            logger.exception("discover_symbols failed")
+            return []
+
+    def _tf_to_seconds(self, tf: str) -> int:
+        # supports common tf formats like '1m', '5m', '1h', '1d', '3m'
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 3600
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 86400
+        except Exception:
+            pass
+        # fallback default
+        return 60
+
+    async def _call_get_klines(self, symbol: str, tf: str, limit: int):
+        names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
+        return await self._call_client_method(names, symbol, tf, limit)
+
+    def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
+        """Normalize many shapes of kline responses into a list of dicts with start_at, close, volume, is_closed (optional)."""
+        out: List[Dict[str, Any]] = []
+        if not raw_klines:
+            return out
+
+        # If returned as dict with 'data' or similar, drill into common fields
+        if isinstance(raw_klines, dict):
+            if "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
+                raw_klines = raw_klines["result"]
+            elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
+                raw_klines = raw_klines["data"]
+
+        seq = raw_klines if isinstance(raw_klines, (list, tuple)) else [raw_klines]
+
+        for item in seq:
+            try:
+                if isinstance(item, (list, tuple)):
+                    # common array format: [open_time, open, high, low, close, volume, ...]
+                    start = None
+                    close = None
+                    vol = None
+                    if len(item) >= 1:
+                        start = int(item[0])
+                    if len(item) >= 5:
+                        try:
+                            close = float(item[4])
+                        except Exception:
+                            close = None
+                    if len(item) >= 6:
+                        try:
+                            vol = float(item[5])
+                        except Exception:
+                            vol = None
+                    out.append({"start_at": start, "close": close, "volume": vol})
+                    continue
+
+                if isinstance(item, dict):
+                    # map many possible keys
+                    start = item.get("start_at") or item.get("open_time") or item.get("t") or item.get("timestamp") or item.get("start")
+                    close = (
+                        item.get("close")
+                        or item.get("close_price")
+                        or item.get("c")
+                        or item.get("last_price")
+                        or item.get("Close")
+                    )
+                    vol = item.get("volume") or item.get("vol") or item.get("turnover") or item.get("v")
+                    # boolean flags: isClosed, is_closed, confirm, complete
+                    is_closed = item.get("isClosed")
+                    if is_closed is None:
+                        is_closed = item.get("is_closed")
+                    if is_closed is None:
+                        is_closed = item.get("complete")
+                    if is_closed is None:
+                        is_closed = item.get("confirmed")
+                    # normalize numeric types
+                    try:
+                        if start is not None:
+                            start = int(start)
+                    except Exception:
+                        start = None
+                    try:
+                        if close is not None:
+                            close = float(close)
+                    except Exception:
+                        close = None
+                    try:
+                        if vol is not None:
+                            vol = float(vol)
+                    except Exception:
+                        vol = None
+                    out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
+                    continue
+
+                # fallback: stringify
+                out.append({"start_at": None, "close": None, "volume": None})
+            except Exception:
+                logger.exception("Failed to normalize kline item: %s", item)
+                continue
+
+        # Drop trailing in-progress candle:
+        if out:
+            last = out[-1]
+            tf_seconds = self._tf_to_seconds(tf)
+            try:
+                now = time.time()
+                last_start = last.get("start_at")
+                is_closed = last.get("is_closed", None)
+                if is_closed is False:
+                    logger.debug("Dropping trailing in-progress candle because is_closed=False for %s %s", tf, last_start)
+                    out = out[:-1]
+                elif isinstance(last_start, int):
+                    # If last candle started less than tf_seconds * 0.9 seconds ago it's likely still forming
+                    if (now - float(last_start)) < max(1.0, tf_seconds * 0.9):
+                        logger.debug("Dropping trailing in-progress candle based on time heuristic for %s %s", tf, last_start)
+                        out = out[:-1]
+            except Exception:
+                logger.exception("Error evaluating trailing candle drop")
+        return out
 
     async def seed_klines_for_symbol(self, symbol: str):
         if KLINE_SEED_LIMIT < 100:
@@ -65,30 +304,53 @@ class Scanner:
         tfs = list(set(ROOT_TFS + MTF_TFS))
         for tf in tfs:
             try:
-                klines = await self.client.get_klines(symbol, tf, limit=KLINE_SEED_LIMIT)
-                if klines:
-                    klines_sorted = sorted(klines, key=lambda x: x.get("start_at", 0))
+                raw = await self._call_get_klines(symbol, tf, limit=KLINE_SEED_LIMIT)
+                if not raw:
+                    # It might also be available via the client as only one-arg function or different signature
+                    raw = await self._call_client_method(["get_klines", "getKlines"], symbol, tf, KLINE_SEED_LIMIT)
+                if not raw:
+                    logger.debug("No klines returned for %s %s", symbol, tf)
+                    continue
+                normalized = self._normalize_klines(raw, tf)
+                if normalized:
+                    # sort by start_at if available
+                    try:
+                        klines_sorted = sorted(normalized, key=lambda x: x.get("start_at") or 0)
+                    except Exception:
+                        klines_sorted = normalized
                     self.kline_store[symbol][tf] = klines_sorted
                     logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
+                    await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
 
     async def seed_all(self):
         logger.info("Seeding klines for all symbols (concurrent=%d)", CONCURRENCY)
+
         async def worker(sym: str):
             await self.concurrent_sem.acquire()
             try:
                 await self.seed_klines_for_symbol(sym)
             finally:
                 self.concurrent_sem.release()
+
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         await asyncio.gather(*tasks)
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None):
         data = self.kline_store.get(symbol, {}).get(tf, [])
-        closes = [float(c.get("close", 0)) for c in data if "close" in c]
+        # Close extraction: support normalized dicts
+        closes = []
+        for c in data:
+            if isinstance(c, dict):
+                if "close" in c and c["close"] is not None:
+                    closes.append(float(c.get("close", 0)))
+            elif isinstance(c, (int, float)):
+                closes.append(float(c))
+            # ignore unknown shapes
         if include_price is not None:
             closes = closes + [float(include_price)]
+        # macd_histogram implementation is external; assume it returns python lists/floats
         macd_line, signal_line, hist = macd_histogram(closes)
         return macd_line, signal_line, hist
 
@@ -97,16 +359,30 @@ class Scanner:
             return False
         prev = hist[-2]
         cur = hist[-1]
+        # treat 0 as a valid numeric value; only bail out on None
         if prev is None or cur is None:
             return False
-        return (prev < 0) and (cur > hist_threshold)
+        try:
+            # previous < 0 and current > threshold implies a flip at the open
+            return (prev < 0) and (cur > hist_threshold)
+        except Exception:
+            logger.exception("Error comparing hist values %s %s", prev, cur)
+            return False
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
         data = self.kline_store.get(symbol, {}).get("1h") or []
         if not data or len(data) < 48:
             logger.debug("Insufficient 1h candles for 24h vol change for %s (have %d)", symbol, len(data))
             return None
-        vols = [float(c.get("volume", 0.0)) for c in data]
+        vols = []
+        for c in data:
+            try:
+                if isinstance(c, dict):
+                    vols.append(float(c.get("volume", 0.0) or 0.0))
+                else:
+                    vols.append(float(c or 0.0))
+            except Exception:
+                vols.append(0.0)
         last_24 = sum(vols[-24:])
         prev_24 = sum(vols[-48:-24])
         if prev_24 == 0:
@@ -174,6 +450,9 @@ class Scanner:
                 await asyncio.gather(*tasks)
 
                 logger.info("Root scan found %d signals", len(root_signals))
+                # emit root_signals event so other parts can react
+                await self._emit_event("root_signals", root_signals)
+
                 if root_signals:
                     await self.handle_root_signals(root_signals)
                 else:
@@ -182,8 +461,18 @@ class Scanner:
             except Exception:
                 logger.exception("Error in root scan loop")
             elapsed = time.time() - start
-            to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
-            await asyncio.sleep(to_sleep)
+
+            # scheduling: either use config interval, or if not set/empty, run at open of every 5m candle
+            if ROOT_SCAN_INTERVAL:
+                to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
+                await asyncio.sleep(to_sleep)
+            else:
+                # Wait until the next 5-minute boundary (UTC epoch)
+                now = time.time()
+                next_5m = math.ceil(now / 300.0) * 300.0
+                to_sleep = max(0, next_5m - now)
+                logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
+                await asyncio.sleep(to_sleep)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
         evaluated = []
@@ -202,6 +491,7 @@ class Scanner:
                 mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
                 if cur_hist is not None and cur_hist > 0:
                     positive_count += 1
+                # treat prev_hist == 0 as valid numeric (we explicitly check None)
                 if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
                     any_positive_mtfflip = True
             one_d_slope = None
@@ -238,6 +528,9 @@ class Scanner:
                 "reason": "candidate",
                 "score": score
             })
+
+        # emit candidates evaluation
+        await self._emit_event("candidates_evaluated", evaluated)
 
         candidates = [e for e in evaluated if e["accept"]]
         if ROOT_FILTER:

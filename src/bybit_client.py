@@ -1,15 +1,21 @@
 """
-Defensive Bybit client using v5 /v5/market endpoints with v2 fallback.
-- Automatically picks mainnet/testnet from MAINNET env.
-- _get returns parsed JSON dict or None on non-JSON / error (does NOT raise),
-  so callers can gracefully fallback and scanner won't exit.
-- get_symbols returns list (possibly empty) rather than raising.
-- Provides helper wrappers used by scanner: get_klines, get_latest_price, get_symbol_info.
+BybitClient with REST + WebSocket kline support.
+
+Features:
+- REST: get_symbols, get_klines, get_latest_price, get_symbol_info, get_balance, create_order (defensive).
+- WS: start_kline_ws(), stop_kline_ws(), subscribe_klines_for_symbols(symbols, tfs) [used for ROOT_TFS],
+      subscribe_mtf_for_symbol(symbol, mtfs) for on-demand MTF subscription,
+      get_ws_klines(symbol, tf) and get_ws_latest_kline(symbol, tf) for accessing in-memory cache.
 """
 import asyncio
-from typing import List, Dict, Any, Optional
+import json
+import time
+from typing import List, Dict, Any, Optional, Tuple
 import aiohttp
-from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS
+from collections import defaultdict, deque
+import traceback
+
+from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS, KLINE_SEED_LIMIT
 from .logger import get_logger
 from .ratelimiter import TokenBucket
 
@@ -25,8 +31,10 @@ class BybitClient:
                 mainnet_flag = bool(MAINNET)
         except Exception:
             mainnet_flag = True
+
         self.rest_base = "https://api.bybit.com" if mainnet_flag else "https://api-testnet.bybit.com"
-        logger.info("BybitClient rest_base=%s", self.rest_base)
+        self.ws_public = "wss://stream.bybit.com/realtime_public" if mainnet_flag else "wss://stream-testnet.bybit.com/realtime_public"
+        logger.info("BybitClient rest_base=%s ws_public=%s", self.rest_base, self.ws_public)
 
         self.api_key = BYBIT_API_KEY
         self.api_secret = BYBIT_API_SECRET
@@ -39,20 +47,36 @@ class BybitClient:
             rate_val = 5.0
         self.rate_limiter = rate_limiter or TokenBucket(max(1.0, rate_val))
 
+        # WS state
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws_session: Optional[aiohttp.ClientSession] = None
+        self._pending_subscribe: asyncio.Queue = asyncio.Queue()
+        # cache: symbol -> tf -> deque of normalized klines
+        self._kline_cache: Dict[str, Dict[str, deque]] = defaultdict(dict)
+        # requested subscriptions set (symbol,tf)
+        self._requested_subs: set = set()
+        # mtf subscriptions per symbol to avoid re-queuing
+        self._mtf_subscribed: set = set()
+        self._ws_stop = False
+        self._ws_backoff = 1.0
+
+    # ---------------- REST helpers ----------------
     async def _session_obj(self) -> aiohttp.ClientSession:
         if not self._session:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self) -> None:
+        await self.stop_kline_ws()
         if self._session:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:
+                logger.exception("Error closing REST session")
             self._session = None
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Optional[Dict[str, Any]]:
-        """
-        Return parsed JSON dict on success, or None on failure/non-JSON so callers can fallback.
-        """
         session = await self._session_obj()
         url = self.rest_base + path
         for attempt in range(self._max_retries):
@@ -61,7 +85,6 @@ class BybitClient:
                 async with session.get(url, params=params, timeout=timeout) as resp:
                     status = resp.status
                     text = await resp.text()
-                    # retry on rate-limit/server errors
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
                         logger.warning("HTTP %s from %s — backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
@@ -89,20 +112,13 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
-    # existing get_symbols unchanged except defensive returns
     async def get_symbols(self) -> List[Dict[str, Any]]:
-        """
-        Try v5 instruments-info first, then fallback to v2 public symbols. Return list (or empty list).
-        """
-        # try v5 /v5/market/instruments-info
         try:
             params = {"category": "linear", "instrumentType": "PERPETUAL"}
             data = await self._get("/v5/market/instruments-info", params=params)
             if isinstance(data, dict):
-                # expected v5 success shape
                 if data.get("ret_code", 0) == 0 and "result" in data:
                     res = data["result"]
-                    # some v5 shapes have result.list
                     if isinstance(res, dict) and isinstance(res.get("list"), list):
                         instruments = res.get("list", [])
                         logger.info("Found %d instruments via v5", len(instruments))
@@ -110,14 +126,11 @@ class BybitClient:
                     if isinstance(res, list):
                         logger.info("Found %d instruments via v5", len(res))
                         return res
-                # fallback if result exists but unexpected shape
                 if "result" in data and isinstance(data["result"], (list, dict)):
                     logger.info("Found instruments via v5 (non-standard shape)")
-                    return data["result"] if isinstance(data["result"], list) else list(data["result"])  # safe coercion
-        except Exception as e:
-            logger.debug("v5 instruments-info attempt failed: %s", e)
-
-        # fallback to v2 /v2/public/symbols
+                    return data["result"] if isinstance(data["result"], list) else list(data["result"])
+        except Exception:
+            logger.debug("v5 instruments-info attempt failed", exc_info=True)
         try:
             data = await self._get("/v2/public/symbols")
             if isinstance(data, dict) and "result" in data:
@@ -125,60 +138,78 @@ class BybitClient:
                 logger.info("Found %d symbols via v2", len(symbols))
                 return symbols
             logger.debug("v2 symbols returned unexpected payload.")
-        except Exception as e:
-            logger.debug("v2 symbols attempt failed: %s", e)
-
+        except Exception:
+            logger.debug("v2 symbols attempt failed", exc_info=True)
         logger.warning("No symbols retrieved from Bybit; returning empty list.")
         return []
 
-    # ---- New convenience wrappers used by Scanner ----
-
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
-        """
-        Try v5 /v5/market/kline then v2 /v2/public/kline/list. Return raw payload (list/dict) or None.
-        """
-        try:
-            params = {"symbol": symbol, "interval": interval, "limit": limit}
-            data = await self._get("/v5/market/kline", params=params)
-            if isinstance(data, dict):
-                # v5 typically returns {"ret_code":0,"result":{"list":[...], ...}} or result as list
-                if data.get("ret_code", 0) == 0 and "result" in data:
-                    res = data["result"]
-                    if isinstance(res, dict) and isinstance(res.get("list"), list):
-                        return res.get("list", [])
-                    if isinstance(res, list):
-                        return res
-                    # sometimes result itself is the list
-                    # if result contains typical kline entries as a list-like, coerce:
-                    if isinstance(res, (list, tuple)):
-                        return list(res)
-                    # otherwise fallthrough and return result
-                    return res
-            # fallback v2
-            data2 = await self._get("/v2/public/kline/list", params={"symbol": symbol, "interval": interval, "limit": limit})
-            if isinstance(data2, dict) and "result" in data2:
-                return data2["result"]
-        except Exception:
-            logger.exception("get_klines failed for %s %s", symbol, interval)
+        tried = []
+        variants = []
+        s = str(interval).strip().lower()
+        if s.endswith("m") or s.endswith("h") or s.endswith("d"):
+            variants.append(s)
+            try:
+                if s.endswith("m"):
+                    variants.append(str(int(s[:-1])))
+            except Exception:
+                pass
+        else:
+            variants.append(s)
+            try:
+                variants.append(f"{int(s)}m")
+            except Exception:
+                pass
+        seen = set()
+        variants = [v for v in variants if not (v in seen or seen.add(v))]
+
+        endpoints = [
+            ("/v5/market/kline", "v5"),
+            ("/v2/public/kline/list", "v2")
+        ]
+
+        for ep, tag in endpoints:
+            for iv in variants:
+                tried.append((ep, iv))
+                try:
+                    params = {"symbol": symbol, "interval": iv, "limit": limit}
+                    data = await self._get(ep, params=params)
+                    if not data:
+                        continue
+                    if isinstance(data, dict):
+                        if "ret_code" in data and data.get("ret_code", 0) == 0 and "result" in data:
+                            res = data["result"]
+                            if isinstance(res, dict) and isinstance(res.get("list"), list):
+                                return res.get("list", [])
+                            if isinstance(res, list):
+                                return res
+                            if isinstance(res, (list, tuple)):
+                                return list(res)
+                            return res
+                        if "result" in data:
+                            return data["result"]
+                        if isinstance(data, list):
+                            return data
+                        return data
+                    if isinstance(data, (list, tuple)):
+                        return list(data)
+                except Exception:
+                    logger.debug("get_klines attempt failed for %s %s @ %s (tag=%s)", symbol, iv, ep, tag, exc_info=True)
+                    continue
+        logger.info("get_klines: no usable klines for %s interval variants=%s tried=%s", symbol, variants, tried)
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
-        """
-        Try v5 tickers and v2 tickers to extract last price as float. Returns None if not available.
-        """
         try:
             params = {"symbol": symbol}
             data = await self._get("/v5/market/tickers", params=params)
-            # v5 often returns {"ret_code":0,"result":[{"symbol":"BTCUSDT","lastPrice":"..."}]}
             if isinstance(data, dict) and "result" in data:
                 res = data["result"]
-                # if dict with list
                 if isinstance(res, list) and len(res) > 0:
                     entry = res[0]
                 elif isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and len(res["list"]) > 0:
                     entry = res["list"][0]
                 elif isinstance(res, dict):
-                    # sometimes result is a dict with symbol keys
                     entry = res
                 else:
                     entry = None
@@ -189,7 +220,6 @@ class BybitClient:
                                 return float(entry[k])
                             except Exception:
                                 continue
-            # fallback to v2 /v2/public/tickers
             data2 = await self._get("/v2/public/tickers", params={"symbol": symbol})
             if isinstance(data2, dict) and "result" in data2:
                 res = data2["result"]
@@ -205,10 +235,6 @@ class BybitClient:
         return None
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        """
-        Attempt to return normalized symbol info. Scanner looks for 'step' and 'min_qty' keys.
-        This function searches get_symbols() result for matching symbol name and extracts common fields.
-        """
         try:
             syms = await self.get_symbols()
             if not syms:
@@ -220,12 +246,10 @@ class BybitClient:
                         target = it
                         break
                     if isinstance(it, dict):
-                        # many possible name fields
                         name = it.get("name") or it.get("symbol") or it.get("symbolName") or it.get("instrument_name")
                         if name and name.upper() == symbol.upper():
                             target = it
                             break
-                        # v5 instruments may use "baseCoin"/"quoteCoin"
                         base = it.get("baseCoin") or it.get("base")
                         quote = it.get("quoteCoin") or it.get("quote")
                         if base and quote and f"{base}{quote}".upper() == symbol.upper():
@@ -237,22 +261,16 @@ class BybitClient:
                 return {}
 
             info: Dict[str, Any] = {}
-
             if isinstance(target, dict):
-                # try several common paths for step/minQty
-                # v5/v2 shapes differ; try lotSizeFilter / qty_step / step
                 step = None
                 min_qty = None
-                # possible nested filters
                 for key in ("lotSizeFilter", "lot_size_filter", "qty_filter", "quantity_filter"):
                     filt = target.get(key)
                     if isinstance(filt, dict):
-                        step = step or filt.get("qtyStep") or filt.get("step") or filt.get("minQty") or filt.get("minQty")
-                        min_qty = min_qty or filt.get("minQty") or filt.get("minQty")
-                # flat fields
+                        step = step or filt.get("qtyStep") or filt.get("step") or filt.get("minQty")
+                        min_qty = min_qty or filt.get("minQty")
                 step = step or target.get("qty_step") or target.get("step") or target.get("quantity_step") or target.get("tick_size")
                 min_qty = min_qty or target.get("min_trading_qty") or target.get("min_qty") or target.get("minOrderQty") or target.get("lot_size")
-                # try numeric conversion where possible
                 try:
                     if step is not None:
                         step = float(step)
@@ -263,42 +281,312 @@ class BybitClient:
                         min_qty = float(min_qty)
                 except Exception:
                     min_qty = None
-
                 info["step"] = step
                 info["min_qty"] = min_qty
-
-                # attach raw target for caller's use
                 info["raw"] = target
-
             return info
         except Exception:
             logger.exception("get_symbol_info failed for %s", symbol)
             return {}
 
     async def get_balance(self, currency: str = "USDT") -> Optional[Dict[str, Any]]:
-        """
-        Placeholder: returns None when no authenticated implementation is available.
-        If you want live balance calls, implement signed/private endpoints here.
-        """
         if not self.api_key or not self.api_secret:
             logger.debug("get_balance: no api keys configured; returning None")
             return None
-        # Authenticated balance fetch is not implemented here to avoid accidental use.
         logger.warning("get_balance: authenticated balance fetch not implemented. Returning None.")
         return None
 
     async def create_order(self, symbol: str, side: str, qty: float) -> Dict[str, Any]:
-        """
-        Placeholder for creating an order. This client intentionally does NOT implement signing
-        and real order placement to avoid accidental live trades. If you intend to place real orders,
-        please implement authenticated POST /private endpoints using your API keys with proper signing.
-
-        Behavior:
-        - If api_key/api_secret are not configured, returns a simulated order dict.
-        - If api_key/api_secret are configured, raises NotImplementedError to force explicit implementation.
-        """
         if not self.api_key or not self.api_secret:
             logger.info("create_order: api keys missing; returning simulated order")
             return {"status": "simulated", "symbol": symbol, "side": side, "qty": qty}
         logger.error("create_order: API keys present but create_order is not implemented for live orders. Implement signing or disable.")
         raise NotImplementedError("create_order is not implemented for live orders in BybitClient. Implement signed order placement.")
+
+    # ---------------- WebSocket support ----------------
+    async def start_kline_ws(self) -> None:
+        if self._ws_task and not self._ws_task.done():
+            logger.debug("WS task already running")
+            return
+        self._ws_stop = False
+        self._ws_task = asyncio.create_task(self._ws_loop())
+        logger.info("Started Bybit WS task")
+
+    async def stop_kline_ws(self) -> None:
+        self._ws_stop = True
+        if self._ws_task:
+            try:
+                self._ws_task.cancel()
+            except Exception:
+                logger.debug("Error cancelling ws task", exc_info=True)
+            self._ws_task = None
+        try:
+            if self._ws is not None and not self._ws.closed:
+                await self._ws.close()
+        except Exception:
+            logger.exception("Error closing ws connection")
+        try:
+            if self._ws_session:
+                await self._ws_session.close()
+        except Exception:
+            logger.exception("Error closing ws session")
+        self._ws = None
+        self._ws_session = None
+        while not self._pending_subscribe.empty():
+            try:
+                self._pending_subscribe.get_nowait()
+            except Exception:
+                break
+        logger.info("Stopped Bybit WS")
+
+    async def subscribe_klines_for_symbols(self, symbols: List[str], tfs: List[str]) -> None:
+        """
+        Queue subscribe requests for symbol x tf combinations (used for ROOT_TFS at startup).
+        """
+        if not symbols or not tfs:
+            return
+        for sym in symbols:
+            for tf in tfs:
+                key = (sym.upper(), tf)
+                if key in self._requested_subs:
+                    continue
+                self._requested_subs.add(key)
+                await self._pending_subscribe.put(("subscribe", sym.upper(), tf))
+        logger.info("Queued subscribe requests for %d symbols x %d tfs", len(symbols), len(tfs))
+
+    async def subscribe_mtf_for_symbol(self, symbol: str, mtfs: List[str]) -> None:
+        """
+        Subscribe to MTFs for a single symbol on-demand. Avoids re-subscribing same symbol/mtf pair.
+        """
+        symbol = symbol.upper()
+        if not mtfs:
+            return
+        for tf in mtfs:
+            key = (symbol, tf)
+            if key in self._mtf_subscribed:
+                continue
+            self._mtf_subscribed.add(key)
+            if key not in self._requested_subs:
+                self._requested_subs.add(key)
+                await self._pending_subscribe.put(("subscribe", symbol, tf))
+        logger.info("Queued MTF subscribe for %s tfs=%s", symbol, mtfs)
+
+    def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
+        s = str(tf).strip().lower()
+        variants = [s]
+        if not any(c.isalpha() for c in s):
+            try:
+                variants.append(f"{int(s)}m")
+            except Exception:
+                pass
+        else:
+            if s.endswith("m"):
+                try:
+                    variants.append(str(int(s[:-1])))
+                except Exception:
+                    pass
+        tops = []
+        for iv in variants:
+            tops.extend([
+                f"kline.{iv}.{symbol}",
+                f"klineV2.{iv}.{symbol}",
+                f"candle.{iv}.{symbol}",
+                f"public.kline.{iv}.{symbol}",
+                f"instrument.kline.{iv}.{symbol}"
+            ])
+        seen = set()
+        out = []
+        for t in tops:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    async def _send_subscribe(self, op: str, topic: str) -> bool:
+        if not self._ws:
+            return False
+        try:
+            msg = {"op": "subscribe", "args": [topic]} if op == "subscribe" else {"op": "unsubscribe", "args": [topic]}
+            await self._ws.send_json(msg)
+            return True
+        except Exception:
+            logger.debug("Failed to send subscribe/unsubscribe %s", topic, exc_info=True)
+            return False
+
+    def _ensure_cache_slot(self, symbol: str, tf: str):
+        symbol = symbol.upper()
+        if tf not in self._kline_cache.get(symbol, {}):
+            maxlen = max(100, int(KLINE_SEED_LIMIT) if isinstance(KLINE_SEED_LIMIT, int) and KLINE_SEED_LIMIT > 0 else 300)
+            self._kline_cache.setdefault(symbol, {})[tf] = deque(maxlen=maxlen)
+
+    def _normalize_ws_kline_item(self, raw: Dict[str, Any], tf: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        start = raw.get("start_at") or raw.get("start") or raw.get("t") or raw.get("open_time") or raw.get("timestamp")
+        close = raw.get("close") or raw.get("close_price") or raw.get("c") or raw.get("last_price")
+        vol = raw.get("volume") or raw.get("vol") or raw.get("v") or raw.get("turnover")
+        is_closed = raw.get("is_closed") or raw.get("isClosed") or raw.get("isFinal") or raw.get("confirm")
+        try:
+            if start is not None:
+                start = int(start)
+        except Exception:
+            start = None
+        try:
+            if close is not None:
+                close = float(close)
+        except Exception:
+            close = None
+        try:
+            if vol is not None:
+                vol = float(vol)
+        except Exception:
+            vol = None
+        return {"start_at": start, "close": close, "volume": vol, "is_closed": is_closed}
+
+    async def _handle_ws_message(self, msg: Dict[str, Any]):
+        try:
+            if msg.get("success") is not None and "request" in msg:
+                # subscription ack etc
+                return
+            if "ping" in msg:
+                try:
+                    await self._ws.send_json({"pong": msg["ping"]})
+                except Exception:
+                    pass
+                return
+            if msg.get("type") in ("pong",):
+                return
+
+            topic = msg.get("topic") or msg.get("arg") or msg.get("topicName")
+            data = msg.get("data")
+            if not data and isinstance(msg.get("result"), dict) and "data" in msg["result"]:
+                data = msg["result"]["data"]
+
+            if topic and data:
+                parts = str(topic).split(".")
+                tf = None
+                symbol = None
+                if len(parts) >= 3:
+                    tf = parts[1]
+                    symbol = parts[-1]
+                else:
+                    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                        symbol = data[0].get("symbol") or data[0].get("s") or data[0].get("instrument_name")
+                        tf = data[0].get("interval") or data[0].get("period") or data[0].get("klineInterval")
+                if not symbol or not tf:
+                    return
+                symbol = str(symbol).upper()
+                tf = str(tf)
+                self._ensure_cache_slot(symbol, tf)
+                seq = data if isinstance(data, (list, tuple)) else [data]
+                for entry in seq:
+                    norm = self._normalize_ws_kline_item(entry, tf)
+                    if not norm:
+                        continue
+                    dq = self._kline_cache[symbol][tf]
+                    if dq and dq[-1].get("start_at") == norm.get("start_at"):
+                        dq[-1] = norm
+                    else:
+                        dq.append(norm)
+                return
+        except Exception:
+            logger.exception("Error handling WS message: %s", traceback.format_exc())
+
+    async def _ws_loop(self):
+        while not self._ws_stop:
+            try:
+                if not self._ws_session:
+                    self._ws_session = aiohttp.ClientSession()
+                logger.info("Connecting to Bybit WS %s", self.ws_public)
+                async with self._ws_session.ws_connect(self.ws_public, heartbeat=30) as ws:
+                    self._ws = ws
+                    self._ws_backoff = 1.0
+                    logger.info("Bybit WS connected")
+                    # drain pending_subscribe
+                    pending = []
+                    while not self._pending_subscribe.empty():
+                        try:
+                            pending.append(self._pending_subscribe.get_nowait())
+                        except Exception:
+                            break
+                    # ensure requested_subs are also queued
+                    for (sym, tf) in list(self._requested_subs):
+                        pending.append(("subscribe", sym, tf))
+                    # build topics and send subscribe messages
+                    for op, sym, tf in pending:
+                        for topic in self._candidate_topics(sym, tf):
+                            try:
+                                await ws.send_json({"op": op, "args": [topic]})
+                                logger.debug("Sent WS %s request for topic=%s", op, topic)
+                            except Exception:
+                                logger.debug("Failed sending subscribe for %s", topic, exc_info=True)
+
+                    async def ping_loop():
+                        try:
+                            while True:
+                                await asyncio.sleep(20)
+                                try:
+                                    await ws.send_json({"op": "ping"})
+                                except Exception:
+                                    break
+                        except asyncio.CancelledError:
+                            return
+
+                    ping_task = asyncio.create_task(ping_loop())
+
+                    async for raw in ws:
+                        if raw.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                msg = json.loads(raw.data)
+                            except Exception:
+                                logger.debug("Non-JSON WS message: %s", raw.data[:400])
+                                continue
+                            await self._handle_ws_message(msg)
+                        elif raw.type == aiohttp.WSMsgType.ERROR:
+                            logger.error("WS error frame: %s", raw)
+                            break
+                        elif raw.type == aiohttp.WSMsgType.CLOSED:
+                            logger.info("WS closed by server")
+                            break
+
+                    try:
+                        ping_task.cancel()
+                    except Exception:
+                        pass
+
+            except asyncio.CancelledError:
+                logger.info("WS loop cancelled")
+                break
+            except Exception:
+                logger.exception("Bybit WS connection error, backing off %.1fs", self._ws_backoff)
+                await asyncio.sleep(self._ws_backoff)
+                self._ws_backoff = min(self._ws_backoff * 2.0, 120.0)
+                continue
+            finally:
+                try:
+                    if self._ws and not self._ws.closed:
+                        await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+        logger.info("Exiting WS loop")
+
+    # ------------- WS cache accessors -------------
+    async def get_ws_klines(self, symbol: str, tf: str) -> List[Dict[str, Any]]:
+        try:
+            c = self._kline_cache.get(symbol.upper(), {}).get(tf, None)
+            if c is None:
+                return []
+            return list(c)
+        except Exception:
+            return []
+
+    def get_ws_latest_kline(self, symbol: str, tf: str) -> Optional[Dict[str, Any]]:
+        # synchronous accessor (safe to call from sync code)
+        try:
+            c = self._kline_cache.get(symbol.upper(), {}).get(tf, None)
+            if not c:
+                return None
+            return dict(c[-1])
+        except Exception:
+            return None

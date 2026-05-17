@@ -1,4 +1,11 @@
-# scanner.py
+"""
+Scanner using REST seeding for MACD history and WebSocket for live current candle updates.
+
+Behavior:
+- After discovering symbols, start WS and subscribe to ROOT_TFS for all symbols.
+- On a root flip detection candidate, request MTF subscriptions for that symbol (on-demand).
+- compute_macd_for supports use_ws_current=True to append the latest WS candle close as a temporary datapoint (not persisted).
+"""
 import asyncio
 import time
 from collections import defaultdict
@@ -6,6 +13,7 @@ from typing import Dict, List, Any, Optional, Callable
 from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
+import logging
 
 from .logger import get_logger
 from .bybit_client import BybitClient
@@ -25,25 +33,18 @@ logger = get_logger("scanner")
 
 class Scanner:
     def __init__(self):
-        # create a token-bucket limiter and pass to client
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
-        # normalized store: kline_store[symbol][tf] -> list of dicts with keys: start_at, close, volume, optionally is_closed
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
-
-        # minimal callback/event system
         self._callbacks: List[Callable[[str, Any], Any]] = []
+        logger.info("scanner: initialized (WS-enabled, root-subscribe-only startup)")
 
-        logger.info("scanner: initialized (robust normalization, 5m-open scheduling when ROOT_SCAN_INTERVAL==0)")
-
-    # minimal event system so other parts can listen
     def register_callback(self, cb: Callable[[str, Any], Any]):
-        """Register a callback that accepts (event_name, payload). Callback may be async or sync."""
         if not callable(cb):
             raise TypeError("callback must be callable")
         self._callbacks.append(cb)
@@ -61,7 +62,6 @@ class Scanner:
                 logger.exception("Callback for event %s failed", event)
 
     async def _call_client_method(self, names: List[str], *args, **kwargs):
-        """Try several method names on the client defensively and return first non-exception result."""
         for name in names:
             try:
                 fn = getattr(self.client, name, None)
@@ -78,7 +78,6 @@ class Scanner:
         return None
 
     async def _get_symbols(self):
-        """Defensively fetch symbols using possible names returned by different Bybit clients/versions."""
         items = None
         try:
             items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])
@@ -92,19 +91,15 @@ class Scanner:
             self.symbols = []
             return []
 
-        # If API returns a dict with data/result field
         if isinstance(items, dict):
             if "data" in items and isinstance(items["data"], (list, dict)):
                 items = items["data"]
             elif "result" in items and isinstance(items["result"], (list, dict)):
                 items = items["result"]
 
-        # If items is a single string, normalize to list
         if isinstance(items, (str,)):
             items = [items]
 
-        syms = []
-        # INFO-level sample payload logging (visible on default logs)
         try:
             if isinstance(items, (list, tuple)) and len(items) > 0:
                 logger.info("scanner: normalization debug active - logging sample instrument payload (truncated)")
@@ -120,16 +115,14 @@ class Scanner:
         except Exception:
             logger.exception("scanner: unable to log sample instrument payload")
 
+        syms = []
         for it in items:
             try:
-                # If it's a plain symbol string
                 if isinstance(it, str):
                     sym = it.strip().upper()
                     syms.append(sym)
                     continue
-
                 if not isinstance(it, dict):
-                    # unknown shape, try to stringify
                     try:
                         v = str(it)
                         syms.append(v.upper())
@@ -137,7 +130,6 @@ class Scanner:
                         continue
                     continue
 
-                # dict-shaped responses: try many fields from v2/v5
                 symbol = (
                     it.get("name")
                     or it.get("symbol")
@@ -147,7 +139,6 @@ class Scanner:
                     or it.get("id")
                 )
                 if not symbol:
-                    # try composing from base/quote
                     base = it.get("baseCoin") or it.get("base")
                     quote = it.get("quoteCoin") or it.get("quote")
                     if base and quote:
@@ -157,7 +148,6 @@ class Scanner:
                     continue
                 symbol = str(symbol).upper()
 
-                # ignore dated contracts — but treat numeric/str "0" as no expiry (perpetual)
                 expiry = (
                     it.get("expiry_time") or it.get("deliveryTime") or it.get("delivery_time")
                     or it.get("expiry") or it.get("expireTime") or it.get("delivery")
@@ -181,10 +171,8 @@ class Scanner:
                     except Exception:
                         has_expiry = True
                 if has_expiry:
-                    # skip dated contracts
                     continue
 
-                # prefer USDT perpetuals
                 if not symbol.endswith("USDT"):
                     quote = it.get("quoteCoin") or it.get("quote")
                     if quote and str(quote).upper() != "USDT":
@@ -208,9 +196,22 @@ class Scanner:
         return syms
 
     async def discover_symbols(self):
-        """Public symbol discovery entry (keeps backward compatibility)."""
         try:
-            return await self._get_symbols()
+            syms = await self._get_symbols()
+            try:
+                await self.client.start_kline_ws()
+            except Exception:
+                logger.exception("Failed to start client WS")
+            # subscribe only to ROOT_TFS at startup to reduce WS subscription load
+            if syms:
+                try:
+                    await self.client.subscribe_klines_for_symbols(syms, ROOT_TFS)
+                    logger.info("Requested WS subscriptions for %d symbols x %d root tfs", len(syms), len(ROOT_TFS))
+                except Exception:
+                    logger.exception("Failed to queue WS subscriptions for roots")
+            else:
+                logger.debug("No symbols discovered; skipped WS subscription requests")
+            return syms
         except Exception:
             logger.exception("discover_symbols failed")
             return []
@@ -352,18 +353,20 @@ class Scanner:
 
     async def seed_all(self):
         logger.info("Seeding klines for all symbols (concurrent=%d)", CONCURRENCY)
-
         async def worker(sym: str):
             await self.concurrent_sem.acquire()
             try:
                 await self.seed_klines_for_symbol(sym)
             finally:
                 self.concurrent_sem.release()
-
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         await asyncio.gather(*tasks)
 
-    def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None):
+    def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
+        """
+        Build closes from REST kline_store and optionally append latest WS cached close as temporary datapoint.
+        Does NOT persist WS data to kline_store.
+        """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes = []
         for c in data:
@@ -373,7 +376,16 @@ class Scanner:
             elif isinstance(c, (int, float)):
                 closes.append(float(c))
         if include_price is not None:
+            # include_price is a strong override (REST latest price)
             closes = closes + [float(include_price)]
+        elif use_ws_current:
+            # fallback: append ws latest kline close as temporary datapoint if available
+            try:
+                ws_last = self.client.get_ws_latest_kline(symbol, tf) if hasattr(self.client, "get_ws_latest_kline") else None
+                if ws_last and ws_last.get("close") is not None:
+                    closes = closes + [float(ws_last.get("close"))]
+            except Exception:
+                pass
         macd_line, signal_line, hist = macd_histogram(closes)
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
@@ -451,12 +463,21 @@ class Scanner:
                 async def check_symbol(sym: str):
                     await self.concurrent_sem.acquire()
                     try:
+                        # Prefer REST latest price; else fallback to WS current close for root TF
                         price = await self.client.get_latest_price(sym)
+                        if price is None:
+                            try:
+                                ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
+                                if ws_last and ws_last.get("close") is not None:
+                                    price = float(ws_last.get("close"))
+                            except Exception:
+                                price = None
                         if price is None:
                             logger.debug("No latest price for %s", sym)
                             return
                         for root in ROOT_TFS:
-                            macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price)
+                            # use_ws_current=True so we append latest WS candle as temporary datapoint if REST price missing
+                            macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
                             if self.detect_flip_current_open(hist, 0.0):
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
@@ -478,6 +499,16 @@ class Scanner:
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
+                    # For each root signal, ensure MTF subscriptions for that symbol (subscribe on-demand)
+                    # then evaluate MTFs using REST-seeded klines and optionally use_ws_current to include latest WS candle.
+                    # We subscribe to MTF once per symbol (client avoids duplicate subscriptions).
+                    for sig in root_signals:
+                        try:
+                            sym = sig["symbol"]
+                            # request MTF subscription on demand (non-blocking)
+                            await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                        except Exception:
+                            logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
                     await self.handle_root_signals(root_signals)
                 else:
                     logger.info("No root signals this interval.")
@@ -486,7 +517,6 @@ class Scanner:
                 logger.exception("Error in root scan loop")
             elapsed = time.time() - start
 
-            # scheduling: either use config interval, or if not set/empty, run at open of every 5m candle
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 await asyncio.sleep(to_sleep)
@@ -507,8 +537,9 @@ class Scanner:
             mtf_state = {}
             positive_count = 0
             any_positive_mtfflip = False
+            # For MTF checks, include use_ws_current=True so we can use latest WS candle as temporary datapoint
             for tf in MTF_TFS:
-                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price)
+                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
                 cur_hist = h[-1] if h and len(h) >= 1 else None
                 prev_hist = h[-2] if h and len(h) >= 2 else None
                 mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
@@ -518,7 +549,7 @@ class Scanner:
                     any_positive_mtfflip = True
             one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
-                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price)
+                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
                 one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK)
             score = float(positive_count)
             if any_positive_mtfflip:
@@ -628,7 +659,6 @@ class Scanner:
         await send_message(text)
 
     async def run(self):
-        # start as a cancellable task
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

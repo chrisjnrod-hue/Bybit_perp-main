@@ -1,4 +1,3 @@
-# scanner.py
 import os
 import asyncio
 import time
@@ -14,8 +13,7 @@ from .macd import macd_histogram, slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MTF_FILTER, MAX_OPEN_TRADES,
-    USE_WS
+    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MTF_FILTER, MAX_OPEN_TRADES, USE_WS
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -24,33 +22,35 @@ from .ratelimiter import TokenBucket
 getcontext().prec = 28
 logger = get_logger("scanner")
 
+# allow override of seed limit via env (keeps backward compatibility)
+SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
+
 # REST poll interval for fallback when WS disabled/unavailable (seconds)
 REST_POLL_INTERVAL = int(os.getenv("REST_POLL_INTERVAL", "5"))
 
 
 class Scanner:
     def __init__(self):
-        # rate limiter placeholder (BybitClient also uses RATE_LIMIT_RPS)
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
 
-        # kline_store[symbol][tf] = list of normalized candles (REST-seeded history)
+        # REST-seeded history store: kline_store[symbol][tf] -> list of normalized candles
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
 
-        # REST poller (only used if WS disabled/unavailable)
+        # REST poller task when WS disabled/unavailable
         self._rest_poller_task: Optional[asyncio.Task] = None
 
-        # minimal callbacks
+        # event callbacks
         self._callbacks: List[Callable[[str, Any], Any]] = []
 
-        logger.info("scanner: initialized (USE_WS=%s)", bool(USE_WS))
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d)", bool(USE_WS), SEED_KLINES_LIMIT)
 
-    # ----- callback/event system -----
+    # ---------------- events ----------------
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
             raise TypeError("callback must be callable")
@@ -68,7 +68,7 @@ class Scanner:
             except Exception:
                 logger.exception("Callback for event %s failed", event)
 
-    # ----- helpers to call client methods defensively -----
+    # -------------- client helper --------------
     async def _call_client_method(self, names: List[str], *args, **kwargs):
         for name in names:
             try:
@@ -85,9 +85,8 @@ class Scanner:
         logger.debug("No client method among %s succeeded", names)
         return None
 
-    # ----- symbol discovery & normalization -----
+    # -------------- symbol discovery --------------
     async def _get_symbols(self) -> List[str]:
-        items = None
         try:
             items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])
         except Exception:
@@ -100,7 +99,6 @@ class Scanner:
             self.symbols = []
             return []
 
-        # drill into common wrappers
         if isinstance(items, dict):
             if "data" in items and isinstance(items["data"], (list, dict)):
                 items = items["data"]
@@ -110,10 +108,9 @@ class Scanner:
         if isinstance(items, (str,)):
             items = [items]
 
-        # INFO-level sample payload logging to aid debugging
+        # log sample payload for debugging
         try:
             if isinstance(items, (list, tuple)) and len(items) > 0:
-                logger.info("scanner: normalization debug active - logging sample instrument payload (truncated)")
                 sample = items[0]
                 try:
                     if isinstance(sample, dict):
@@ -122,20 +119,17 @@ class Scanner:
                         logger.info("scanner: sample instrument type: %s repr: %s", type(sample).__name__, repr(sample)[:400])
                 except Exception:
                     logger.info("scanner: failed to extract sample keys")
-                logger.info("scanner: sample instrument payload (truncated): %s", repr(sample)[:1000])
+                logger.debug("scanner: sample instrument payload (truncated): %s", repr(sample)[:1000])
         except Exception:
             logger.exception("scanner: unable to log sample instrument payload")
 
         syms = []
         for it in items:
             try:
-                # string entry
                 if isinstance(it, str):
                     sym = it.strip().upper()
                     syms.append(sym)
                     continue
-
-                # not dict: coerce to string if possible
                 if not isinstance(it, dict):
                     try:
                         v = str(it)
@@ -144,7 +138,6 @@ class Scanner:
                         continue
                     continue
 
-                # dict-shaped entry: many possible key names across Bybit versions
                 symbol = (
                     it.get("name")
                     or it.get("symbol")
@@ -163,7 +156,6 @@ class Scanner:
                     continue
                 symbol = str(symbol).upper()
 
-                # expiry/delivery handling: treat numeric/str "0" as no expiry (perpetual)
                 expiry = (
                     it.get("expiry_time") or it.get("deliveryTime") or it.get("delivery_time")
                     or it.get("expiry") or it.get("expireTime") or it.get("delivery")
@@ -187,10 +179,9 @@ class Scanner:
                     except Exception:
                         has_expiry = True
                 if has_expiry:
-                    # skip dated contracts
                     continue
 
-                # prefer USDT perpetuals
+                # prefer USDT perp
                 if not symbol.endswith("USDT"):
                     quote = it.get("quoteCoin") or it.get("quote")
                     if quote and str(quote).upper() != "USDT":
@@ -216,38 +207,55 @@ class Scanner:
     async def discover_symbols(self) -> List[str]:
         try:
             syms = await self._get_symbols()
-            # start WS only when configured to use WS
+            # start websocket only when configured
             if USE_WS:
                 try:
                     await self.client.start_kline_ws()
                 except Exception:
                     logger.exception("Failed to start client WS")
-                # subscribe ROOT_TFS for all discovered symbols
-                if syms:
-                    try:
-                        await self.client.subscribe_klines_for_symbols(syms, ROOT_TFS)
-                        logger.info("Requested WS subscriptions for %d symbols x %d root tfs", len(syms), len(ROOT_TFS))
-                    except Exception:
-                        logger.exception("Failed to queue WS subscriptions for roots")
             else:
-                logger.info("USE_WS is False; WS will not be started, REST poller used when needed")
+                logger.info("USE_WS is False; not starting websocket")
 
-            # ensure rest poller if ws not connected or disabled
-            await self._ensure_rest_poller()
+            # Attempt immediate subscriptions for ROOT_TFS using client.sub_kline (tries multiple topic variants)
+            if syms:
+                tasks = []
+                sem = asyncio.Semaphore(max(1, CONCURRENCY))
+                for sym in syms:
+                    for tf in ROOT_TFS:
+                        async def worker(s=sym, t=tf):
+                            async with sem:
+                                try:
+                                    res = await self.client.sub_kline(s, t) if hasattr(self.client, "sub_kline") else await self.client.subscribe_klines_for_symbols([s], [t])
+                                    if res:
+                                        logger.debug("sub_kline: immediate attempt for %s %s", s, t)
+                                    else:
+                                        logger.debug("sub_kline: queued for %s %s", s, t)
+                                except Exception:
+                                    logger.exception("sub_kline error for %s %s", s, t)
+                        tasks.append(asyncio.create_task(worker()))
+                if tasks:
+                    await asyncio.gather(*tasks)
             return syms
         except Exception:
             logger.exception("discover_symbols failed")
             return []
 
-    # ----- kline normalization & seeding (REST) -----
+    # ---------------- Kline normalization & seeding ----------------
     def _tf_to_seconds(self, tf: str) -> int:
         try:
-            if tf.endswith("m"):
-                return int(tf[:-1]) * 60
-            if tf.endswith("h"):
-                return int(tf[:-1]) * 3600
-            if tf.endswith("d"):
-                return int(tf[:-1]) * 86400
+            s = str(tf)
+            if s.endswith("m"):
+                return int(s[:-1]) * 60
+            if s.endswith("h"):
+                return int(s[:-1]) * 3600
+            if s == "D" or s.endswith("d"):
+                # 'D' treated as 1 day
+                try:
+                    if s == "D":
+                        return 24 * 3600
+                    return int(s[:-1]) * 86400
+                except Exception:
+                    return 24 * 3600
         except Exception:
             pass
         return 60
@@ -353,14 +361,14 @@ class Scanner:
         return out
 
     async def seed_klines_for_symbol(self, symbol: str):
-        if KLINE_SEED_LIMIT < 100:
-            logger.warning("KLINE_SEED_LIMIT is low (%d); MACD stability may be degraded. Consider >=200", KLINE_SEED_LIMIT)
+        if SEED_KLINES_LIMIT < 100:
+            logger.warning("SEED_KLINES_LIMIT is low (%d); MACD stability may be degraded. Consider >=200", SEED_KLINES_LIMIT)
         tfs = list(set(ROOT_TFS + MTF_TFS))
         for tf in tfs:
             try:
-                raw = await self._call_get_klines(symbol, tf, limit=KLINE_SEED_LIMIT)
+                raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
                 if not raw:
-                    raw = await self._call_client_method(["get_klines", "getKlines"], symbol, tf, KLINE_SEED_LIMIT)
+                    raw = await self._call_client_method(["get_klines", "getKlines"], symbol, tf, SEED_KLINES_LIMIT)
                 if not raw:
                     logger.debug("No klines returned for %s %s", symbol, tf)
                     continue
@@ -372,33 +380,38 @@ class Scanner:
                         klines_sorted = normalized
                     self.kline_store[symbol][tf] = klines_sorted
                     logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
+                    # If only one candle returned, log truncated raw response to help debug
+                    if len(klines_sorted) <= 1:
+                        try:
+                            snippet = str(raw)
+                            snippet_trunc = (snippet[:2000] + '...') if len(snippet) > 2000 else snippet
+                            logger.warning("Seeded only %d candle for %s %s. Raw response (truncated): %s", len(klines_sorted), symbol, tf, snippet_trunc)
+                        except Exception:
+                            logger.warning("Seeded only %d candle for %s %s (raw response logging failed).", len(klines_sorted), symbol, tf)
                     await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
 
     async def seed_all(self):
-        logger.info("Seeding klines for all symbols (concurrent=%d)", CONCURRENCY)
-
+        logger.info("Seeding klines for all symbols (concurrent=%d limit=%d)", CONCURRENCY, SEED_KLINES_LIMIT)
         async def worker(sym: str):
             await self.concurrent_sem.acquire()
             try:
                 await self.seed_klines_for_symbol(sym)
             finally:
                 self.concurrent_sem.release()
-
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         await asyncio.gather(*tasks)
 
-    # ----- REST poller used when WS is disabled or not connected -----
+    # ---------------- REST poller fallback (when WS is disabled/unavailable) ----------------
     async def _rest_poller(self):
-        logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
+        logger.info("REST poller started (interval=%s seconds) because WS unavailable", REST_POLL_INTERVAL)
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
                 start = time.time()
                 if not self.symbols:
                     await asyncio.sleep(REST_POLL_INTERVAL)
                     continue
-
                 sem = self.concurrent_sem
 
                 async def poll_symbol(sym: str):
@@ -440,12 +453,11 @@ class Scanner:
         except asyncio.CancelledError:
             logger.info("REST poller cancelled")
         except Exception:
-            logger.exception("REST poller exception")
+            logger.exception("REST poller encountered an exception")
         logger.info("REST poller stopped")
 
     async def _ensure_rest_poller(self):
         if USE_WS and self.client.is_ws_connected():
-            # stop poller if running
             if self._rest_poller_task and not self._rest_poller_task.done():
                 try:
                     self._rest_poller_task.cancel()
@@ -457,16 +469,18 @@ class Scanner:
             return
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
-    # ----- MACD & detection -----
+    # ---------------- MACD and helpers ----------------
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         data = self.kline_store.get(symbol, {}).get(tf, [])
-        closes = []
+        closes: List[float] = []
         for c in data:
-            if isinstance(c, dict):
-                if "close" in c and c["close"] is not None:
-                    closes.append(float(c.get("close", 0)))
-            elif isinstance(c, (int, float)):
-                closes.append(float(c))
+            try:
+                if isinstance(c, dict) and c.get("close") is not None:
+                    closes.append(float(c.get("close")))
+                elif isinstance(c, (int, float)):
+                    closes.append(float(c))
+            except Exception:
+                continue
         if include_price is not None:
             closes = closes + [float(include_price)]
         elif use_ws_current and USE_WS:
@@ -539,7 +553,7 @@ class Scanner:
             pass
         return float(quant)
 
-    # ----- root scan loop -----
+    # ---------------- root scan loop ----------------
     async def root_scan_loop(self):
         logger.info("Starting root scan loop interval=%s", ROOT_SCAN_INTERVAL)
         while not self._stop:
@@ -549,7 +563,7 @@ class Scanner:
                     await self.discover_symbols()
                     await self.seed_all()
 
-                # ensure REST poller if WS not connected or disabled
+                # ensure rest poller (if ws disabled/unavailable)
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
@@ -592,11 +606,12 @@ class Scanner:
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
-                    # request MTF subscriptions on-demand for each signal's symbol
+                    # request MTF subscriptions on-demand and handle signals
                     for sig in root_signals:
                         try:
                             sym = sig["symbol"]
-                            await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                            if hasattr(self.client, "subscribe_mtf_for_symbol"):
+                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
                     await self.handle_root_signals(root_signals)
@@ -607,7 +622,6 @@ class Scanner:
                 logger.exception("Error in root scan loop")
             elapsed = time.time() - start
 
-            # scheduling: either use config interval, or if not set/empty, run at open of every 5m candle
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 await asyncio.sleep(to_sleep)
@@ -618,7 +632,7 @@ class Scanner:
                 logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
                 await asyncio.sleep(to_sleep)
 
-    # ----- handle evaluated root signals & open trades -----
+    # ---------------- handle signals & trades ----------------
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
         evaluated = []
         for item in root_signals:
@@ -722,7 +736,7 @@ class Scanner:
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
                 await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
 
-    # ----- summary & run/stop -----
+    # ---------------- summary & run/stop ----------------
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
         if not root_signals:
             await send_message("Root scan: no signals this interval.")
@@ -751,7 +765,6 @@ class Scanner:
         await send_message(text)
 
     async def run(self):
-        # start as a cancellable task
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

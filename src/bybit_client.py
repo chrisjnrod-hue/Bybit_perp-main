@@ -1,11 +1,13 @@
+# bybit_client.py
 """
 BybitClient with REST + resilient WebSocket kline support.
 
-This version tolerates handshake 404s by trying multiple WS endpoints,
-logs clearly when WS can't connect, and keeps retrying with backoff.
-REST methods (get_symbols, get_klines, get_latest_price, get_symbol_info)
-are unchanged and defensive.
+- Tries multiple WS endpoints and any BYBIT_WS_HOSTS env override.
+- Exposes start_kline_ws/stop_kline_ws, subscribe_klines_for_symbols, subscribe_mtf_for_symbol,
+  get_ws_klines, get_ws_latest_kline, is_ws_connected.
+- Keeps REST methods defensive.
 """
+import os
 import asyncio
 import json
 import time
@@ -33,12 +35,19 @@ class BybitClient:
             mainnet_flag = True
 
         self.rest_base = "https://api.bybit.com" if mainnet_flag else "https://api-testnet.bybit.com"
-        # base host for WS; actual path variants will be tried
+
+        # default ws hosts/paths to try; some Bybit deployments accept one and not the other
         host = "stream.bybit.com" if mainnet_flag else "stream-testnet.bybit.com"
-        self.ws_hosts = [
+        default_ws_hosts = [
             f"wss://{host}/realtime_public",
             f"wss://{host}/realtime",
         ]
+        # allow override/extra candidate hosts via env var BYBIT_WS_HOSTS (comma separated)
+        env_hosts = os.getenv("BYBIT_WS_HOSTS", "")
+        extra = [h.strip() for h in env_hosts.split(",") if h.strip()]
+        # final ordered list
+        self.ws_hosts = extra + default_ws_hosts
+
         logger.info("BybitClient rest_base=%s ws_hosts=%s", self.rest_base, self.ws_hosts)
 
         self.api_key = BYBIT_API_KEY
@@ -52,7 +61,7 @@ class BybitClient:
             rate_val = 5.0
         self.rate_limiter = rate_limiter or TokenBucket(max(1.0, rate_val))
 
-        # WS runtime
+        # WS runtime state
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_session: Optional[aiohttp.ClientSession] = None
@@ -63,7 +72,7 @@ class BybitClient:
         self._ws_stop = False
         self._ws_backoff = 1.0
 
-    # ---------------- REST helpers (unchanged) ----------------
+    # ---------------- REST helpers ----------------
     async def _session_obj(self) -> aiohttp.ClientSession:
         if not self._session:
             self._session = aiohttp.ClientSession()
@@ -115,6 +124,7 @@ class BybitClient:
         return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
+        # try v5 then v2, defensive parsing
         try:
             params = {"category": "linear", "instrumentType": "PERPETUAL"}
             data = await self._get("/v5/market/instruments-info", params=params)
@@ -480,7 +490,7 @@ class BybitClient:
         """
         Connect attempts:
          - Try each host/path in self.ws_hosts in order.
-         - If handshake (404 or other) occurs, try next host.
+         - If handshake (404 or other) occurs, try next url.
          - If none succeed, back off and retry.
         """
         while not self._ws_stop:
@@ -496,15 +506,17 @@ class BybitClient:
                         connected = True
                         logger.info("Bybit WS connected to %s", ws_url)
 
-                        # drain pending subscriptions and send subscribe requests
+                        # drain pending_subscribe
                         pending = []
                         while not self._pending_subscribe.empty():
                             try:
                                 pending.append(self._pending_subscribe.get_nowait())
                             except Exception:
                                 break
+                        # ensure requested_subs are also queued
                         for (sym, tf) in list(self._requested_subs):
                             pending.append(("subscribe", sym, tf))
+
                         for op, sym, tf in pending:
                             for topic in self._candidate_topics(sym, tf):
                                 try:
@@ -546,7 +558,6 @@ class BybitClient:
                         except Exception:
                             pass
                 except client_exceptions.WSServerHandshakeError as wh:
-                    # handshake failure (e.g. 404); try next url
                     logger.warning("Bybit WS handshake failed for %s: %s", ws_url, getattr(wh, 'message', repr(wh)))
                     continue
                 except asyncio.CancelledError:
@@ -564,7 +575,6 @@ class BybitClient:
                     self._ws = None
 
                 if connected:
-                    # exited cleanly from connection loop; break host trial loop and retry connecting same hosts after backoff if necessary
                     break
 
             if not connected:
@@ -593,3 +603,9 @@ class BybitClient:
             return dict(c[-1])
         except Exception:
             return None
+
+    def is_ws_connected(self) -> bool:
+        try:
+            return self._ws is not None and not self._ws.closed
+        except Exception:
+            return False

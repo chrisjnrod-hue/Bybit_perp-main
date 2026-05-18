@@ -1,11 +1,15 @@
+# scanner.py
 """
-Scanner using REST seeding for MACD history and WebSocket for live current candle updates.
+Scanner that uses REST seeding for MACD and a WS client for live updates when available.
+If the WS cannot connect (handshake failures, platform blocks), scanner falls back to a REST poller
+that periodically fetches latest root candles so detection continues.
 
-Behavior:
-- After discovering symbols, start WS and subscribe to ROOT_TFS for all symbols.
-- On a root flip detection candidate, request MTF subscriptions for that symbol (on-demand).
-- compute_macd_for supports use_ws_current=True to append the latest WS candle close as a temporary datapoint (not persisted).
+Key points:
+- WS is preferred for live current-candle updates (compute_macd_for use_ws_current=True).
+- WS cache is NOT used to seed MACD history (seed_all uses REST).
+- REST poller updates the last candle for ROOT_TFS when WS is unavailable.
 """
+import os
 import asyncio
 import time
 from collections import defaultdict
@@ -13,7 +17,6 @@ from typing import Dict, List, Any, Optional, Callable
 from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
-import logging
 
 from .logger import get_logger
 from .bybit_client import BybitClient
@@ -30,6 +33,9 @@ from .ratelimiter import TokenBucket
 getcontext().prec = 28
 logger = get_logger("scanner")
 
+# If WS not available, poll REST this often (seconds). Keep conservative to avoid rate limits.
+REST_POLL_INTERVAL = int(os.getenv("REST_POLL_INTERVAL", "5"))
+
 
 class Scanner:
     def __init__(self):
@@ -41,8 +47,9 @@ class Scanner:
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
+        self._rest_poller_task: Optional[asyncio.Task] = None
         self._callbacks: List[Callable[[str, Any], Any]] = []
-        logger.info("scanner: initialized (WS-enabled, root-subscribe-only startup)")
+        logger.info("scanner: initialized (WS-enabled with REST poller fallback)")
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -77,6 +84,7 @@ class Scanner:
         logger.debug("No client method among %s succeeded", names)
         return None
 
+    # ---------------- Symbols ----------------
     async def _get_symbols(self):
         items = None
         try:
@@ -202,20 +210,23 @@ class Scanner:
                 await self.client.start_kline_ws()
             except Exception:
                 logger.exception("Failed to start client WS")
-            # subscribe only to ROOT_TFS at startup to reduce WS subscription load
             if syms:
                 try:
+                    # subscribe only to ROOT_TFS at startup to reduce WS subscription load
                     await self.client.subscribe_klines_for_symbols(syms, ROOT_TFS)
                     logger.info("Requested WS subscriptions for %d symbols x %d root tfs", len(syms), len(ROOT_TFS))
                 except Exception:
                     logger.exception("Failed to queue WS subscriptions for roots")
             else:
                 logger.debug("No symbols discovered; skipped WS subscription requests")
+            # ensure rest poller state (if WS not connected, poller will start)
+            await self._ensure_rest_poller()
             return syms
         except Exception:
             logger.exception("discover_symbols failed")
             return []
 
+    # ----------------- normalization & REST seeding -----------------
     def _tf_to_seconds(self, tf: str) -> int:
         try:
             if tf.endswith("m"):
@@ -362,6 +373,88 @@ class Scanner:
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         await asyncio.gather(*tasks)
 
+    # ----------------- WS fallback poller management -----------------
+    async def _rest_poller(self):
+        """
+        When WS is not connected, poll REST for the most recent root-candle per symbol
+        and update kline_store's last candle (temporary). This helps detection continue
+        in environments that block websockets.
+        """
+        logger.info("REST poller started (interval=%ss) because WS unavailable", REST_POLL_INTERVAL)
+        try:
+            while not self._stop and not self.client.is_ws_connected():
+                start = time.time()
+                # poll symbols in limited concurrency batches
+                if not self.symbols:
+                    await asyncio.sleep(REST_POLL_INTERVAL)
+                    continue
+                sem = self.concurrent_sem
+                async def poll_symbol(sym: str):
+                    await sem.acquire()
+                    try:
+                        for root in ROOT_TFS:
+                            try:
+                                data = await self.client.get_klines(sym, root, limit=3)
+                                normalized = self._normalize_klines(data, root) if data else []
+                                if normalized:
+                                    # pick last closed candle if present; else last
+                                    if normalized:
+                                        # don't replace seed history, just update last candle for detection
+                                        lst = self.kline_store.get(sym, {}).get(root, [])
+                                        # we want to update lst[-1] if timestamps match, else append
+                                        last_new = normalized[-1]
+                                        if lst:
+                                            try:
+                                                if lst[-1].get("start_at") == last_new.get("start_at"):
+                                                    lst[-1] = last_new
+                                                else:
+                                                    lst.append(last_new)
+                                            except Exception:
+                                                # fallback: set as single list
+                                                self.kline_store.setdefault(sym, {})[root] = normalized
+                                        else:
+                                            self.kline_store.setdefault(sym, {})[root] = normalized
+                            except Exception:
+                                logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
+                    finally:
+                        sem.release()
+
+                tasks = [asyncio.create_task(poll_symbol(s)) for s in self.symbols]
+                # wait, but bound the wait time so poller loop remains responsive
+                try:
+                    await asyncio.wait(tasks, timeout=REST_POLL_INTERVAL)
+                except Exception:
+                    pass
+                elapsed = time.time() - start
+                to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
+                # break out early if WS came back
+                if self.client.is_ws_connected():
+                    logger.info("WS reconnected; stopping REST poller")
+                    break
+                await asyncio.sleep(to_sleep)
+        except asyncio.CancelledError:
+            logger.info("REST poller cancelled")
+        except Exception:
+            logger.exception("REST poller encountered an exception")
+        logger.info("REST poller stopped")
+
+    async def _ensure_rest_poller(self):
+        if self.client.is_ws_connected():
+            # stop poller if running
+            if self._rest_poller_task and not self._rest_poller_task.done():
+                try:
+                    self._rest_poller_task.cancel()
+                except Exception:
+                    pass
+                self._rest_poller_task = None
+            return
+
+        # start poller if not already running
+        if self._rest_poller_task and not self._rest_poller_task.done():
+            return
+        self._rest_poller_task = asyncio.create_task(self._rest_poller())
+
+    # ----------------- MACD & detection -----------------
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
         Build closes from REST kline_store and optionally append latest WS cached close as temporary datapoint.
@@ -376,12 +469,12 @@ class Scanner:
             elif isinstance(c, (int, float)):
                 closes.append(float(c))
         if include_price is not None:
-            # include_price is a strong override (REST latest price)
             closes = closes + [float(include_price)]
         elif use_ws_current:
-            # fallback: append ws latest kline close as temporary datapoint if available
             try:
-                ws_last = self.client.get_ws_latest_kline(symbol, tf) if hasattr(self.client, "get_ws_latest_kline") else None
+                ws_last = None
+                if hasattr(self.client, "get_ws_latest_kline"):
+                    ws_last = self.client.get_ws_latest_kline(symbol, tf)
                 if ws_last and ws_last.get("close") is not None:
                     closes = closes + [float(ws_last.get("close"))]
             except Exception:
@@ -449,6 +542,7 @@ class Scanner:
             pass
         return float(quant)
 
+    # ----------------- root scan loop -----------------
     async def root_scan_loop(self):
         logger.info("Starting root scan loop interval=%s", ROOT_SCAN_INTERVAL)
         while not self._stop:
@@ -458,12 +552,23 @@ class Scanner:
                     await self.discover_symbols()
                     await self.seed_all()
 
+                # ensure rest poller state: if WS not connected, ensure poller running
+                if not self.client.is_ws_connected():
+                    await self._ensure_rest_poller()
+                else:
+                    # if WS reconnected, stop poller if running
+                    if self._rest_poller_task and not self._rest_poller_task.done():
+                        try:
+                            self._rest_poller_task.cancel()
+                        except Exception:
+                            pass
+                        self._rest_poller_task = None
+
                 root_signals: List[Dict[str, Any]] = []
 
                 async def check_symbol(sym: str):
                     await self.concurrent_sem.acquire()
                     try:
-                        # Prefer REST latest price; else fallback to WS current close for root TF
                         price = await self.client.get_latest_price(sym)
                         if price is None:
                             try:
@@ -476,7 +581,6 @@ class Scanner:
                             logger.debug("No latest price for %s", sym)
                             return
                         for root in ROOT_TFS:
-                            # use_ws_current=True so we append latest WS candle as temporary datapoint if REST price missing
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
                             if self.detect_flip_current_open(hist, 0.0):
                                 vol_change = self.compute_24h_volume_change(sym)
@@ -499,13 +603,10 @@ class Scanner:
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
-                    # For each root signal, ensure MTF subscriptions for that symbol (subscribe on-demand)
-                    # then evaluate MTFs using REST-seeded klines and optionally use_ws_current to include latest WS candle.
-                    # We subscribe to MTF once per symbol (client avoids duplicate subscriptions).
+                    # request MTF subscriptions on-demand
                     for sig in root_signals:
                         try:
                             sym = sig["symbol"]
-                            # request MTF subscription on demand (non-blocking)
                             await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
@@ -527,7 +628,10 @@ class Scanner:
                 logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
                 await asyncio.sleep(to_sleep)
 
+    # ----------------- further methods (handle_root_signals, send_summary, run, stop) remain unchanged -----------------
+    # (Use the previously provided robust implementations for these; they work with the compute_macd_for changes.)
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
+        # Implementation unchanged from prior robust version; keep identical logic for evaluation & opening
         evaluated = []
         for item in root_signals:
             sym = item["symbol"]
@@ -537,7 +641,6 @@ class Scanner:
             mtf_state = {}
             positive_count = 0
             any_positive_mtfflip = False
-            # For MTF checks, include use_ws_current=True so we can use latest WS candle as temporary datapoint
             for tf in MTF_TFS:
                 macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
                 cur_hist = h[-1] if h and len(h) >= 1 else None
@@ -675,3 +778,8 @@ class Scanner:
         self._stop = True
         if self._task and not self._task.done():
             self._task.cancel()
+        if self._rest_poller_task and not self._rest_poller_task.done():
+            try:
+                self._rest_poller_task.cancel()
+            except Exception:
+                pass

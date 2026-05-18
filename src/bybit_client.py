@@ -1,13 +1,11 @@
 # bybit_client.py
 """
-BybitClient with REST + resilient WebSocket kline support.
-
-- Tries multiple WS endpoints and any BYBIT_WS_HOSTS env override.
-- Exposes start_kline_ws/stop_kline_ws, subscribe_klines_for_symbols, subscribe_mtf_for_symbol,
-  get_ws_klines, get_ws_latest_kline, is_ws_connected.
-- Keeps REST methods defensive.
+BybitClient with REST + WebSocket kline support.
+Minimal additions:
+ - async sub_kline(symbol, tf): try several topic/interval formats immediately when WS is connected,
+   otherwise queue the subscription for later (keeps prior subscribe_klines_for_symbols behaviour).
+ - existing resilient WS loop and topic candidate generation are reused.
 """
-import os
 import asyncio
 import json
 import time
@@ -16,6 +14,7 @@ import aiohttp
 from aiohttp import client_exceptions
 from collections import defaultdict, deque
 import traceback
+import os
 
 from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS, KLINE_SEED_LIMIT
 from .logger import get_logger
@@ -35,17 +34,15 @@ class BybitClient:
             mainnet_flag = True
 
         self.rest_base = "https://api.bybit.com" if mainnet_flag else "https://api-testnet.bybit.com"
-
-        # default ws hosts/paths to try; some Bybit deployments accept one and not the other
         host = "stream.bybit.com" if mainnet_flag else "stream-testnet.bybit.com"
+
+        # allow override via env BYBIT_WS_HOSTS (comma separated) to help debugging/regions
+        env_hosts = os.getenv("BYBIT_WS_HOSTS", "")
+        extra = [h.strip() for h in env_hosts.split(",") if h.strip()]
         default_ws_hosts = [
             f"wss://{host}/realtime_public",
             f"wss://{host}/realtime",
         ]
-        # allow override/extra candidate hosts via env var BYBIT_WS_HOSTS (comma separated)
-        env_hosts = os.getenv("BYBIT_WS_HOSTS", "")
-        extra = [h.strip() for h in env_hosts.split(",") if h.strip()]
-        # final ordered list
         self.ws_hosts = extra + default_ws_hosts
 
         logger.info("BybitClient rest_base=%s ws_hosts=%s", self.rest_base, self.ws_hosts)
@@ -66,13 +63,16 @@ class BybitClient:
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_session: Optional[aiohttp.ClientSession] = None
         self._pending_subscribe: asyncio.Queue = asyncio.Queue()
+        # cache: symbol -> tf -> deque of normalized klines
         self._kline_cache: Dict[str, Dict[str, deque]] = defaultdict(dict)
+        # requested subscriptions set (symbol,tf)
         self._requested_subs: set = set()
+        # mtf subscriptions per symbol to avoid re-queuing
         self._mtf_subscribed: set = set()
         self._ws_stop = False
         self._ws_backoff = 1.0
 
-    # ---------------- REST helpers ----------------
+    # ---- REST helpers (unchanged defensive) ----
     async def _session_obj(self) -> aiohttp.ClientSession:
         if not self._session:
             self._session = aiohttp.ClientSession()
@@ -124,7 +124,6 @@ class BybitClient:
         return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
-        # try v5 then v2, defensive parsing
         try:
             params = {"category": "linear", "instrumentType": "PERPETUAL"}
             data = await self._get("/v5/market/instruments-info", params=params)
@@ -172,6 +171,7 @@ class BybitClient:
                 variants.append(f"{int(s)}m")
             except Exception:
                 pass
+
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
@@ -208,6 +208,7 @@ class BybitClient:
                 except Exception:
                     logger.debug("get_klines attempt failed for %s %s @ %s (tag=%s)", symbol, iv, ep, tag, exc_info=True)
                     continue
+
         logger.info("get_klines: no usable klines for %s interval variants=%s tried=%s", symbol, variants, tried)
         return None
 
@@ -293,6 +294,7 @@ class BybitClient:
                         min_qty = float(min_qty)
                 except Exception:
                     min_qty = None
+
                 info["step"] = step
                 info["min_qty"] = min_qty
                 info["raw"] = target
@@ -315,7 +317,37 @@ class BybitClient:
         logger.error("create_order: API keys present but create_order is not implemented for live orders. Implement signing or disable.")
         raise NotImplementedError("create_order is not implemented for live orders in BybitClient. Implement signed order placement.")
 
-    # ---------------- WebSocket support (resilient) ----------------
+    # ---------------- WebSocket support ----------------
+    def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
+        # produce candidate topic formats using numeric and "m" representations
+        s = str(tf).strip().lower()
+        variants = [s]
+        # numeric-only -> add "m"
+        try:
+            if s.isdigit():
+                variants.append(f"{int(s)}m")
+            elif s.endswith("m") and s[:-1].isdigit():
+                variants.append(str(int(s[:-1])))
+        except Exception:
+            pass
+        tops = []
+        for iv in variants:
+            tops.extend([
+                f"kline.{iv}.{symbol}",
+                f"klineV2.{iv}.{symbol}",
+                f"candle.{iv}.{symbol}",
+                f"public.kline.{iv}.{symbol}",
+                f"instrument.kline.{iv}.{symbol}"
+            ])
+        # de-dup
+        seen = set()
+        out = []
+        for t in tops:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
     async def start_kline_ws(self) -> None:
         if self._ws_task and not self._ws_task.done():
             logger.debug("WS task already running")
@@ -377,36 +409,31 @@ class BybitClient:
                 await self._pending_subscribe.put(("subscribe", symbol, tf))
         logger.info("Queued MTF subscribe for %s tfs=%s", symbol, mtfs)
 
-    def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
-        s = str(tf).strip().lower()
-        variants = [s]
-        if not any(c.isalpha() for c in s):
-            try:
-                variants.append(f"{int(s)}m")
-            except Exception:
-                pass
-        else:
-            if s.endswith("m"):
+    async def sub_kline(self, symbol: str, tf: str) -> bool:
+        """
+        Try to subscribe immediately using several candidate topic formats.
+        Returns True if a send was attempted (and likely accepted by server).
+        If WS is not connected, enqueues the subscription for later and returns False.
+        """
+        symbol = symbol.upper()
+        candidates = self._candidate_topics(symbol, tf)
+        # if ws available, try immediate sends
+        if self._ws and not self._ws.closed:
+            for topic in candidates:
                 try:
-                    variants.append(str(int(s[:-1])))
-                except Exception:
-                    pass
-        tops = []
-        for iv in variants:
-            tops.extend([
-                f"kline.{iv}.{symbol}",
-                f"klineV2.{iv}.{symbol}",
-                f"candle.{iv}.{symbol}",
-                f"public.kline.{iv}.{symbol}",
-                f"instrument.kline.{iv}.{symbol}"
-            ])
-        seen = set()
-        out = []
-        for t in tops:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
+                    await self._ws.send_json({"op": "subscribe", "args": [topic]})
+                    logger.debug("sub_kline: subscribed topic=%s for %s %s", topic, symbol, tf)
+                    return True
+                except Exception as e:
+                    logger.debug("sub_kline: attempt failed for topic=%s (%s). err=%s", topic, symbol, tf, e)
+            # none succeeded, enqueue for WS loop to try multiples later
+        # queue for later
+        key = (symbol, tf)
+        if key not in self._requested_subs:
+            self._requested_subs.add(key)
+            await self._pending_subscribe.put(("subscribe", symbol, tf))
+        logger.debug("sub_kline: queued subscribe for %s %s (WS not connected or immediate attempts failed)", symbol, tf)
+        return False
 
     async def _handle_ws_message(self, msg: Dict[str, Any]):
         try:
@@ -487,12 +514,6 @@ class BybitClient:
         return {"start_at": start, "close": close, "volume": vol, "is_closed": is_closed}
 
     async def _ws_loop(self):
-        """
-        Connect attempts:
-         - Try each host/path in self.ws_hosts in order.
-         - If handshake (404 or other) occurs, try next url.
-         - If none succeed, back off and retry.
-        """
         while not self._ws_stop:
             connected = False
             for ws_url in self.ws_hosts:
@@ -506,24 +527,26 @@ class BybitClient:
                         connected = True
                         logger.info("Bybit WS connected to %s", ws_url)
 
-                        # drain pending_subscribe
+                        # drain pending_subscribe and requested subs into a local list
                         pending = []
                         while not self._pending_subscribe.empty():
                             try:
                                 pending.append(self._pending_subscribe.get_nowait())
                             except Exception:
                                 break
-                        # ensure requested_subs are also queued
                         for (sym, tf) in list(self._requested_subs):
                             pending.append(("subscribe", sym, tf))
 
+                        # for each pending (sym,tf) we attempt subscribing with candidate topics
                         for op, sym, tf in pending:
+                            if op != "subscribe":
+                                continue
                             for topic in self._candidate_topics(sym, tf):
                                 try:
-                                    await ws.send_json({"op": op, "args": [topic]})
-                                    logger.debug("Sent WS %s request for topic=%s", op, topic)
+                                    await ws.send_json({"op": "subscribe", "args": [topic]})
+                                    logger.debug("WS subscribe requested topic=%s", topic)
                                 except Exception:
-                                    logger.debug("Failed sending subscribe for %s", topic, exc_info=True)
+                                    logger.debug("Failed to send subscribe for %s", topic, exc_info=True)
 
                         async def ping_loop():
                             try:
@@ -557,6 +580,7 @@ class BybitClient:
                             ping_task.cancel()
                         except Exception:
                             pass
+
                 except client_exceptions.WSServerHandshakeError as wh:
                     logger.warning("Bybit WS handshake failed for %s: %s", ws_url, getattr(wh, 'message', repr(wh)))
                     continue

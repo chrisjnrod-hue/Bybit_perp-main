@@ -1,3 +1,11 @@
+"""
+Scanner: REST-seeded history + optional WS current-candle augmentation.
+
+- Uses SEED_KLINES_LIMIT (env SEED_KLINES_LIMIT or config.KLINE_SEED_LIMIT) when seeding REST klines.
+- Uses client.sub_kline(symbol, tf) if available to try multiple topic formats for subscriptions.
+- If WS is disabled/unavailable, keeps a REST poller to update latest candles for detection.
+- Does NOT persist WS cache into REST seeding; compute_macd_for can optionally use WS latest candle as a temporary datapoint.
+"""
 import os
 import asyncio
 import time
@@ -225,11 +233,16 @@ class Scanner:
                         async def worker(s=sym, t=tf):
                             async with sem:
                                 try:
-                                    res = await self.client.sub_kline(s, t) if hasattr(self.client, "sub_kline") else await self.client.subscribe_klines_for_symbols([s], [t])
-                                    if res:
-                                        logger.debug("sub_kline: immediate attempt for %s %s", s, t)
+                                    if hasattr(self.client, "sub_kline"):
+                                        res = await self.client.sub_kline(s, t)
+                                        if res:
+                                            logger.debug("sub_kline immediate attempt for %s %s", s, t)
+                                        else:
+                                            logger.debug("sub_kline queued for %s %s", s, t)
                                     else:
-                                        logger.debug("sub_kline: queued for %s %s", s, t)
+                                        # fall back to queuing subscription
+                                        await self.client.subscribe_klines_for_symbols([s], [t])
+                                        logger.debug("queued subscribe_klines_for_symbols for %s %s", s, t)
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
@@ -249,7 +262,6 @@ class Scanner:
             if s.endswith("h"):
                 return int(s[:-1]) * 3600
             if s == "D" or s.endswith("d"):
-                # 'D' treated as 1 day
                 try:
                     if s == "D":
                         return 24 * 3600
@@ -370,25 +382,43 @@ class Scanner:
                 if not raw:
                     raw = await self._call_client_method(["get_klines", "getKlines"], symbol, tf, SEED_KLINES_LIMIT)
                 if not raw:
-                    logger.debug("No klines returned for %s %s", symbol, tf)
+                    logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
+
                 normalized = self._normalize_klines(raw, tf)
-                if normalized:
+
+                # Keep only candles with a valid close (and numeric finite)
+                valid = []
+                for c in normalized:
                     try:
-                        klines_sorted = sorted(normalized, key=lambda x: x.get("start_at") or 0)
+                        if not isinstance(c, dict):
+                            continue
+                        close = c.get("close")
+                        start = c.get("start_at")
+                        if close is None:
+                            continue
+                        if isinstance(close, (int, float)) and math.isfinite(float(close)):
+                            valid.append({"start_at": start, "close": float(close), "volume": c.get("volume")})
                     except Exception:
-                        klines_sorted = normalized
-                    self.kline_store[symbol][tf] = klines_sorted
-                    logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
-                    # If only one candle returned, log truncated raw response to help debug
-                    if len(klines_sorted) <= 1:
-                        try:
-                            snippet = str(raw)
-                            snippet_trunc = (snippet[:2000] + '...') if len(snippet) > 2000 else snippet
-                            logger.warning("Seeded only %d candle for %s %s. Raw response (truncated): %s", len(klines_sorted), symbol, tf, snippet_trunc)
-                        except Exception:
-                            logger.warning("Seeded only %d candle for %s %s (raw response logging failed).", len(klines_sorted), symbol, tf)
-                    await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
+                        continue
+
+                if not valid:
+                    # nothing usable returned; log truncated raw response for debugging and skip storing
+                    try:
+                        snippet = str(raw)
+                        snippet_trunc = (snippet[:2000] + '...') if len(snippet) > 2000 else snippet
+                        logger.warning("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
+                    except Exception:
+                        logger.warning("Seeded 0 usable candles for %s %s (raw response logging failed).", symbol, tf)
+                    continue
+
+                try:
+                    klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
+                except Exception:
+                    klines_sorted = valid
+                self.kline_store[symbol][tf] = klines_sorted
+                logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
+                await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
 
@@ -423,17 +453,23 @@ class Scanner:
                                 normalized = self._normalize_klines(data, root) if data else []
                                 if normalized:
                                     lst = self.kline_store.get(sym, {}).get(root, [])
-                                    last_new = normalized[-1]
-                                    if lst:
-                                        try:
-                                            if lst[-1].get("start_at") == last_new.get("start_at"):
-                                                lst[-1] = last_new
-                                            else:
-                                                lst.append(last_new)
-                                        except Exception:
-                                            self.kline_store.setdefault(sym, {})[root] = normalized
-                                    else:
-                                        self.kline_store.setdefault(sym, {})[root] = normalized
+                                    # pick last usable candle
+                                    last_new = None
+                                    for c in reversed(normalized):
+                                        if c.get("close") is not None:
+                                            last_new = {"start_at": c.get("start_at"), "close": float(c.get("close")), "volume": c.get("volume")}
+                                            break
+                                    if last_new:
+                                        if lst:
+                                            try:
+                                                if lst[-1].get("start_at") == last_new.get("start_at"):
+                                                    lst[-1] = last_new
+                                                else:
+                                                    lst.append(last_new)
+                                            except Exception:
+                                                self.kline_store.setdefault(sym, {})[root] = [last_new]
+                                        else:
+                                            self.kline_store.setdefault(sym, {})[root] = [last_new]
                             except Exception:
                                 logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
                     finally:

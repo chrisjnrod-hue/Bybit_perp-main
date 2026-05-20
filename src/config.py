@@ -53,8 +53,10 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "") or ""
 EXCLUDE_STABLECOINS = safe_csv_list("EXCLUDE_STABLECOINS", ["USDT", "BUSD", "USDC"])
 
 # ---- Timeframes ----
-ROOT_TFS = safe_csv_list("ROOT_TFS", ["1h", "4h", "1d"])
-MTF_TFS = safe_csv_list("MTF_TFS", ["5m", "15m", "1h", "4h", "1d"])
+# IMPORTANT: Use numeric intervals (in minutes) or "D" for daily, not "1h", "5m" format
+# Bybit REST API expects: "5", "15", "60", "240", "D" etc.
+ROOT_TFS = safe_csv_list("ROOT_TFS", ["60", "240", "D"])
+MTF_TFS = safe_csv_list("MTF_TFS", ["5", "15", "60", "240", "D"])
 
 # Intervals and seed sizes
 # NOTE: If ROOT_SCAN_INTERVAL is 0 (default here) the scanner will run on 5m-candle opens.

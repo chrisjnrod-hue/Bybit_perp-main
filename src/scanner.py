@@ -2,6 +2,7 @@
 import os
 import asyncio
 import time
+import json
 from collections import defaultdict
 from typing import Dict, List, Any, Optional, Callable
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -39,6 +40,7 @@ class Scanner:
         self._task: Optional[asyncio.Task] = None
         self._rest_poller_task: Optional[asyncio.Task] = None
         self._callbacks: List[Callable[[str, Any], Any]] = []
+        self._24h_volumes: Dict[str, Dict[str, float]] = {}  # Track volume for change calculation
         logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d)", bool(USE_WS), SEED_KLINES_LIMIT)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -374,11 +376,8 @@ class Scanner:
     async def seed_all(self):
         logger.info("Seeding klines for all symbols (concurrent=%d limit=%d)", CONCURRENCY, SEED_KLINES_LIMIT)
         async def worker(sym: str):
-            await self.concurrent_sem.acquire()
-            try:
+            async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
-            finally:
-                self.concurrent_sem.release()
         tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
         if tasks:
             await asyncio.gather(*tasks)
@@ -394,8 +393,7 @@ class Scanner:
                 sem = self.concurrent_sem
 
                 async def poll_symbol(sym: str):
-                    await sem.acquire()
-                    try:
+                    async with sem:
                         for root in ROOT_TFS:
                             try:
                                 data = await self.client.get_klines(sym, root, limit=3)
@@ -420,8 +418,6 @@ class Scanner:
                                             self.kline_store.setdefault(sym, {})[root] = [last_new]
                             except Exception:
                                 logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
-                    finally:
-                        sem.release()
 
                 tasks = [asyncio.create_task(poll_symbol(s)) for s in self.symbols]
                 try:
@@ -516,6 +512,45 @@ class Scanner:
             pass
         return float(quant)
 
+    async def _update_24h_volume(self, symbol: str) -> Optional[float]:
+        """Update and track 24h volume data"""
+        try:
+            # Attempt to get 24h ticker data from client
+            if hasattr(self.client, "get_24h_ticker"):
+                data = await self.client.get_24h_ticker(symbol)
+                if data and isinstance(data, dict):
+                    vol = data.get("volume") or data.get("vol") or data.get("turnover")
+                    if vol is not None:
+                        try:
+                            vol = float(vol)
+                            if symbol not in self._24h_volumes:
+                                self._24h_volumes[symbol] = {"current": vol, "previous": vol}
+                            else:
+                                self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
+                                self._24h_volumes[symbol]["current"] = vol
+                            return vol
+                        except Exception:
+                            pass
+        except Exception:
+            logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
+        return None
+
+    def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
+        """Compute percentage change in 24h volume"""
+        try:
+            if symbol not in self._24h_volumes:
+                return None
+            vol_data = self._24h_volumes[symbol]
+            prev_vol = vol_data.get("previous", 0)
+            curr_vol = vol_data.get("current", 0)
+            if prev_vol <= 0:
+                return None
+            change = (curr_vol - prev_vol) / prev_vol
+            return change
+        except Exception:
+            logger.debug("Could not compute 24h volume change for %s", symbol)
+            return None
+
     async def root_scan_loop(self):
         logger.info("Starting root scan loop interval=%s", ROOT_SCAN_INTERVAL)
         while not self._stop:
@@ -523,42 +558,45 @@ class Scanner:
             try:
                 if not self.symbols:
                     await self.discover_symbols()
-                    await self.seed_all()
+                    if self.symbols:
+                        await self.seed_all()
 
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
 
                 async def check_symbol(sym: str):
-                    await self.concurrent_sem.acquire()
-                    try:
-                        price = await self.client.get_latest_price(sym)
-                        if price is None:
-                            try:
-                                if USE_WS and self.client.is_ws_connected():
-                                    ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
-                                    if ws_last and ws_last.get("close") is not None:
-                                        price = float(ws_last.get("close"))
-                            except Exception:
-                                price = None
-                        if price is None:
-                            logger.debug("No latest price for %s", sym)
-                            return
-                        for root in ROOT_TFS:
-                            macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                            if self.detect_flip_current_open(hist, 0.0):
-                                vol_change = self.compute_24h_volume_change(sym)
-                                root_signals.append({
-                                    "symbol": sym,
-                                    "root": root,
-                                    "price": price,
-                                    "hist": hist,
-                                    "vol_change": vol_change
-                                })
-                    except Exception:
-                        logger.exception("Error checking symbol %s", sym)
-                    finally:
-                        self.concurrent_sem.release()
+                    async with self.concurrent_sem:
+                        try:
+                            price = await self.client.get_latest_price(sym)
+                            if price is None:
+                                try:
+                                    if USE_WS and self.client.is_ws_connected():
+                                        ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
+                                        if ws_last and ws_last.get("close") is not None:
+                                            price = float(ws_last.get("close"))
+                                except Exception:
+                                    price = None
+                            if price is None:
+                                logger.debug("No latest price for %s", sym)
+                                return
+                            
+                            # Update volume data
+                            await self._update_24h_volume(sym)
+                            
+                            for root in ROOT_TFS:
+                                macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
+                                if self.detect_flip_current_open(hist, 0.0):
+                                    vol_change = self.compute_24h_volume_change(sym)
+                                    root_signals.append({
+                                        "symbol": sym,
+                                        "root": root,
+                                        "price": price,
+                                        "hist": hist,
+                                        "vol_change": vol_change
+                                    })
+                        except Exception:
+                            logger.exception("Error checking symbol %s", sym)
 
                 tasks = [asyncio.create_task(check_symbol(s)) for s in self.symbols]
                 if tasks:
@@ -674,8 +712,15 @@ class Scanner:
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
+                logger.debug("Failed to get balance for %s", sym, exc_info=True)
                 balance = None
-            symbol_info = await self.client.get_symbol_info(sym)
+            
+            try:
+                symbol_info = await self.client.get_symbol_info(sym)
+            except Exception:
+                logger.debug("Failed to get symbol info for %s", sym, exc_info=True)
+                symbol_info = {}
+            
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
@@ -689,6 +734,7 @@ class Scanner:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
+                    logger.info("Opened live trade: %s %s @ %s qty=%s score=%.2f", sym, side, price, qty, c["score"])
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
             else:

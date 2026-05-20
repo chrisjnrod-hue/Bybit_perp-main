@@ -113,9 +113,12 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
-    # ----- get_klines with detailed console logging -----
+    # ----- get_klines with ALWAYS-ON detailed logging -----
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
-        debug_log = _env_true("DEBUG_KLINES_LOG")
+        """
+        Get klines with detailed always-on logging to console.
+        Every request and response is logged so you can see exactly what's happening.
+        """
         tried = []
         variants = []
         s = str(interval).strip().lower()
@@ -147,41 +150,50 @@ class BybitClient:
                 tried.append((ep, iv))
                 try:
                     params = {"symbol": symbol, "interval": iv, "limit": limit}
-                    if debug_log:
-                        logger.info("get_klines: request -> endpoint=%s tag=%s symbol=%s interval=%s limit=%s", ep, tag, symbol, iv, limit)
+                    logger.info("=== get_klines: REQUEST symbol=%s interval=%s endpoint=%s params=%s", symbol, iv, ep, params)
                     data = await self._get(ep, params=params)
-                    if debug_log:
-                        try:
-                            txt = json.dumps(data, default=str)
-                        except Exception:
-                            txt = str(data)
-                        snippet = txt if len(txt) <= 2000 else (txt[:2000] + " ...[truncated]")
-                        logger.info("get_klines: response -> endpoint=%s tag=%s symbol=%s interval=%s snippet=%s", ep, tag, symbol, iv, snippet)
+                    try:
+                        txt = json.dumps(data, default=str)
+                    except Exception:
+                        txt = str(data)
+                    snippet = txt if len(txt) <= 2000 else (txt[:2000] + " ...[truncated]")
+                    logger.info("=== get_klines: RESPONSE symbol=%s interval=%s endpoint=%s len=%d body=%s", symbol, iv, ep, len(txt) if isinstance(txt, str) else 0, snippet)
+                    
                     if not data:
+                        logger.info("=== get_klines: empty data, trying next variant")
                         continue
 
                     if isinstance(data, dict):
                         if "ret_code" in data and data.get("ret_code", 0) == 0 and "result" in data:
                             res = data["result"]
                             if isinstance(res, dict) and isinstance(res.get("list"), list):
+                                item_count = len(res.get("list", []))
+                                logger.info("=== get_klines: SUCCESS (v5 dict.result.list) returning %d items", item_count)
                                 return res.get("list", [])
                             if isinstance(res, list):
+                                logger.info("=== get_klines: SUCCESS (v5 dict.result is list) returning %d items", len(res))
                                 return res
                             if isinstance(res, (list, tuple)):
+                                logger.info("=== get_klines: SUCCESS (v5 dict.result is tuple) returning %d items", len(res))
                                 return list(res)
+                            logger.info("=== get_klines: SUCCESS (v5 dict.result raw)")
                             return res
                         if "result" in data:
+                            logger.info("=== get_klines: returning dict['result']")
                             return data["result"]
                         if isinstance(data, list):
+                            logger.info("=== get_klines: SUCCESS (dict is list) returning %d items", len(data))
                             return data
+                        logger.info("=== get_klines: returning dict as-is")
                         return data
                     if isinstance(data, (list, tuple)):
+                        logger.info("=== get_klines: SUCCESS (top-level list/tuple) returning %d items", len(data))
                         return list(data)
                 except Exception:
-                    logger.exception("get_klines: attempt failed for %s %s @ %s (tag=%s)", symbol, iv, ep, tag)
+                    logger.exception("=== get_klines: EXCEPTION attempt failed for %s %s @ %s (tag=%s)", symbol, iv, ep, tag)
                     continue
 
-        logger.info("get_klines: no usable klines for %s interval variants=%s tried=%s", symbol, variants, tried)
+        logger.info("=== get_klines: FAILED all attempts. no usable klines for %s interval variants=%s tried=%s", symbol, variants, tried)
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
@@ -274,6 +286,37 @@ class BybitClient:
         except Exception:
             logger.exception("get_symbol_info failed for %s", symbol)
             return {}
+
+    async def get_symbols(self) -> List[Dict[str, Any]]:
+        try:
+            params = {"category": "linear", "instrumentType": "PERPETUAL"}
+            data = await self._get("/v5/market/instruments-info", params=params)
+            if isinstance(data, dict):
+                if data.get("ret_code", 0) == 0 and "result" in data:
+                    res = data["result"]
+                    if isinstance(res, dict) and isinstance(res.get("list"), list):
+                        instruments = res.get("list", [])
+                        logger.info("Found %d instruments via v5", len(instruments))
+                        return instruments
+                    if isinstance(res, list):
+                        logger.info("Found %d instruments via v5", len(res))
+                        return res
+                if "result" in data and isinstance(data["result"], (list, dict)):
+                    logger.info("Found instruments via v5 (non-standard shape)")
+                    return data["result"] if isinstance(data["result"], list) else list(data["result"])
+        except Exception:
+            logger.debug("v5 instruments-info attempt failed", exc_info=True)
+        try:
+            data = await self._get("/v2/public/symbols")
+            if isinstance(data, dict) and "result" in data:
+                symbols = data["result"] or []
+                logger.info("Found %d symbols via v2", len(symbols))
+                return symbols
+            logger.debug("v2 symbols returned unexpected payload.")
+        except Exception:
+            logger.debug("v2 symbols attempt failed", exc_info=True)
+        logger.warning("No symbols retrieved from Bybit; returning empty list.")
+        return []
 
     # ---------------- WebSocket ----------------
     def _candidate_topics(self, symbol: str, tf: str) -> List[str]:

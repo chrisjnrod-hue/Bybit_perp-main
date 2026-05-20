@@ -1,11 +1,17 @@
-# bybit_client.py
 """
-BybitClient with REST + WebSocket kline support.
-Minimal additions:
- - async sub_kline(symbol, tf): try several topic/interval formats immediately when WS is connected,
-   otherwise queue the subscription for later (keeps prior subscribe_klines_for_symbols behaviour).
- - existing resilient WS loop and topic candidate generation are reused.
+BybitClient with REST + resilient WebSocket kline support.
+
+Small, safe change:
+- sub_kline(...) will early-return (no-op) when USE_WS is disabled via environment variable.
+  This prevents queuing subscriptions when you intentionally run REST-only (USE_WS=false).
+
+Other features:
+- Robust REST helpers with retries/backoff.
+- get_klines tries v5 and v2 endpoints and interval variants.
+- start_kline_ws/_ws_loop resilient to handshake failures and tries multiple host/path candidates.
+- WS kline caching and helpers (get_ws_latest_kline, get_ws_klines) for optional live augmentation.
 """
+import os
 import asyncio
 import json
 import time
@@ -14,7 +20,6 @@ import aiohttp
 from aiohttp import client_exceptions
 from collections import defaultdict, deque
 import traceback
-import os
 
 from .config import MAINNET, BYBIT_API_KEY, BYBIT_API_SECRET, RATE_LIMIT_RPS, KLINE_SEED_LIMIT
 from .logger import get_logger
@@ -171,7 +176,9 @@ class BybitClient:
                 variants.append(f"{int(s)}m")
             except Exception:
                 pass
-
+        # Add daily 'D' candidate for '1d' or 'd'
+        if s in ("1d", "d", "day"):
+            variants.append("D")
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
@@ -208,7 +215,6 @@ class BybitClient:
                 except Exception:
                     logger.debug("get_klines attempt failed for %s %s @ %s (tag=%s)", symbol, iv, ep, tag, exc_info=True)
                     continue
-
         logger.info("get_klines: no usable klines for %s interval variants=%s tried=%s", symbol, variants, tried)
         return None
 
@@ -322,7 +328,6 @@ class BybitClient:
         # produce candidate topic formats using numeric and "m" representations
         s = str(tf).strip().lower()
         variants = [s]
-        # numeric-only -> add "m"
         try:
             if s.isdigit():
                 variants.append(f"{int(s)}m")
@@ -339,7 +344,6 @@ class BybitClient:
                 f"public.kline.{iv}.{symbol}",
                 f"instrument.kline.{iv}.{symbol}"
             ])
-        # de-dup
         seen = set()
         out = []
         for t in tops:
@@ -414,7 +418,17 @@ class BybitClient:
         Try to subscribe immediately using several candidate topic formats.
         Returns True if a send was attempted (and likely accepted by server).
         If WS is not connected, enqueues the subscription for later and returns False.
+
+        IMPORTANT: If the environment disables WS (USE_WS=false), this method returns False
+        without queuing anything. This prevents noisy queued-subscribe logs when intentionally
+        running REST-only (e.g., Render free tier).
         """
+        # Respect explicit environment override: if USE_WS is disabled, do nothing.
+        use_ws_env = os.getenv("USE_WS", "").strip().lower()
+        if use_ws_env in ("0", "false", "no"):
+            logger.debug("sub_kline: USE_WS disabled by env; skipping subscribe for %s %s", symbol, tf)
+            return False
+
         symbol = symbol.upper()
         candidates = self._candidate_topics(symbol, tf)
         # if ws available, try immediate sends

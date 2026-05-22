@@ -1,4 +1,4 @@
-# scanner.py
+# scanner.py - COMPLETE FIX FOR NO ROOT SIGNALS
 import os
 import asyncio
 import time
@@ -29,6 +29,7 @@ REST_POLL_INTERVAL = int(os.getenv("REST_POLL_INTERVAL", "5"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
 REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
+DEBUG_KLINES = os.getenv("DEBUG_KLINES", "true").lower() in ("true", "1", "yes")
 
 
 class Scanner:
@@ -47,8 +48,9 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d)", 
-                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS)
+        self._seeded_symbols: set = set()
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_KLINES=%s)", 
+                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_KLINES)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -223,25 +225,48 @@ class Scanner:
 
     def _tf_to_seconds(self, tf: str) -> int:
         try:
-            s = str(tf)
+            s = str(tf).strip().lower()
             if s.endswith("m"):
                 return int(s[:-1]) * 60
             if s.endswith("h"):
                 return int(s[:-1]) * 3600
-            if s == "D" or s.endswith("d"):
-                try:
-                    if s == "D":
-                        return 24 * 3600
-                    return int(s[:-1]) * 86400
-                except Exception:
-                    return 24 * 3600
+            if s == "d" or s == "1d":
+                return 24 * 3600
+            if s.endswith("d"):
+                return int(s[:-1]) * 86400
+            # If it's just a number, assume minutes
+            try:
+                return int(s) * 60
+            except ValueError:
+                pass
         except Exception:
             pass
         return 60
 
+    def _normalize_tf(self, tf: str) -> str:
+        """Normalize timeframe to standard format (1m, 5m, 1h, 4h, 1d, etc)"""
+        s = str(tf).strip().lower()
+        # Already normalized
+        if s and (s[-1] in 'mhd'):
+            return s
+        # Try to convert number to minutes
+        try:
+            minutes = int(s)
+            if minutes >= 60:
+                hours = minutes // 60
+                if hours >= 24:
+                    days = hours // 24
+                    return f"{days}d"
+                return f"{hours}h"
+            return f"{minutes}m"
+        except ValueError:
+            return "1m"  # Default fallback
+
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
         names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
-        return await self._call_client_method(names, symbol, tf, limit)
+        # Normalize timeframe before calling
+        tf_normalized = self._normalize_tf(tf)
+        return await self._call_client_method(names, symbol, tf_normalized, limit)
 
     def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -334,19 +359,25 @@ class Scanner:
     async def seed_klines_for_symbol(self, symbol: str):
         if SEED_KLINES_LIMIT < 100:
             logger.warning("SEED_KLINES_LIMIT is low (%d); consider >=200", SEED_KLINES_LIMIT)
+        
         tfs = list(set(ROOT_TFS + MTF_TFS))
+        seed_success = False
+        
         for tf in tfs:
             try:
-                logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
+                tf_normalized = self._normalize_tf(tf)
+                logger.info("seed_klines_for_symbol: %s %s (limit=%d)", symbol, tf_normalized, SEED_KLINES_LIMIT)
                 
                 async with self.request_sem:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
                 
                 if not raw:
-                    logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
+                    logger.debug("No klines returned for %s %s", symbol, tf_normalized)
                     continue
 
                 normalized = self._normalize_klines(raw, tf)
+                if DEBUG_KLINES:
+                    logger.info("Normalized %d klines for %s %s", len(normalized), symbol, tf_normalized)
 
                 valid = []
                 for c in normalized:
@@ -363,23 +394,23 @@ class Scanner:
                         continue
 
                 if not valid:
-                    try:
-                        txt = json.dumps(raw, default=str)
-                    except Exception:
-                        txt = str(raw)
-                    snippet_trunc = (txt[:500] + '...') if len(txt) > 500 else txt
-                    logger.debug("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
+                    logger.warning("Seeded 0 usable candles for %s %s", symbol, tf_normalized)
                     continue
 
                 try:
                     klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
                 except Exception:
                     klines_sorted = valid
-                self.kline_store[symbol][tf] = klines_sorted
-                logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
-                await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
+                
+                self.kline_store[symbol][tf_normalized] = klines_sorted
+                logger.info("Seeded %s %s: %d candles", symbol, tf_normalized, len(klines_sorted))
+                await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf_normalized, "count": len(klines_sorted)})
+                seed_success = True
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
+        
+        if seed_success:
+            self._seeded_symbols.add(symbol)
 
     async def seed_all(self):
         logger.info("Seeding klines for all symbols (concurrent=%d limit=%d)", CONCURRENCY, SEED_KLINES_LIMIT)
@@ -395,6 +426,8 @@ class Scanner:
                 await asyncio.gather(*tasks)
             if i + REQUEST_BATCH_SIZE < len(self.symbols):
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
+        
+        logger.info("Seeding complete. Successfully seeded %d/%d symbols", len(self._seeded_symbols), len(self.symbols))
 
     async def _rest_poller(self):
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
@@ -409,10 +442,11 @@ class Scanner:
                     async with self.request_sem:
                         for root in ROOT_TFS:
                             try:
-                                data = await self.client.get_klines(sym, root, limit=3)
+                                root_normalized = self._normalize_tf(root)
+                                data = await self.client.get_klines(sym, root_normalized, limit=3)
                                 normalized = self._normalize_klines(data, root) if data else []
                                 if normalized:
-                                    lst = self.kline_store.get(sym, {}).get(root, [])
+                                    lst = self.kline_store.get(sym, {}).get(root_normalized, [])
                                     last_new = None
                                     for c in reversed(normalized):
                                         if c.get("close") is not None:
@@ -426,9 +460,9 @@ class Scanner:
                                                 else:
                                                     lst.append(last_new)
                                             except Exception:
-                                                self.kline_store.setdefault(sym, {})[root] = [last_new]
+                                                self.kline_store.setdefault(sym, {})[root_normalized] = [last_new]
                                         else:
-                                            self.kline_store.setdefault(sym, {})[root] = [last_new]
+                                            self.kline_store.setdefault(sym, {})[root_normalized] = [last_new]
                             except Exception:
                                 logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
 
@@ -469,7 +503,14 @@ class Scanner:
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
-        data = self.kline_store.get(symbol, {}).get(tf, [])
+        tf_normalized = self._normalize_tf(tf)
+        data = self.kline_store.get(symbol, {}).get(tf_normalized, [])
+        
+        if not data:
+            if DEBUG_KLINES:
+                logger.debug("No kline data for %s %s", symbol, tf_normalized)
+            return None, None, None
+        
         closes: List[float] = []
         for c in data:
             try:
@@ -479,21 +520,32 @@ class Scanner:
                     closes.append(float(c))
             except Exception:
                 continue
+        
+        if not closes:
+            if DEBUG_KLINES:
+                logger.debug("No valid closes for %s %s", symbol, tf_normalized)
+            return None, None, None
+        
         if include_price is not None:
             closes = closes + [float(include_price)]
         elif use_ws_current and USE_WS:
             try:
-                ws_last = self.client.get_ws_latest_kline(symbol, tf) if hasattr(self.client, "get_ws_latest_kline") else None
+                ws_last = self.client.get_ws_latest_kline(symbol, tf_normalized) if hasattr(self.client, "get_ws_latest_kline") else None
                 if ws_last and ws_last.get("close") is not None:
                     closes = closes + [float(ws_last.get("close"))]
             except Exception:
                 pass
-        macd_line, signal_line, hist = macd_histogram(closes)
+        
         try:
-            hist = [None if v is None else float(v) for v in (hist or [])]
+            macd_line, signal_line, hist = macd_histogram(closes)
+            try:
+                hist = [None if v is None else float(v) for v in (hist or [])]
+            except Exception:
+                pass
+            return macd_line, signal_line, hist
         except Exception:
-            pass
-        return macd_line, signal_line, hist
+            logger.exception("Error computing MACD for %s %s", symbol, tf_normalized)
+            return None, None, None
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0):
         if not hist or len(hist) < 2:
@@ -582,11 +634,12 @@ class Scanner:
             start = time.time()
             try:
                 if not self.symbols:
+                    logger.info("No symbols discovered yet. Discovering...")
                     await self.discover_symbols()
                     if self.symbols:
                         logger.info("Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("Symbol seeding complete")
+                        logger.info("Symbol seeding complete. Seeded: %d/%d", len(self._seeded_symbols), len(self.symbols))
 
                 await self._ensure_rest_poller()
 
@@ -594,6 +647,10 @@ class Scanner:
 
                 async def check_symbol(sym: str):
                     try:
+                        # Skip if no kline data available
+                        if not self.kline_store.get(sym):
+                            return
+                        
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
                         
@@ -617,6 +674,10 @@ class Scanner:
                         
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
+                            if hist is None:
+                                if DEBUG_KLINES:
+                                    logger.debug("No MACD histogram for %s %s", sym, root)
+                                continue
                             if self.detect_flip_current_open(hist, 0.0):
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
@@ -626,11 +687,14 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
+                                logger.info("SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
                 # Scan symbols in batches to avoid overwhelming API
                 checked_count = 0
+                signal_symbols = set()
+                
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
                     if self._stop:
                         break
@@ -694,7 +758,7 @@ class Scanner:
             one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
                 _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK)
+                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
             
             score = float(positive_count)
             if any_positive_mtfflip:

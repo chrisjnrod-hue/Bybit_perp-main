@@ -617,7 +617,7 @@ class Scanner:
                         
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                            if self.detect_flip_current_open(hist, 0.0):
+                            if hist and self.detect_flip_current_open(hist, 0.0):
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
                                     "symbol": sym,
@@ -626,6 +626,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
+                                logger.info("SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -694,7 +695,7 @@ class Scanner:
             one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
                 _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK)
+                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
             
             score = float(positive_count)
             if any_positive_mtfflip:

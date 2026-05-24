@@ -573,14 +573,14 @@ class Scanner:
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
         
-        # ============ MACD DEBUG LOG ============
+        # ============ MACD DEBUG LOG - SHOW LAST 10 VALUES ============
         if DEBUG_SURGICAL_LOGS and len(closes) > 0:
             try:
-                last_5_hist = hist[-5:] if hist and len(hist) >= 5 else (hist if hist else [])
-                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_5=%s", 
-                           symbol, tf, len(closes), last_5_hist)
-            except Exception:
-                pass
+                last_10_hist = hist[-10:] if hist and len(hist) >= 10 else (hist if hist else [])
+                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s", 
+                           symbol, tf, len(closes), last_10_hist)
+            except Exception as e:
+                logger.info("[MACD_DEBUG] %s %s: error formatting histogram: %s", symbol, tf, str(e)[:50])
         
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
@@ -602,7 +602,7 @@ class Scanner:
         try:
             result = (prev < 0) and (cur > hist_threshold)
             
-            # ============ FLIP DEBUG LOG ============
+            # ============ FLIP DEBUG LOG - ALWAYS LOG WHEN CLOSE ============
             if DEBUG_SURGICAL_LOGS:
                 logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, threshold=%s, FLIP=%s", 
                            symbol, tf, prev if prev else 0, cur if cur else 0, hist_threshold, result)
@@ -610,6 +610,12 @@ class Scanner:
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
                            symbol, tf, prev, cur, hist_threshold, result)
+            
+            # ============ CRITICAL: Log when flip IS detected ============
+            if result and DEBUG_SURGICAL_LOGS:
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: FLIP OCCURRED! prev=%.8f → cur=%.8f", 
+                              symbol, tf, prev, cur)
+            
             return result
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
@@ -725,6 +731,12 @@ class Scanner:
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            
+                            # ============ DEBUG: Log all flip checks ============
+                            if DEBUG_SURGICAL_LOGS:
+                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
+                                           sym, root, hist is not None and len(hist) > 0, flip)
+                            
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
@@ -735,6 +747,8 @@ class Scanner:
                                     "vol_change": vol_change
                                 })
                                 logger.info("✓ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                if DEBUG_SURGICAL_LOGS:
+                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 

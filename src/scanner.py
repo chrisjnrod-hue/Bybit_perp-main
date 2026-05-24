@@ -344,6 +344,21 @@ class Scanner:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
                 
                 if not raw:
+                    
+                 # ============ DEBUG: SHOW API RESPONSE STRUCTURE ============
+if isinstance(raw, dict):
+    logger.info("[DEBUG_KEYS] %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
+    if "list" in raw:
+        logger.info("[DEBUG_SAMPLE] First item in 'list': %s", raw["list"][0] if raw["list"] else "empty")
+    if "result" in raw:
+        logger.info("[DEBUG_SAMPLE] First item in 'result': %s", raw["result"][0] if raw["result"] else "empty")
+    if "data" in raw:
+        logger.info("[DEBUG_SAMPLE] First item in 'data': %s", raw["data"][0] if raw["data"] else "empty")
+elif isinstance(raw, list):
+    logger.info("[DEBUG_KEYS] %s %s - Response is a list", symbol, tf)
+    logger.info("[DEBUG_SAMPLE] First item: %s", raw[0] if raw else "empty")
+
+    
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 

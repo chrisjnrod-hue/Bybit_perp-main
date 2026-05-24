@@ -242,9 +242,9 @@ class Scanner:
 
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
         names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
-        return await self._call_client_method(names, symbol, tf, limit)
+        return await self._call_client_method(names, symbol, tf, limit)  
 
-    def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
+        def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if not raw_klines:
             return out
@@ -331,7 +331,7 @@ class Scanner:
             except Exception:
                 logger.exception("Error evaluating trailing candle drop")
         return out
-
+                    
     async def seed_klines_for_symbol(self, symbol: str):
         if SEED_KLINES_LIMIT < 100:
             logger.warning("SEED_KLINES_LIMIT is low (%d); consider >=200", SEED_KLINES_LIMIT)

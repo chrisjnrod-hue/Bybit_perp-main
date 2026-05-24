@@ -242,15 +242,18 @@ class Scanner:
 
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
         names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
-        return await self._call_client_method(names, symbol, tf, limit)  
+        return await self._call_client_method(names, symbol, tf, limit)
 
-        def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
+    def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if not raw_klines:
             return out
 
         if isinstance(raw_klines, dict):
-            if "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
+            # Try multiple common response wrapper keys
+            if "list" in raw_klines and isinstance(raw_klines["list"], (list, dict)):
+                raw_klines = raw_klines["list"]
+            elif "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
                 raw_klines = raw_klines["result"]
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
@@ -277,13 +280,35 @@ class Scanner:
                             vol = float(item[5])
                         except Exception:
                             vol = None
-                    out.append({"start_at": start, "close": close, "volume": vol})
+                    
+                    # Only append if we have a valid close price
+                    if close is not None:
+                        out.append({"start_at": start, "close": close, "volume": vol})
                     continue
 
                 if isinstance(item, dict):
-                    start = item.get("start_at") or item.get("open_time") or item.get("t") or item.get("timestamp") or item.get("start")
-                    close = (item.get("close") or item.get("close_price") or item.get("c") or item.get("last_price") or item.get("Close"))
-                    vol = item.get("volume") or item.get("vol") or item.get("turnover") or item.get("v")
+                    start = (
+                        item.get("start_at") 
+                        or item.get("open_time") 
+                        or item.get("t") 
+                        or item.get("timestamp") 
+                        or item.get("start")
+                        or item.get("time")
+                    )
+                    close = (
+                        item.get("close") 
+                        or item.get("close_price") 
+                        or item.get("c") 
+                        or item.get("last_price") 
+                        or item.get("Close")
+                    )
+                    vol = (
+                        item.get("volume") 
+                        or item.get("vol") 
+                        or item.get("turnover") 
+                        or item.get("v")
+                        or item.get("quoteAsset")
+                    )
                     is_closed = item.get("isClosed")
                     if is_closed is None:
                         is_closed = item.get("is_closed")
@@ -291,6 +316,7 @@ class Scanner:
                         is_closed = item.get("complete")
                     if is_closed is None:
                         is_closed = item.get("confirmed")
+                    
                     try:
                         if start is not None:
                             start = int(start)
@@ -306,10 +332,12 @@ class Scanner:
                             vol = float(vol)
                     except Exception:
                         vol = None
-                    out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
+                    
+                    # Only append if we have a valid close price
+                    if close is not None:
+                        out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
                     continue
 
-                out.append({"start_at": None, "close": None, "volume": None})
             except Exception:
                 logger.exception("Failed to normalize kline item: %s", item)
                 continue
@@ -331,7 +359,7 @@ class Scanner:
             except Exception:
                 logger.exception("Error evaluating trailing candle drop")
         return out
-                    
+
     async def seed_klines_for_symbol(self, symbol: str):
         if SEED_KLINES_LIMIT < 100:
             logger.warning("SEED_KLINES_LIMIT is low (%d); consider >=200", SEED_KLINES_LIMIT)
@@ -344,28 +372,33 @@ class Scanner:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
                 
                 if not raw:
-                    
-                 # ============ DEBUG: SHOW API RESPONSE STRUCTURE ============
-if isinstance(raw, dict):
-    logger.info("[DEBUG_KEYS] %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
-    if "list" in raw:
-        logger.info("[DEBUG_SAMPLE] First item in 'list': %s", raw["list"][0] if raw["list"] else "empty")
-    if "result" in raw:
-        logger.info("[DEBUG_SAMPLE] First item in 'result': %s", raw["result"][0] if raw["result"] else "empty")
-    if "data" in raw:
-        logger.info("[DEBUG_SAMPLE] First item in 'data': %s", raw["data"][0] if raw["data"] else "empty")
-elif isinstance(raw, list):
-    logger.info("[DEBUG_KEYS] %s %s - Response is a list", symbol, tf)
-    logger.info("[DEBUG_SAMPLE] First item: %s", raw[0] if raw else "empty")
-
-    
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
+
+                # ============ DEBUG SURGICAL LOG #0: API RESPONSE STRUCTURE ============
+                if DEBUG_SURGICAL_LOGS:
+                    try:
+                        if isinstance(raw, dict):
+                            logger.info("[SURGICAL_LOG_0] API_KEYS %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
+                            # Show first item in each potential container
+                            for key in ["list", "result", "data"]:
+                                if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
+                                    first_item = raw[key][0]
+                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s", 
+                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
+                                    break
+                        elif isinstance(raw, (list, tuple)):
+                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s", 
+                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
+                    except Exception as e:
+                        logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
 
                 # ============ SURGICAL LOG #1: RAW API RESPONSE ============
                 if DEBUG_SURGICAL_LOGS:
                     try:
-                        if isinstance(raw, dict) and "result" in raw:
+                        if isinstance(raw, dict) and "list" in raw:
+                            sample_raw = raw["list"][:3] if isinstance(raw["list"], list) else raw["list"]
+                        elif isinstance(raw, dict) and "result" in raw:
                             sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
                         elif isinstance(raw, dict) and "data" in raw:
                             sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
@@ -375,7 +408,7 @@ elif isinstance(raw, list):
                             sample_raw = str(raw)[:200]
                         logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
                     except Exception as e:
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, e)
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, str(e)[:100])
 
                 normalized = self._normalize_klines(raw, tf)
 

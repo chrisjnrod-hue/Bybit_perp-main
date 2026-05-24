@@ -470,8 +470,13 @@ class Scanner:
 
     async def _rest_poller(self):
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
+        poll_count = 0
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
+                poll_count += 1
+                if poll_count % 5 == 0:  # Log every 5th poll
+                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
+                
                 start = time.time()
                 if not self.symbols:
                     await asyncio.sleep(REST_POLL_INTERVAL)
@@ -568,6 +573,15 @@ class Scanner:
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
         
+        # ============ MACD DEBUG LOG ============
+        if DEBUG_SURGICAL_LOGS and len(closes) > 0:
+            try:
+                last_5_hist = hist[-5:] if hist and len(hist) >= 5 else (hist if hist else [])
+                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_5=%s", 
+                           symbol, tf, len(closes), last_5_hist)
+            except Exception:
+                pass
+        
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
@@ -587,6 +601,12 @@ class Scanner:
             return False
         try:
             result = (prev < 0) and (cur > hist_threshold)
+            
+            # ============ FLIP DEBUG LOG ============
+            if DEBUG_SURGICAL_LOGS:
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, threshold=%s, FLIP=%s", 
+                           symbol, tf, prev if prev else 0, cur if cur else 0, hist_threshold, result)
+            
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
                            symbol, tf, prev, cur, hist_threshold, result)
@@ -745,6 +765,15 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
                 await self.send_summary(root_signals)
+                
+                # ============ ROOT SCAN SUMMARY LOG ============
+                try:
+                    candidates_count = len(root_signals) if root_signals else 0
+                    logger.info("✓ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                               checked_count, len(root_signals), candidates_count)
+                except Exception:
+                    pass
+                
             except Exception:
                 logger.exception("Error in root scan loop")
             elapsed = time.time() - start

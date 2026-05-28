@@ -29,6 +29,7 @@ REST_POLL_INTERVAL = int(os.getenv("REST_POLL_INTERVAL", "5"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
 REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
+DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 
 
 class Scanner:
@@ -47,8 +48,8 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d)", 
-                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS)
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s)", 
+                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -346,6 +347,21 @@ class Scanner:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 
+                # ============ SURGICAL LOG #1: RAW API RESPONSE ============
+                if DEBUG_SURGICAL_LOGS:
+                    try:
+                        if isinstance(raw, dict) and "result" in raw:
+                            sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
+                        elif isinstance(raw, dict) and "data" in raw:
+                            sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
+                        elif isinstance(raw, list):
+                            sample_raw = raw[:3]
+                        else:
+                            sample_raw = str(raw)[:200]
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
+                    except Exception as e:
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, e)
+
                 normalized = self._normalize_klines(raw, tf)
 
                 valid = []
@@ -361,6 +377,14 @@ class Scanner:
                             valid.append({"start_at": start, "close": float(close), "volume": c.get("volume")})
                     except Exception:
                         continue
+
+                # ============ SURGICAL LOG #2: NORMALIZATION RESULTS ============
+                if DEBUG_SURGICAL_LOGS:
+                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d", 
+                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
+                    if len(valid) == 0 and len(normalized) > 0:
+                        sample_norm = normalized[:2]
+                        logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
 
                 if not valid:
                     try:
@@ -488,22 +512,37 @@ class Scanner:
                     closes = closes + [float(ws_last.get("close"))]
             except Exception:
                 pass
+        
+        # ============ SURGICAL LOG #3: MACD INPUT & OUTPUT ============
         macd_line, signal_line, hist = macd_histogram(closes)
+        if DEBUG_SURGICAL_LOGS:
+            valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
+            logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
+                       symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
+        
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
             pass
         return macd_line, signal_line, hist
 
-    def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0):
+    def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         if not hist or len(hist) < 2:
+            if DEBUG_SURGICAL_LOGS and (symbol or tf):
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: insufficient_hist (len=%d)", symbol, tf, len(hist) if hist else 0)
             return False
         prev = hist[-2]
         cur = hist[-1]
         if prev is None or cur is None:
+            if DEBUG_SURGICAL_LOGS and (symbol or tf):
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            return (prev < 0) and (cur > hist_threshold)
+            result = (prev < 0) and (cur > hist_threshold)
+            if DEBUG_SURGICAL_LOGS and (symbol or tf):
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
+                           symbol, tf, prev, cur, hist_threshold, result)
+            return result
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
             return False
@@ -617,7 +656,8 @@ class Scanner:
                         
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                            if self.detect_flip_current_open(hist, 0.0):
+                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
                                     "symbol": sym,
@@ -626,6 +666,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
+                                logger.info("âœ“ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -694,7 +735,7 @@ class Scanner:
             one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
                 _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK)
+                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
             
             score = float(positive_count)
             if any_positive_mtfflip:
@@ -745,30 +786,19 @@ class Scanner:
             candidates = sorted(selected, key=lambda r: (r["score"], r["positive_count"]), reverse=True)
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-        logger.info("Processing %d candidates (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
+        logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
 
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Reached max open trades; stopping opens.")
                 break
-            
             sym = c["symbol"]
             price = c["price"]
-            
             try:
-                async with self.request_sem:
-                    balance = await self.client.get_balance("USDT")
+                balance = await self.client.get_balance("USDT")
             except Exception:
-                logger.debug("Failed to get balance for %s", sym, exc_info=True)
                 balance = None
-            
-            try:
-                async with self.request_sem:
-                    symbol_info = await self.client.get_symbol_info(sym)
-            except Exception:
-                logger.debug("Failed to get symbol info for %s", sym, exc_info=True)
-                symbol_info = {}
-            
+            symbol_info = await self.client.get_symbol_info(sym)
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
@@ -776,15 +806,12 @@ class Scanner:
                 continue
             if qty != qty_raw:
                 logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
-            
             side = "Buy"
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
-                    async with self.request_sem:
-                        order = await self.client.create_order(sym, side, qty)
+                    order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
-                    logger.info("Opened live trade: %s %s @ %s qty=%s score=%.2f", sym, side, price, qty, c["score"])
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
             else:

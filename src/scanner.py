@@ -692,6 +692,7 @@ class Scanner:
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
+                logger.warning("[DIAGNOSTIC_SCAN_START] ============ ROOT SCAN START (cycle #%d) ============", loop_count)
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
@@ -709,23 +710,19 @@ class Scanner:
                                 price = None
                         
                         if price is None:
-                            logger.debug("[CHECK_SYMBOL] %s: price is None, skipping", sym)
+                            logger.debug("[SKIP_NO_PRICE] %s: no price available", sym)
                             return
                         
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
-                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: computing MACD", sym, root)
+                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: MACD computed, hist length=%d", sym, root, len(hist) if hist else 0)
+                            logger.info("[ROOT_SCAN_CALC] %s %s: MACD calc complete, hist_len=%d, last_val=%s", sym, root, len(hist) if hist else 0, hist[-1] if hist and len(hist) > 0 else None)
                             
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
-                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: flip check complete, result=%s", sym, root, flip)
-                            
-                            if DEBUG_SURGICAL_LOGS:
-                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
-                                           sym, root, hist is not None and len(hist) > 0, flip)
+                            logger.info("[ROOT_SCAN_RESULT] %s %s: flip_detected=%s", sym, root, flip)
                             
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
@@ -736,9 +733,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
-                                logger.info("✓ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
-                                if DEBUG_SURGICAL_LOGS:
-                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
+                                logger.warning("✓✓✓ SIGNAL DETECTED: %s %s @ %s ✓✓✓", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -753,8 +748,8 @@ class Scanner:
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
-                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
-                logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
+                logger.warning("[DIAGNOSTIC_SCAN_END] ============ ROOT SCAN COMPLETE (cycle #%d) ============", loop_count)
+                logger.warning("[SCAN_RESULTS] Checked=%d symbols, Signals=%d, ROOT_TFS=%s", checked_count, len(root_signals), ROOT_TFS)
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
@@ -769,13 +764,6 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
                 await self.send_summary(root_signals)
-                
-                try:
-                    candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("✓ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
-                               checked_count, len(root_signals), candidates_count)
-                except Exception:
-                    pass
                 
             except Exception:
                 logger.exception("Error in root scan loop")

@@ -593,7 +593,6 @@ class Scanner:
         if prev is None or cur is None:
             logger.info("[DEBUG-FLIP] %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
-        # Only require a flip from negative (red) to positive (green)
         result = prev < hist_threshold and cur > hist_threshold
         logger.info("[DEBUG-FLIP] %s %s prev=%.8f cur=%.8f flip=%s", symbol, tf, prev, cur, result)
         if result:
@@ -624,7 +623,6 @@ class Scanner:
         return float(quant)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume data with caching"""
         try:
             now = time.time()
             if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
@@ -652,7 +650,6 @@ class Scanner:
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """Compute percentage change in 24h volume"""
         try:
             if symbol not in self._24h_volumes:
                 return None
@@ -668,32 +665,34 @@ class Scanner:
             return None
 
     async def root_scan_loop(self):
-        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        logger.warning("*** ROOT_SCAN_LOOP STARTED ***")
         loop_count = 0
         
         while not self._stop:
             loop_count += 1
-            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
+            logger.warning("=" * 80)
+            logger.warning("ROOT SCAN CYCLE #%d BEGINNING", loop_count)
+            logger.warning("=" * 80)
             
             start = time.time()
             try:
                 if not self.symbols:
-                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
+                    logger.warning("NO SYMBOLS LOADED - DISCOVERING...")
                     await self.discover_symbols()
                     if self.symbols:
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
+                        logger.warning("SEEDING %d SYMBOLS WITH KLINES", len(self.symbols))
                         await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                        logger.warning("SYMBOL SEEDING COMPLETE")
                     else:
-                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
+                        logger.error("SYMBOL DISCOVERY RETURNED EMPTY!")
                         await asyncio.sleep(10)
                         continue
 
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
-                logger.warning("[DIAGNOSTIC_SCAN_START] ============ ROOT SCAN START (cycle #%d) ============", loop_count)
-                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
+                logger.warning("ROOT_TFS = %s", ROOT_TFS)
+                logger.warning("STARTING TO CHECK %d SYMBOLS", len(self.symbols))
 
                 async def check_symbol(sym: str):
                     try:
@@ -710,19 +709,18 @@ class Scanner:
                                 price = None
                         
                         if price is None:
-                            logger.debug("[SKIP_NO_PRICE] %s: no price available", sym)
+                            logger.debug("[SKIP] %s - no price", sym)
                             return
                         
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
-                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
+                            logger.info("[CHECK] %s %s: computing MACD", sym, root)
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                            logger.info("[ROOT_SCAN_CALC] %s %s: MACD calc complete, hist_len=%d, last_val=%s", sym, root, len(hist) if hist else 0, hist[-1] if hist and len(hist) > 0 else None)
+                            logger.info("[CHECK] %s %s: hist_len=%d, last_hist=%s", sym, root, len(hist) if hist else 0, hist[-1] if hist and len(hist) > 0 else None)
                             
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
-                            logger.info("[ROOT_SCAN_RESULT] %s %s: flip_detected=%s", sym, root, flip)
                             
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
@@ -733,9 +731,9 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
-                                logger.warning("✓✓✓ SIGNAL DETECTED: %s %s @ %s ✓✓✓", sym, root, price)
-                    except Exception:
-                        logger.exception("Error checking symbol %s", sym)
+                                logger.warning("*** SIGNAL DETECTED: %s %s @ %s ***", sym, root, price)
+                    except Exception as ex:
+                        logger.error("[ERROR] Checking symbol %s: %s", sym, str(ex), exc_info=True)
 
                 checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
@@ -748,8 +746,9 @@ class Scanner:
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
-                logger.warning("[DIAGNOSTIC_SCAN_END] ============ ROOT SCAN COMPLETE (cycle #%d) ============", loop_count)
-                logger.warning("[SCAN_RESULTS] Checked=%d symbols, Signals=%d, ROOT_TFS=%s", checked_count, len(root_signals), ROOT_TFS)
+                logger.warning("=" * 80)
+                logger.warning("ROOT SCAN CYCLE #%d COMPLETE: checked=%d, signals=%d", loop_count, checked_count, len(root_signals))
+                logger.warning("=" * 80)
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
@@ -765,14 +764,14 @@ class Scanner:
                     logger.info("No root signals this interval.")
                 await self.send_summary(root_signals)
                 
-            except Exception:
-                logger.exception("Error in root scan loop")
+            except Exception as ex:
+                logger.error("ERROR IN ROOT SCAN LOOP: %s", str(ex), exc_info=True)
             
             elapsed = time.time() - start
 
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
-                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
+                logger.info("Sleeping %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
                 now = time.time()

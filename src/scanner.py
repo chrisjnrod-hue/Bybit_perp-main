@@ -1,4 +1,6 @@
-# scanner.py
+# Add this COMPLETE diagnostic version to replace your current scanner.py
+# This will help us identify exactly where the process breaks down
+
 import os
 import asyncio
 import time
@@ -31,6 +33,9 @@ REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 
+# ============ NEW: Diagnostic flags ============
+DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
+
 
 class Scanner:
     def __init__(self):
@@ -48,8 +53,8 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s)", 
-                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS)
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
+                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -188,9 +193,13 @@ class Scanner:
 
     async def discover_symbols(self) -> List[str]:
         try:
+            logger.info("[DIAGNOSTIC] discover_symbols: STARTING")
             syms = await self._get_symbols()
             if not syms:
+                logger.warning("[DIAGNOSTIC] discover_symbols: NO SYMBOLS FOUND!")
                 return []
+
+            logger.info("[DIAGNOSTIC] discover_symbols: Found %d symbols", len(syms))
 
             if USE_WS:
                 try:
@@ -217,6 +226,7 @@ class Scanner:
                     await asyncio.gather(*tasks)
 
             await self._ensure_rest_poller()
+            logger.info("[DIAGNOSTIC] discover_symbols: COMPLETE - ready to scan")
             return syms
         except Exception:
             logger.exception("discover_symbols failed")
@@ -250,7 +260,9 @@ class Scanner:
             return out
 
         if isinstance(raw_klines, dict):
-            if "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
+            if "list" in raw_klines and isinstance(raw_klines["list"], (list, dict)):
+                raw_klines = raw_klines["list"]
+            elif "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
                 raw_klines = raw_klines["result"]
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
@@ -277,13 +289,34 @@ class Scanner:
                             vol = float(item[5])
                         except Exception:
                             vol = None
-                    out.append({"start_at": start, "close": close, "volume": vol})
+                    
+                    if close is not None:
+                        out.append({"start_at": start, "close": close, "volume": vol})
                     continue
 
                 if isinstance(item, dict):
-                    start = item.get("start_at") or item.get("open_time") or item.get("t") or item.get("timestamp") or item.get("start")
-                    close = (item.get("close") or item.get("close_price") or item.get("c") or item.get("last_price") or item.get("Close"))
-                    vol = item.get("volume") or item.get("vol") or item.get("turnover") or item.get("v")
+                    start = (
+                        item.get("start_at") 
+                        or item.get("open_time") 
+                        or item.get("t") 
+                        or item.get("timestamp") 
+                        or item.get("start")
+                        or item.get("time")
+                    )
+                    close = (
+                        item.get("close") 
+                        or item.get("close_price") 
+                        or item.get("c") 
+                        or item.get("last_price") 
+                        or item.get("Close")
+                    )
+                    vol = (
+                        item.get("volume") 
+                        or item.get("vol") 
+                        or item.get("turnover") 
+                        or item.get("v")
+                        or item.get("quoteAsset")
+                    )
                     is_closed = item.get("isClosed")
                     if is_closed is None:
                         is_closed = item.get("is_closed")
@@ -291,6 +324,7 @@ class Scanner:
                         is_closed = item.get("complete")
                     if is_closed is None:
                         is_closed = item.get("confirmed")
+                    
                     try:
                         if start is not None:
                             start = int(start)
@@ -306,10 +340,11 @@ class Scanner:
                             vol = float(vol)
                     except Exception:
                         vol = None
-                    out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
+                    
+                    if close is not None:
+                        out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
                     continue
 
-                out.append({"start_at": None, "close": None, "volume": None})
             except Exception:
                 logger.exception("Failed to normalize kline item: %s", item)
                 continue
@@ -347,10 +382,27 @@ class Scanner:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 
-                # ============ SURGICAL LOG #1: RAW API RESPONSE ============
                 if DEBUG_SURGICAL_LOGS:
                     try:
-                        if isinstance(raw, dict) and "result" in raw:
+                        if isinstance(raw, dict):
+                            logger.info("[SURGICAL_LOG_0] API_KEYS %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
+                            for key in ["list", "result", "data"]:
+                                if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
+                                    first_item = raw[key][0]
+                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s", 
+                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
+                                    break
+                        elif isinstance(raw, (list, tuple)):
+                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s", 
+                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
+                    except Exception as e:
+                        logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
+
+                if DEBUG_SURGICAL_LOGS:
+                    try:
+                        if isinstance(raw, dict) and "list" in raw:
+                            sample_raw = raw["list"][:3] if isinstance(raw["list"], list) else raw["list"]
+                        elif isinstance(raw, dict) and "result" in raw:
                             sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
                         elif isinstance(raw, dict) and "data" in raw:
                             sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
@@ -360,7 +412,7 @@ class Scanner:
                             sample_raw = str(raw)[:200]
                         logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
                     except Exception as e:
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, e)
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, str(e)[:100])
 
                 normalized = self._normalize_klines(raw, tf)
 
@@ -378,7 +430,6 @@ class Scanner:
                     except Exception:
                         continue
 
-                # ============ SURGICAL LOG #2: NORMALIZATION RESULTS ============
                 if DEBUG_SURGICAL_LOGS:
                     logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d", 
                                symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
@@ -406,12 +457,11 @@ class Scanner:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
 
     async def seed_all(self):
-        logger.info("Seeding klines for all symbols (concurrent=%d limit=%d)", CONCURRENCY, SEED_KLINES_LIMIT)
+        logger.info("[DIAGNOSTIC] seed_all: STARTING with %d symbols", len(self.symbols))
         async def worker(sym: str):
             async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
         
-        # Batch symbols to avoid overwhelming the system
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
             tasks = [asyncio.create_task(worker(s)) for s in batch]
@@ -419,11 +469,18 @@ class Scanner:
                 await asyncio.gather(*tasks)
             if i + REQUEST_BATCH_SIZE < len(self.symbols):
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
+        
+        logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
+        poll_count = 0
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
+                poll_count += 1
+                if poll_count % 5 == 0:
+                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
+                
                 start = time.time()
                 if not self.symbols:
                     await asyncio.sleep(REST_POLL_INTERVAL)
@@ -456,7 +513,6 @@ class Scanner:
                             except Exception:
                                 logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
 
-                # Poll in batches
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
                     if self._stop:
                         break
@@ -513,12 +569,19 @@ class Scanner:
             except Exception:
                 pass
         
-        # ============ SURGICAL LOG #3: MACD INPUT & OUTPUT ============
         macd_line, signal_line, hist = macd_histogram(closes)
         if DEBUG_SURGICAL_LOGS:
             valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
+        
+        if DEBUG_SURGICAL_LOGS and len(closes) > 0:
+            try:
+                last_10_hist = hist[-10:] if hist and len(hist) >= 10 else (hist if hist else [])
+                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s", 
+                           symbol, tf, len(closes), last_10_hist)
+            except Exception as e:
+                logger.info("[MACD_DEBUG] %s %s: error formatting histogram: %s", symbol, tf, str(e)[:50])
         
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
@@ -538,10 +601,24 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            result = (prev < 0) and (cur > hist_threshold)
+            # ============ IMPROVED FLIP DETECTION WITH NOISE FILTER ============
+            zero_cross = (prev < hist_threshold) and (cur > hist_threshold)
+            hist_change = cur - prev
+            strong_flip = abs(hist_change) > 0.00001 and cur > 0.000001
+            result = zero_cross and strong_flip
+            
+            if DEBUG_SURGICAL_LOGS:
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s", 
+                           symbol, tf, prev, cur, hist_change, zero_cross, strong_flip, result)
+            
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
                            symbol, tf, prev, cur, hist_threshold, result)
+            
+            if result and DEBUG_SURGICAL_LOGS:
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f â†’ cur=%.8f (change=%.8f)", 
+                              symbol, tf, prev, cur, hist_change)
+            
             return result
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
@@ -574,7 +651,6 @@ class Scanner:
         """Update and track 24h volume data with caching"""
         try:
             now = time.time()
-            # Only update every 60 seconds
             if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
                 return None
             
@@ -610,26 +686,37 @@ class Scanner:
             if prev_vol <= 0:
                 return None
             change = (curr_vol - prev_vol) / prev_vol
-            return min(change, 1.0)  # Cap at 100%
+            return min(change, 1.0)
         except Exception:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
 
     async def root_scan_loop(self):
-        logger.info("Starting root scan loop interval=%s", ROOT_SCAN_INTERVAL)
+        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        loop_count = 0
+        
         while not self._stop:
+            loop_count += 1
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
+            
             start = time.time()
             try:
                 if not self.symbols:
+                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
                     await self.discover_symbols()
                     if self.symbols:
-                        logger.info("Starting symbol seed (count=%d)", len(self.symbols))
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("Symbol seeding complete")
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                    else:
+                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
+                        await asyncio.sleep(10)
+                        continue
 
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
+                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
                     try:
@@ -648,15 +735,17 @@ class Scanner:
                         if price is None:
                             return
                         
-                        # Cache price
                         self._last_price_cache[sym] = price
-                        
-                        # Update volume data (only updates every 60s)
                         await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            
+                            if DEBUG_SURGICAL_LOGS:
+                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
+                                           sym, root, hist is not None and len(hist) > 0, flip)
+                            
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
@@ -667,10 +756,11 @@ class Scanner:
                                     "vol_change": vol_change
                                 })
                                 logger.info("âœ“ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                if DEBUG_SURGICAL_LOGS:
+                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
-                # Scan symbols in batches to avoid overwhelming API
                 checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
                     if self._stop:
@@ -682,6 +772,7 @@ class Scanner:
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
+                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
                 logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
                 await self._emit_event("root_signals", root_signals)
 
@@ -697,12 +788,22 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
                 await self.send_summary(root_signals)
+                
+                try:
+                    candidates_count = len(root_signals) if root_signals else 0
+                    logger.info("âœ“ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                               checked_count, len(root_signals), candidates_count)
+                except Exception:
+                    pass
+                
             except Exception:
                 logger.exception("Error in root scan loop")
+            
             elapsed = time.time() - start
 
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
+                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
                 now = time.time()

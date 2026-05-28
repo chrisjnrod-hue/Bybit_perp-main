@@ -31,6 +31,7 @@ REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
+
 class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
@@ -592,11 +593,355 @@ class Scanner:
         if prev is None or cur is None:
             logger.info("[DEBUG-FLIP] %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
-        # Flip detection: Previous histogram value < 0 and current value > 0
+        # Only require a flip from negative (red) to positive (green)
         result = prev < hist_threshold and cur > hist_threshold
         logger.info("[DEBUG-FLIP] %s %s prev=%.8f cur=%.8f flip=%s", symbol, tf, prev, cur, result)
         if result:
             logger.warning("[FLIP_DETECTED] %s %s: MACD flip detected! prev=%.8f -> cur=%.8f", symbol, tf, prev, cur)
         return result
 
-    # [All other methods unchanged...]
+    def _quantize_qty(self, qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
+        if qty is None:
+            return 0.0
+        qty_d = Decimal(str(qty))
+        if step is None or step <= 0:
+            if min_qty and qty_d < Decimal(str(min_qty)):
+                logger.debug("Qty below min_qty, bumping to min_qty %s", min_qty)
+                return float(Decimal(str(min_qty)))
+            return float(qty_d)
+        step_d = Decimal(str(step))
+        mult = (qty_d / step_d).to_integral_value(rounding=ROUND_DOWN)
+        quant = (mult * step_d)
+        if min_qty is not None:
+            min_d = Decimal(str(min_qty))
+            if quant < min_d:
+                logger.debug("Quantized qty %s below min_qty %s, using min_qty", float(quant), float(min_d))
+                quant = min_d
+        try:
+            quant = quant.normalize()
+        except Exception:
+            pass
+        return float(quant)
+
+    async def _update_24h_volume(self, symbol: str) -> Optional[float]:
+        """Update and track 24h volume data with caching"""
+        try:
+            now = time.time()
+            if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
+                return None
+            
+            if hasattr(self.client, "get_24h_ticker"):
+                async with self.request_sem:
+                    data = await self.client.get_24h_ticker(symbol)
+                if data and isinstance(data, dict):
+                    vol = data.get("volume") or data.get("vol") or data.get("turnover")
+                    if vol is not None:
+                        try:
+                            vol = float(vol)
+                            if symbol not in self._24h_volumes:
+                                self._24h_volumes[symbol] = {"current": vol, "previous": vol}
+                            else:
+                                self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
+                                self._24h_volumes[symbol]["current"] = vol
+                            self._last_price_time[symbol] = now
+                            return vol
+                        except Exception:
+                            pass
+        except Exception:
+            logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
+        return None
+
+    def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
+        """Compute percentage change in 24h volume"""
+        try:
+            if symbol not in self._24h_volumes:
+                return None
+            vol_data = self._24h_volumes[symbol]
+            prev_vol = vol_data.get("previous", 0)
+            curr_vol = vol_data.get("current", 0)
+            if prev_vol <= 0:
+                return None
+            change = (curr_vol - prev_vol) / prev_vol
+            return min(change, 1.0)
+        except Exception:
+            logger.debug("Could not compute 24h volume change for %s", symbol)
+            return None
+
+    async def root_scan_loop(self):
+        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        loop_count = 0
+        
+        while not self._stop:
+            loop_count += 1
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
+            
+            start = time.time()
+            try:
+                if not self.symbols:
+                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
+                    await self.discover_symbols()
+                    if self.symbols:
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
+                        await self.seed_all()
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                    else:
+                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
+                        await asyncio.sleep(10)
+                        continue
+
+                await self._ensure_rest_poller()
+
+                root_signals: List[Dict[str, Any]] = []
+                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
+
+                async def check_symbol(sym: str):
+                    try:
+                        async with self.request_sem:
+                            price = await self.client.get_latest_price(sym)
+                        
+                        if price is None:
+                            try:
+                                if USE_WS and self.client.is_ws_connected():
+                                    ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
+                                    if ws_last and ws_last.get("close") is not None:
+                                        price = float(ws_last.get("close"))
+                            except Exception:
+                                price = None
+                        
+                        if price is None:
+                            return
+                        
+                        self._last_price_cache[sym] = price
+                        await self._update_24h_volume(sym)
+                        
+                        for root in ROOT_TFS:
+                            macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
+                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            
+                            if DEBUG_SURGICAL_LOGS:
+                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
+                                           sym, root, hist is not None and len(hist) > 0, flip)
+                            
+                            if hist and flip:
+                                vol_change = self.compute_24h_volume_change(sym)
+                                root_signals.append({
+                                    "symbol": sym,
+                                    "root": root,
+                                    "price": price,
+                                    "hist": hist,
+                                    "vol_change": vol_change
+                                })
+                                logger.info("✓ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                if DEBUG_SURGICAL_LOGS:
+                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
+                    except Exception:
+                        logger.exception("Error checking symbol %s", sym)
+
+                checked_count = 0
+                for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
+                    if self._stop:
+                        break
+                    batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
+                    tasks = [asyncio.create_task(check_symbol(s)) for s in batch]
+                    await asyncio.gather(*tasks)
+                    checked_count += len(batch)
+                    if i + REQUEST_BATCH_SIZE < len(self.symbols):
+                        await asyncio.sleep(REQUEST_BATCH_DELAY)
+
+                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
+                logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
+                await self._emit_event("root_signals", root_signals)
+
+                if root_signals:
+                    for sig in root_signals:
+                        try:
+                            sym = sig["symbol"]
+                            if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
+                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                        except Exception:
+                            logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
+                    await self.handle_root_signals(root_signals)
+                else:
+                    logger.info("No root signals this interval.")
+                await self.send_summary(root_signals)
+                
+                try:
+                    candidates_count = len(root_signals) if root_signals else 0
+                    logger.info("✓ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                               checked_count, len(root_signals), candidates_count)
+                except Exception:
+                    pass
+                
+            except Exception:
+                logger.exception("Error in root scan loop")
+            
+            elapsed = time.time() - start
+
+            if ROOT_SCAN_INTERVAL:
+                to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
+                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
+                await asyncio.sleep(to_sleep)
+            else:
+                now = time.time()
+                next_5m = math.ceil(now / 300.0) * 300.0
+                to_sleep = max(0, next_5m - now)
+                logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
+                await asyncio.sleep(to_sleep)
+
+    async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
+        evaluated = []
+        for item in root_signals:
+            sym = item["symbol"]
+            price = item["price"]
+            root = item["root"]
+            vol_change = item.get("vol_change")
+            mtf_state = {}
+            positive_count = 0
+            any_positive_mtfflip = False
+            
+            for tf in MTF_TFS:
+                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
+                cur_hist = h[-1] if h and len(h) >= 1 else None
+                prev_hist = h[-2] if h and len(h) >= 2 else None
+                mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
+                if cur_hist is not None and cur_hist > 0:
+                    positive_count += 1
+                if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
+                    any_positive_mtfflip = True
+            
+            one_d_slope = None
+            if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
+                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
+                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
+            
+            score = float(positive_count)
+            if any_positive_mtfflip:
+                score += 1.0
+            if vol_change is not None and vol_change > 0:
+                score += min(vol_change, 1.0)
+            
+            if MTF_FILTER:
+                positive_rising_count = 0
+                for tf, vals in mtf_state.items():
+                    cur = vals.get("cur")
+                    prev = vals.get("prev")
+                    if cur is not None and prev is not None and cur > prev and cur > 0:
+                        positive_rising_count += 1
+                score += positive_rising_count * 0.8
+                one_d = mtf_state.get("1d")
+                if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
+                    if one_d_slope is not None and one_d_slope > 0:
+                        score += 0.5
+            
+            evaluated.append({
+                "symbol": sym,
+                "root": root,
+                "price": price,
+                "mtf": mtf_state,
+                "positive_count": positive_count,
+                "vol_change": vol_change,
+                "one_d_slope": one_d_slope,
+                "accept": True,
+                "reason": "candidate",
+                "score": score
+            })
+
+        await self._emit_event("candidates_evaluated", evaluated)
+
+        candidates = [e for e in evaluated if e["accept"]]
+        if ROOT_FILTER:
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for c in candidates:
+                grouped.setdefault(c["root"], []).append(c)
+            selected: List[Dict[str, Any]] = []
+            for root in ROOT_TFS:
+                lst = grouped.get(root, [])
+                if not lst:
+                    continue
+                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
+                selected.extend(top)
+            candidates = sorted(selected, key=lambda r: (r["score"], r["positive_count"]), reverse=True)
+
+        current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
+        logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
+
+        for c in candidates:
+            if not self.trade_manager.can_open():
+                logger.info("Reached max open trades; stopping opens.")
+                break
+            sym = c["symbol"]
+            price = c["price"]
+            try:
+                balance = await self.client.get_balance("USDT")
+            except Exception:
+                balance = None
+            symbol_info = await self.client.get_symbol_info(sym)
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+            if qty <= 0 or math.isclose(qty, 0.0):
+                logger.warning("Computed qty for %s was zero after quantize (qty=%s). Skipping open.", sym, qty)
+                continue
+            if qty != qty_raw:
+                logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+            side = "Buy"
+            if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
+                try:
+                    order = await self.client.create_order(sym, side, qty)
+                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
+                except Exception:
+                    logger.exception("Failed to place order for %s", sym)
+            else:
+                t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
+                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
+
+    async def send_summary(self, root_signals: List[Dict[str, Any]]):
+        if not root_signals:
+            await send_message("Root scan: no signals this interval.")
+            return
+        grouped = {}
+        for it in root_signals:
+            grouped.setdefault(it["root"], []).append((it["symbol"], it["price"], it.get("vol_change")))
+        lines = []
+        lines.append(f"Root scan summary ({len(root_signals)} signals)")
+        for rt in ROOT_TFS:
+            lst = grouped.get(rt, [])
+            if not lst:
+                continue
+            lines.append(f"\nRoot {rt} signals:")
+            for s, p, v in lst:
+                if v is None:
+                    lines.append(f"- {s} @ {p}")
+                else:
+                    lines.append(f"- {s} @ {p} (24h vol Δ {v:.2f})")
+        open_sum = self.trade_manager.summary()
+        if open_sum:
+            lines.append("\nOpen trades:")
+            for ot in open_sum:
+                lines.append(f"- {ot['symbol']} {ot['qty']} @ {ot['entry']}")
+        text = "\n".join(lines)
+        await send_message(text)
+
+    async def run(self):
+        self._task = asyncio.create_task(self.root_scan_loop())
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            logger.info("Scanner run cancelled")
+        finally:
+            try:
+                await self.client.close()
+            except Exception:
+                logger.exception("Error closing client")
+
+    def stop(self):
+        logger.info("Stopping scanner...")
+        self._stop = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+        if self._rest_poller_task and not self._rest_poller_task.done():
+            try:
+                self._rest_poller_task.cancel()
+            except Exception:
+                pass

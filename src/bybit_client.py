@@ -34,8 +34,8 @@ class BybitClient:
         env_hosts = os.getenv("BYBIT_WS_HOSTS", "")
         extra = [h.strip() for h in env_hosts.split(",") if h.strip()]
         default_ws_hosts = [
-            f"wss://{host}/realtime_public",
-            f"wss://{host}/realtime",
+            f"wss://{host}/v5/public/linear",
+            f"wss://{host}/v5/private",
         ]
         self.ws_hosts = extra + default_ws_hosts
 
@@ -88,7 +88,7 @@ class BybitClient:
                     text = await resp.text()
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
-                        logger.warning("HTTP %s from %s — backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
+                        logger.warning("HTTP %s from %s â€” backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
                         await asyncio.sleep(wait)
                         continue
                     try:
@@ -289,21 +289,46 @@ class BybitClient:
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
         try:
-            params = {"category": "linear", "instrumentType": "PERPETUAL"}
-            data = await self._get("/v5/market/instruments-info", params=params)
-            if isinstance(data, dict):
-                if data.get("ret_code", 0) == 0 and "result" in data:
-                    res = data["result"]
-                    if isinstance(res, dict) and isinstance(res.get("list"), list):
-                        instruments = res.get("list", [])
-                        logger.info("Found %d instruments via v5", len(instruments))
-                        return instruments
-                    if isinstance(res, list):
-                        logger.info("Found %d instruments via v5", len(res))
-                        return res
-                if "result" in data and isinstance(data["result"], (list, dict)):
-                    logger.info("Found instruments via v5 (non-standard shape)")
-                    return data["result"] if isinstance(data["result"], list) else list(data["result"])
+            all_instruments = []
+            cursor = None
+
+            while True:
+                params = {
+                    "category": "linear",
+                    "instrumentType": "PERPETUAL",
+                    "limit": 1000
+                }
+
+                if cursor:
+                    params["cursor"] = cursor
+
+                data = await self._get("/v5/market/instruments-info", params=params)
+
+                if not isinstance(data, dict):
+                    break
+
+                result = data.get("result", {})
+                instruments = result.get("list", [])
+
+                if instruments:
+                    all_instruments.extend(instruments)
+
+                cursor = result.get("nextPageCursor")
+
+                logger.info(
+                    "Fetched page: instruments=%d total=%d cursor=%s",
+                    len(instruments),
+                    len(all_instruments),
+                    cursor
+                )
+
+                if not cursor:
+                    break
+
+            if all_instruments:
+                logger.info("Found %d total instruments via paginated v5", len(all_instruments))
+                return all_instruments
+
         except Exception:
             logger.debug("v5 instruments-info attempt failed", exc_info=True)
         try:
@@ -473,7 +498,7 @@ class BybitClient:
                 tf = None
                 symbol = None
                 if len(parts) >= 3:
-                    tf = parts[1]
+                    tf = parts[-2] if len(parts) >= 3 else None
                     symbol = parts[-1]
                 else:
                     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):

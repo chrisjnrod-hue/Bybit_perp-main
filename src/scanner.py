@@ -709,14 +709,19 @@ class Scanner:
                                 price = None
                         
                         if price is None:
+                            logger.debug("[CHECK_SYMBOL] %s: price is None, skipping", sym)
                             return
                         
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
+                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: computing MACD", sym, root)
                             macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
+                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: MACD computed, hist length=%d", sym, root, len(hist) if hist else 0)
+                            
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            logger.info("[CHECK_SYMBOL_ROOT] %s %s: flip check complete, result=%s", sym, root, flip)
                             
                             if DEBUG_SURGICAL_LOGS:
                                 logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 

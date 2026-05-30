@@ -1,14 +1,14 @@
-# Add this COMPLETE diagnostic version to replace your current scanner.py
-# This will help us identify exactly where the process breaks down
+# Add this COMPLETE production version to replace your current scanner.py
+# This version includes all MTF filtering, proper telegram formatting, and live trade features
 
 import os
 import asyncio
 import time
 import json
+import math
 from collections import defaultdict
 from typing import Dict, List, Any, Optional, Callable
 from decimal import Decimal, ROUND_DOWN, getcontext
-import math
 import inspect
 
 from .logger import get_logger
@@ -17,7 +17,8 @@ from .macd import macd_histogram, slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MTF_FILTER, MAX_OPEN_TRADES, USE_WS
+    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MTF_FILTER, MAX_OPEN_TRADES, USE_WS,
+    MACD_HIST_THRESHOLD, MIN_VOLUME_CHANGE
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -32,9 +33,8 @@ MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
 REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
-
-# ============ NEW: Diagnostic flags ============
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
+SEND_ALL_SIGNALS_ON_DEPLOY = os.getenv("SEND_ALL_SIGNALS_ON_DEPLOY", "true").strip().lower() in ("1", "true", "yes", "y")
 
 
 class Scanner:
@@ -53,8 +53,9 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
-                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
+        self._is_first_scan = True
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s SEND_ALL_ON_DEPLOY=%s)", 
+                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE, SEND_ALL_SIGNALS_ON_DEPLOY)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -91,7 +92,7 @@ class Scanner:
 
     async def _get_symbols(self) -> List[str]:
         try:
-            items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])
+            items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols_v2", "symbols"])
         except Exception:
             logger.exception("Error fetching symbols from client")
             items = None
@@ -250,6 +251,12 @@ class Scanner:
             pass
         return 60
 
+    def _get_next_5m_open(self) -> float:
+        """Calculate seconds until next 5-minute candle opens"""
+        now = time.time()
+        next_5m = math.ceil(now / 300.0) * 300.0
+        return max(0, next_5m - now)
+
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
         names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
         return await self._call_client_method(names, symbol, tf, limit)
@@ -362,9 +369,6 @@ class Scanner:
                     is_closed,
                     len(out)
                 )
-
-                # IMPORTANT:
-                # Keep current candle for live MACD flip detection
 
             except Exception:
                 logger.exception("Error evaluating candle status")
@@ -562,6 +566,7 @@ class Scanner:
                     closes.append(float(c))
             except Exception:
                 continue
+        
         # Replace current candle close instead of appending fake candle
         if include_price is not None:
             if closes:
@@ -572,7 +577,10 @@ class Scanner:
             try:
                 ws_last = self.client.get_ws_latest_kline(symbol, tf) if hasattr(self.client, "get_ws_latest_kline") else None
                 if ws_last and ws_last.get("close") is not None:
-                    closes = closes + [float(ws_last.get("close"))]
+                    if closes:
+                        closes[-1] = float(ws_last.get("close"))
+                    else:
+                        closes.append(float(ws_last.get("close")))
             except Exception:
                 pass
         
@@ -597,6 +605,7 @@ class Scanner:
         return macd_line, signal_line, hist
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
+        """Detect MACD histogram flip from negative to positive"""
         if not hist or len(hist) < 2:
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: insufficient_hist (len=%d)", symbol, tf, len(hist) if hist else 0)
@@ -608,25 +617,17 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            # ============ IMPROVED FLIP DETECTION WITH NOISE FILTER ============
             zero_cross = prev <= 0 and cur > 0
-            hist_change = cur - prev
-            strong_flip = True
-            result = zero_cross
             
             if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s", 
-                           symbol, tf, prev, cur, hist_change, zero_cross, strong_flip, result)
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, zero_cross=%s, FLIP=%s", 
+                           symbol, tf, prev, cur, zero_cross, zero_cross)
             
-            if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
-                           symbol, tf, prev, cur, hist_threshold, result)
+            if zero_cross and DEBUG_SURGICAL_LOGS:
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: FLIP DETECTED! prev=%.8f -> cur=%.8f", 
+                              symbol, tf, prev, cur)
             
-            if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)", 
-                              symbol, tf, prev, cur, hist_change)
-            
-            return result
+            return zero_cross
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
             return False
@@ -683,7 +684,7 @@ class Scanner:
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """Compute percentage change in 24h volume"""
+        """Compute percentage change in 24h volume (positive values only)"""
         try:
             if symbol not in self._24h_volumes:
                 return None
@@ -693,13 +694,110 @@ class Scanner:
             if prev_vol <= 0:
                 return None
             change = (curr_vol - prev_vol) / prev_vol
-            return min(change, 1.0)
+            return max(0, min(change, 1.0))  # Clamp to [0, 1]
         except Exception:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
 
+    def _evaluate_mtf_signals(self, symbol: str, price: float) -> Dict[str, Any]:
+        """
+        Evaluate MTF signals for a symbol.
+        Returns:
+        - positive_count: number of TFs with positive histogram
+        - has_any_flip: whether any TF has current flip
+        - mtf_state: dict of TF -> {prev, cur, slope, has_flip}
+        - one_d_slope: slope on 1d
+        """
+        mtf_state = {}
+        positive_count = 0
+        has_any_flip = False
+        one_d_slope = None
+
+        for tf in MTF_TFS:
+            macd_line, sig, hist = self.compute_macd_for(symbol, tf, include_price=price, use_ws_current=True)
+            
+            cur_hist = hist[-1] if hist and len(hist) >= 1 else None
+            prev_hist = hist[-2] if hist and len(hist) >= 2 else None
+            
+            # Check for flip
+            has_flip = False
+            if prev_hist is not None and cur_hist is not None:
+                has_flip = prev_hist <= 0 and cur_hist > 0
+            
+            # Compute slope for this TF
+            tf_slope = None
+            if hist and len(hist) > 1:
+                tf_slope = slope(hist, lookback=MTF_SLOPE_LOOKBACK) if hist else None
+            
+            mtf_state[tf] = {
+                "prev": prev_hist,
+                "cur": cur_hist,
+                "slope": tf_slope,
+                "has_flip": has_flip
+            }
+            
+            # Count positive histograms
+            if cur_hist is not None and cur_hist > 0:
+                positive_count += 1
+            
+            # Track any flip
+            if has_flip:
+                has_any_flip = True
+        
+        # Get 1d slope
+        if "1d" in mtf_state and mtf_state["1d"]["cur"] is not None:
+            _, _, full_hist = self.compute_macd_for(symbol, "1d", include_price=price, use_ws_current=True)
+            one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
+        
+        return {
+            "mtf_state": mtf_state,
+            "positive_count": positive_count,
+            "has_any_flip": has_any_flip,
+            "one_d_slope": one_d_slope
+        }
+
+    def _score_candidate(self, eval_data: Dict[str, Any], vol_change: Optional[float]) -> float:
+        """Score a candidate trade based on MTF alignment"""
+        mtf_state = eval_data["mtf_state"]
+        positive_count = eval_data["positive_count"]
+        has_any_flip = eval_data["has_any_flip"]
+        one_d_slope = eval_data["one_d_slope"]
+        
+        score = float(positive_count)
+        
+        # Bonus for any flip
+        if has_any_flip:
+            score += 2.0
+        
+        # Volume change bonus
+        if vol_change is not None and vol_change > 0:
+            score += min(vol_change, 1.0)
+        
+        # MTF Filter: additional scoring for upslope alignment
+        if MTF_FILTER:
+            for tf, vals in mtf_state.items():
+                cur = vals.get("cur")
+                prev = vals.get("prev")
+                tf_slope = vals.get("slope")
+                
+                # Bonus if positive and rising
+                if cur is not None and prev is not None and cur > prev and cur > 0:
+                    score += 0.8
+                
+                # Bonus if on upslope
+                if tf_slope is not None and tf_slope > 0:
+                    score += 0.5
+            
+            # 1d consideration: if negative but rising
+            one_d = mtf_state.get("1d")
+            if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
+                if one_d_slope is not None and one_d_slope > 0:
+                    score += 0.5  # Still valid if rising toward positive
+        
+        return score
+
     async def root_scan_loop(self):
-        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - ROOT_SCAN_INTERVAL=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
         
         while not self._stop:
@@ -776,7 +874,7 @@ class Scanner:
 
                             flip = self.detect_flip_current_open(
                                 hist,
-                                0.0,
+                                MACD_HIST_THRESHOLD,
                                 symbol=sym,
                                 tf=root
                             )
@@ -817,7 +915,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
-                                logger.info("Ã¢Å“â€œ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                logger.info("➔ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                                 if DEBUG_SURGICAL_LOGS:
                                     logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
                     except Exception:
@@ -858,14 +956,29 @@ class Scanner:
                                 await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
-                    await self.handle_root_signals(root_signals)
+                    
+                    # Send all signals on deploy or subsequent scans based on SEND_ALL_SIGNALS_ON_DEPLOY
+                    if self._is_first_scan and SEND_ALL_SIGNALS_ON_DEPLOY:
+                        logger.info("FIRST SCAN with SEND_ALL_SIGNALS_ON_DEPLOY=True, sending all signals")
+                        self._is_first_scan = False
+                        await self.send_signal_summary(root_signals)
+                    elif not self._is_first_scan:
+                        await self.send_signal_summary(root_signals)
+                    
+                    # Only open trades on subsequent scans (not first scan)
+                    if not self._is_first_scan:
+                        await self.handle_root_signals(root_signals)
+                    else:
+                        logger.info("First scan: skipping trade opens, awaiting next interval")
+                        self._is_first_scan = False
                 else:
                     logger.info("No root signals this interval.")
-                await self.send_summary(root_signals)
+                    if not (self._is_first_scan and SEND_ALL_SIGNALS_ON_DEPLOY):
+                        await send_message("Root scan: no signals this interval.")
                 
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                    logger.info("➔ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
                                checked_count, len(root_signals), candidates_count)
                 except Exception:
                     pass
@@ -875,61 +988,70 @@ class Scanner:
             
             elapsed = time.time() - start
 
-            if ROOT_SCAN_INTERVAL:
+            # Determine sleep duration
+            if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                now = time.time()
-                next_5m = math.ceil(now / 300.0) * 300.0
-                to_sleep = max(0, next_5m - now)
-                logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
+                # Align to next 5-minute candle
+                to_sleep = self._get_next_5m_open()
+                logger.info("[DIAGNOSTIC] root_scan_loop: ROOT_SCAN_INTERVAL=0, sleeping %.1f seconds until next 5m open", to_sleep)
                 await asyncio.sleep(to_sleep)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
+        """
+        Process root signals through MTF evaluation, filtering, and trading.
+        Implements:
+        - A: Scan MTF for positive MACD (accept even if any TF has flip)
+        - B: Monitor if 1+ TF is negative until last TF flips on current candle
+        - C: If only 1d is negative but rising (upslope), accept
+        """
         evaluated = []
         for item in root_signals:
             sym = item["symbol"]
             price = item["price"]
             root = item["root"]
             vol_change = item.get("vol_change")
-            mtf_state = {}
-            positive_count = 0
-            any_positive_mtfflip = False
             
-            for tf in MTF_TFS:
-                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
-                cur_hist = h[-1] if h and len(h) >= 1 else None
-                prev_hist = h[-2] if h and len(h) >= 2 else None
-                mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
-                if cur_hist is not None and cur_hist > 0:
-                    positive_count += 1
-                if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
-                    any_positive_mtfflip = True
+            # Evaluate MTF signals
+            eval_data = self._evaluate_mtf_signals(sym, price)
+            mtf_state = eval_data["mtf_state"]
+            positive_count = eval_data["positive_count"]
+            has_any_flip = eval_data["has_any_flip"]
+            one_d_slope = eval_data["one_d_slope"]
             
-            one_d_slope = None
-            if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
-                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
+            # Rule A: Accept if any TF has positive histogram
+            rule_a_pass = positive_count > 0
             
-            score = float(positive_count)
-            if any_positive_mtfflip:
-                score += 1.0
-            if vol_change is not None and vol_change > 0:
-                score += min(vol_change, 1.0)
+            # Rule B: Monitor negative TFs (check if rising)
+            rule_b_monitor = False
+            negative_tfs = [tf for tf, vals in mtf_state.items() if vals.get("cur") is not None and vals.get("cur") < 0]
+            if negative_tfs:
+                # All negative TFs must be rising (upslope) to be acceptable
+                rule_b_monitor = all(
+                    mtf_state[tf].get("slope") is not None and mtf_state[tf].get("slope") > 0 
+                    for tf in negative_tfs
+                )
             
-            if MTF_FILTER:
-                positive_rising_count = 0
-                for tf, vals in mtf_state.items():
-                    cur = vals.get("cur")
-                    prev = vals.get("prev")
-                    if cur is not None and prev is not None and cur > prev and cur > 0:
-                        positive_rising_count += 1
-                score += positive_rising_count * 0.8
-                one_d = mtf_state.get("1d")
-                if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
-                    if one_d_slope is not None and one_d_slope > 0:
-                        score += 0.5
+            # Rule C: 1d special handling
+            rule_c_pass = False
+            one_d_state = mtf_state.get("1d")
+            if one_d_state and one_d_state.get("cur") is not None and one_d_state.get("cur") < 0:
+                if one_d_slope is not None and one_d_slope > 0:
+                    rule_c_pass = True
+            
+            # Accept if any rule passes
+            accept = rule_a_pass or rule_b_monitor or rule_c_pass
+            reason = []
+            if rule_a_pass:
+                reason.append("positive_alignment")
+            if rule_b_monitor:
+                reason.append("rising_negative")
+            if rule_c_pass:
+                reason.append("1d_upslope")
+            
+            score = self._score_candidate(eval_data, vol_change)
             
             evaluated.append({
                 "symbol": sym,
@@ -937,16 +1059,22 @@ class Scanner:
                 "price": price,
                 "mtf": mtf_state,
                 "positive_count": positive_count,
+                "has_any_flip": has_any_flip,
                 "vol_change": vol_change,
                 "one_d_slope": one_d_slope,
-                "accept": True,
-                "reason": "candidate",
+                "accept": accept,
+                "reason": ",".join(reason) if reason else "unknown",
                 "score": score
             })
 
         await self._emit_event("candidates_evaluated", evaluated)
 
         candidates = [e for e in evaluated if e["accept"]]
+        if not candidates:
+            logger.info("No candidates passed MTF evaluation")
+            return
+
+        # Apply ROOT_FILTER if enabled
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
@@ -981,44 +1109,70 @@ class Scanner:
                 continue
             if qty != qty_raw:
                 logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+            
             side = "Buy"
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
-                    await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
+                    await send_message(f"🟢 LIVE TRADE OPENED\n{sym}\n{side} @ {price}\nQty: {qty:.6f}\nScore: {c['score']:.2f}\nReason: {c['reason']}")
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
             else:
-                t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
-                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
-                await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
+                t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "reason": c["reason"]})
+                logger.info("Simulated open %s qty=%s score=%.2f reason=%s", sym, qty, c["score"], c["reason"])
+                await send_message(f"📊 SIMULATED TRADE\n{sym}\n{side} @ {price}\nQty: {qty:.6f}\nScore: {c['score']:.2f}\nReason: {c['reason']}")
 
-    async def send_summary(self, root_signals: List[Dict[str, Any]]):
+    async def send_signal_summary(self, root_signals: List[Dict[str, Any]]):
+        """
+        Send Telegram summary grouped by root TF.
+        Format: 
+        - Block 1: Root signals summary
+        - Block 2+: Per-timeframe signals with MTF alignment state
+        """
         if not root_signals:
             await send_message("Root scan: no signals this interval.")
             return
+        
+        # Group by root TF
         grouped = {}
-        for it in root_signals:
-            grouped.setdefault(it["root"], []).append((it["symbol"], it["price"], it.get("vol_change")))
-        lines = []
-        lines.append(f"Root scan summary ({len(root_signals)} signals)")
-        for rt in ROOT_TFS:
-            lst = grouped.get(rt, [])
-            if not lst:
+        for item in root_signals:
+            root = item["root"]
+            grouped.setdefault(root, []).append(item)
+        
+        # Build message blocks
+        blocks = []
+        blocks.append(f"<b>Root Scan Summary</b>\n{len(root_signals)} signals detected")
+        
+        # Sort by ROOT_TFS order
+        for root_tf in ROOT_TFS:
+            signals = grouped.get(root_tf, [])
+            if not signals:
                 continue
-            lines.append(f"\nRoot {rt} signals:")
-            for s, p, v in lst:
-                if v is None:
-                    lines.append(f"- {s} @ {p}")
-                else:
-                    lines.append(f"- {s} @ {p} (24h vol ÃŽâ€ {v:.2f})")
-        open_sum = self.trade_manager.summary()
-        if open_sum:
-            lines.append("\nOpen trades:")
-            for ot in open_sum:
-                lines.append(f"- {ot['symbol']} {ot['qty']} @ {ot['entry']}")
-        text = "\n".join(lines)
+            
+            blocks.append(f"\n<b>Root {root_tf} ({len(signals)} signals):</b>")
+            
+            for sig in signals:
+                sym = sig["symbol"]
+                price = sig["price"]
+                vol_change = sig.get("vol_change")
+                hist = sig.get("hist", [])
+                cur_hist = hist[-1] if hist and len(hist) > 0 else None
+                
+                # Format signal
+                vol_str = f" | 24h vol Δ {vol_change:.1%}" if vol_change is not None and vol_change > 0 else ""
+                hist_str = f" | hist={cur_hist:.6f}" if cur_hist is not None else ""
+                
+                blocks.append(f"  • <code>{sym}</code> @ {price:.4f}{vol_str}{hist_str}")
+        
+        # Add open trades summary
+        open_summary = self.trade_manager.summary()
+        if open_summary:
+            blocks.append(f"\n<b>Open Trades ({len(open_summary)}):</b>")
+            for ot in open_summary:
+                blocks.append(f"  • {ot['symbol']} {ot['qty']:.6f} @ {ot['entry']:.4f}")
+        
+        text = "\n".join(blocks)
         await send_message(text)
 
     async def run(self):

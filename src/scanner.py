@@ -54,7 +54,7 @@ class Scanner:
         self._pending_signals: Dict[str, Dict[str, Any]] = {}
         # Queue of signals that will be opened on the next root scan interval
         self._queued_opens: List[Dict[str, Any]] = []
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
                    bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -290,31 +290,31 @@ class Scanner:
                             vol = float(item[5])
                         except Exception:
                             vol = None
-                    
+
                     if close is not None:
                         out.append({"start_at": start, "close": close, "volume": vol})
                     continue
 
                 if isinstance(item, dict):
                     start = (
-                        item.get("start_at") 
-                        or item.get("open_time") 
-                        or item.get("t") 
-                        or item.get("timestamp") 
+                        item.get("start_at")
+                        or item.get("open_time")
+                        or item.get("t")
+                        or item.get("timestamp")
                         or item.get("start")
                         or item.get("time")
                     )
                     close = (
-                        item.get("close") 
-                        or item.get("close_price") 
-                        or item.get("c") 
-                        or item.get("last_price") 
+                        item.get("close")
+                        or item.get("close_price")
+                        or item.get("c")
+                        or item.get("last_price")
                         or item.get("Close")
                     )
                     vol = (
-                        item.get("volume") 
-                        or item.get("vol") 
-                        or item.get("turnover") 
+                        item.get("volume")
+                        or item.get("vol")
+                        or item.get("turnover")
                         or item.get("v")
                         or item.get("quoteAsset")
                     )
@@ -325,7 +325,7 @@ class Scanner:
                         is_closed = item.get("complete")
                     if is_closed is None:
                         is_closed = item.get("confirmed")
-                    
+
                     try:
                         if start is not None:
                             start = int(start)
@@ -341,7 +341,7 @@ class Scanner:
                             vol = float(vol)
                     except Exception:
                         vol = None
-                    
+
                     if close is not None:
                         out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
                     continue
@@ -378,10 +378,10 @@ class Scanner:
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
-                
+
                 async with self.request_sem:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
-                
+
                 if not raw:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
@@ -393,12 +393,12 @@ class Scanner:
                             for key in ["list", "result", "data"]:
                                 if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
                                     first_item = raw[key][0]
-                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s", 
-                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
+                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s",
+                                                symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
                                     break
                         elif isinstance(raw, (list, tuple)):
-                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s", 
-                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
+                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s",
+                                        symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
                     except Exception as e:
                         logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
 
@@ -435,8 +435,8 @@ class Scanner:
                         continue
 
                 if DEBUG_SURGICAL_LOGS:
-                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d", 
-                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
+                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d",
+                                symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
                     if len(valid) == 0 and len(normalized) > 0:
                         sample_norm = normalized[:2]
                         logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
@@ -465,7 +465,7 @@ class Scanner:
         async def worker(sym: str):
             async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
-        
+
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
             tasks = [asyncio.create_task(worker(s)) for s in batch]
@@ -473,7 +473,7 @@ class Scanner:
                 await asyncio.gather(*tasks)
             if i + REQUEST_BATCH_SIZE < len(self.symbols):
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
-        
+
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
@@ -484,7 +484,7 @@ class Scanner:
                 poll_count += 1
                 if poll_count % 5 == 0:
                     logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
-                
+
                 start = time.time()
                 if not self.symbols:
                     await asyncio.sleep(REST_POLL_INTERVAL)
@@ -576,21 +576,21 @@ class Scanner:
                     closes = closes + [float(ws_last.get("close"))]
             except Exception:
                 pass
-        
+
         macd_line, signal_line, hist = macd_histogram(closes)
         if DEBUG_SURGICAL_LOGS:
             valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
-        
+
         if DEBUG_SURGICAL_LOGS and len(closes) > 0:
             try:
                 last_10_hist = hist[-10:] if hist and len(hist) >= 10 else (hist if hist else [])
-                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s", 
+                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s",
                            symbol, tf, len(closes), last_10_hist)
             except Exception as e:
                 logger.info("[MACD_DEBUG] %s %s: error formatting histogram: %s", symbol, tf, str(e)[:50])
-        
+
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
@@ -609,24 +609,23 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            # ============ IMPROVED FLIP DETECTION WITH NOISE FILTER ============
             zero_cross = prev <= 0 and cur > 0
             hist_change = cur - prev
             strong_flip = True
             result = zero_cross
-            
+
             if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s", 
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s",
                            symbol, tf, prev, cur, hist_change, zero_cross, strong_flip, result)
-            
+
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s",
                            symbol, tf, prev, cur, hist_threshold, result)
-            
+
             if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)", 
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)",
                               symbol, tf, prev, cur, hist_change)
-            
+
             return result
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
@@ -661,7 +660,7 @@ class Scanner:
             now = time.time()
             if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
                 return None
-            
+
             if hasattr(self.client, "get_24h_ticker"):
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
@@ -699,10 +698,128 @@ class Scanner:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
 
+    async def _process_pending_signals(self):
+        """
+        Re-evaluate pending signals. If conditions met (last TF flipped, positive MTF, or 1d negative but rising),
+        move signal to queued opens.
+        """
+        if not self._pending_signals:
+            return
+
+        mtf_list = ["5m", "15m", "1h", "4h", "1d"]
+        to_remove = []
+        for sym, pending in list(self._pending_signals.items()):
+            try:
+                # get latest price if available from cache otherwise try to fetch
+                price = self._last_price_cache.get(sym)
+                if price is None:
+                    try:
+                        async with self.request_sem:
+                            price = await self.client.get_latest_price(sym)
+                        if price is not None:
+                            self._last_price_cache[sym] = price
+                    except Exception:
+                        price = pending.get("price")
+
+                positive_any = False
+                any_flip = False
+                negative_count = 0
+                mtf_state = {}
+
+                for tf in mtf_list:
+                    macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
+                    cur_hist = h[-1] if h and len(h) >= 1 else None
+                    prev_hist = h[-2] if h and len(h) >= 2 else None
+                    mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist, "hist": h}
+                    flip = False
+                    try:
+                        flip = self.detect_flip_current_open(h, 0.0, symbol=sym, tf=tf)
+                    except Exception:
+                        flip = False
+                    if cur_hist is not None and cur_hist > 0:
+                        positive_any = True
+                    if flip:
+                        any_flip = True
+                    if cur_hist is not None and cur_hist < 0:
+                        negative_count += 1
+
+                # compute 1d slope if needed
+                one_d_slope = None
+                try:
+                    one_d_full_hist = mtf_state.get("1d", {}).get("hist", []) or []
+                    if one_d_full_hist:
+                        one_d_slope = slope(one_d_full_hist or [], lookback=MTF_SLOPE_LOOKBACK)
+                except Exception:
+                    one_d_slope = None
+
+                # Acceptance logic for pending signals:
+                accept = False
+                reason = None
+                # If any positive or any flip -> accept
+                if positive_any or any_flip:
+                    accept = True
+                    reason = "mtf_positive_or_flip_pending"
+                else:
+                    # check only-1d-negative but rising
+                    if negative_count >= 1:
+                        only_1d_negative = True
+                        for tf, vals in mtf_state.items():
+                            if tf == "1d":
+                                continue
+                            cur = vals.get("cur")
+                            if cur is not None and cur < 0:
+                                only_1d_negative = False
+                                break
+                        if only_1d_negative:
+                            cur_1d = mtf_state.get("1d", {}).get("cur")
+                            if cur_1d is not None and cur_1d < 0 and one_d_slope is not None and one_d_slope > 0:
+                                accept = True
+                                reason = "1d_negative_but_rising_pending"
+                            else:
+                                # else keep pending
+                                accept = False
+                                reason = "pending_wait_for_flips"
+                        else:
+                            accept = False
+                            reason = "pending_wait_for_flips"
+                    else:
+                        accept = False
+                        reason = "no_positive_pending"
+
+                if accept:
+                    score = float(abs(mtf_state.get("1h", {}).get("cur") or 0.0))
+                    vol_change = self.compute_24h_volume_change(sym)
+                    if vol_change:
+                        score += float(vol_change)
+                    self._queued_opens.append({
+                        "symbol": sym,
+                        "root": pending.get("root"),
+                        "price": price,
+                        "score": score,
+                        "mtf": mtf_state
+                    })
+                    to_remove.append(sym)
+                    logger.info("Pending signal accepted and queued: %s (reason=%s)", sym, reason)
+                else:
+                    # update pending state timestamp and mtf snapshot
+                    self._pending_signals[sym].update({
+                        "mtf": mtf_state,
+                        "last_checked": time.time(),
+                        "reason": reason
+                    })
+            except Exception:
+                logger.exception("Error re-evaluating pending signal %s", sym)
+
+        for sym in to_remove:
+            try:
+                del self._pending_signals[sym]
+            except Exception:
+                pass
+
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
-        
+
         while not self._stop:
             loop_count += 1
 
@@ -712,7 +829,7 @@ class Scanner:
             )
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
-            
+
             start = time.time()
             try:
                 # Attempt to open queued signals from previous cycle now
@@ -753,7 +870,7 @@ class Scanner:
                                 await send_message(f"Simulated queued open {sym} {side} @ {price} qty={qty:.6f} score={q.get('score', 0):.2f}")
                         except Exception:
                             logger.exception("Error processing queued open %s", q)
-                
+
                 if not self.symbols:
                     logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
                     await self.discover_symbols()
@@ -768,6 +885,9 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
+                # Re-evaluate pending signals (monitoring step)
+                await self._process_pending_signals()
+
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
@@ -775,7 +895,7 @@ class Scanner:
                     try:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
-                        
+
                         if price is None:
                             try:
                                 if USE_WS and self.client.is_ws_connected():
@@ -784,13 +904,13 @@ class Scanner:
                                         price = float(ws_last.get("close"))
                             except Exception:
                                 price = None
-                        
+
                         if price is None:
                             return
-                        
+
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
-                        
+
                         for root in ROOT_TFS:
 
                             logger.info(
@@ -843,11 +963,11 @@ class Scanner:
                                 root,
                                 flip
                             )
-                            
+
                             if DEBUG_SURGICAL_LOGS:
-                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
-                                           sym, root, hist is not None and len(hist) > 0, flip)
-                            
+                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s",
+                                            sym, root, hist is not None and len(hist) > 0, flip)
+
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
@@ -902,17 +1022,17 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
                 await self.send_summary(root_signals)
-                
+
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d",
                                checked_count, len(root_signals), candidates_count)
                 except Exception:
                     pass
-                
+
             except Exception:
                 logger.exception("Error in root scan loop")
-            
+
             elapsed = time.time() - start
 
             if ROOT_SCAN_INTERVAL:
@@ -933,7 +1053,7 @@ class Scanner:
         - Accept and queue opens for next interval if:
           A) Any MTF tf has positive MACD current histogram OR current flip detected.
           B) If >=1 tf is negative, add to pending monitoring until last timeframe flips on current candle open.
-          C) If only 1d is negative but 1d histogram slope is rising (slope > 0), accept immediately.
+          C) If ONLY 1d is negative but is rising (slope > 0), accept immediately.
         - Removed ROOT_FILTER and MTF_FILTER behavior.
         - Accepted signals are queued and opened on the next root scan interval (or simulated if TRADE_ENABLED False).
         """
@@ -1083,14 +1203,7 @@ class Scanner:
                 return
 
             # Map root tf to human text order: ensure 1h,4h,1d ordering when present
-            root_order = []
-            # normalize ROOT_TFS values to canonical strings
-            # Attempt to map numeric roots like "60","240","1d" to readable forms.
-            # We'll use ROOT_TFS as provided but build ordering: prefer "60"/"1h", "240"/"4h", "1d"
-            # Build root_order from ROOT_TFS but sorted to 1h->4h->1d when possible
             norm_roots = [str(r) for r in ROOT_TFS]
-            # helper map
-            pref = []
             found_1h = None
             found_4h = None
             found_1d = None
@@ -1101,13 +1214,13 @@ class Scanner:
                     found_4h = r
                 elif r.lower() in ("1d", "1D", "d", "1day"):
                     found_1d = r
+            pref = []
             if found_1h:
                 pref.append(found_1h)
             if found_4h:
                 pref.append(found_4h)
             if found_1d:
                 pref.append(found_1d)
-            # include any remaining roots
             for r in norm_roots:
                 if r not in pref:
                     pref.append(r)
@@ -1133,8 +1246,6 @@ class Scanner:
                     continue
                 lines.append("\n" + ("=" * 30))
                 lines.append(f"Root TF {rt} detailed signals:")
-                # For each signal produce a block with requested fields.
-                # For signal strength we use |hist_value(1h) | + vol_change (24h)
                 for s in lst:
                     sym = s["symbol"]
                     price = s["price"]
@@ -1145,16 +1256,13 @@ class Scanner:
                     strength = (abs(cur_hist_1h) if cur_hist_1h is not None else 0.0) + (vol_change if vol_change else 0.0)
                     # get mtf alignment snapshot from pending/evaluated state if any
                     mtf_snapshot = {}
-                    # try pending first
                     pending = self._pending_signals.get(sym)
                     if pending:
                         mtf_snapshot = pending.get("mtf", {})
                     else:
-                        # maybe in queued opens
                         qs = next((q for q in self._queued_opens if q.get("symbol") == sym), None)
                         if qs:
                             mtf_snapshot = qs.get("mtf", {})
-                    # Build a short mtf alignment string
                     mtf_states = []
                     for tf in ("5m", "15m", "1h", "4h", "1d"):
                         cur = None
@@ -1170,7 +1278,6 @@ class Scanner:
                         mtf_states.append(f"{tf}:{cur}")
                     mtf_line = " | ".join(mtf_states)
 
-                    # title bybit perp as requested
                     title = "Bybit Perp"
                     lines.append(f"\n{title} - {sym}")
                     lines.append(f"- Price: {price}")

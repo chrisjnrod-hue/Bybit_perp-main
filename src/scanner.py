@@ -120,6 +120,53 @@ class Scanner:
         logger.debug("No client method among %s succeeded", names)
         return None
 
+    async def hourly_trade_cleanup(self):
+
+    while not self._stop:
+
+        now = time.localtime()
+
+        if now.tm_min == 55:
+
+            if len(self.trade_manager.open_trades) >= MAX_OPEN_TRADES:
+
+                worst_trade = None
+                worst_pnl = float("inf")
+
+                for t in self.trade_manager.open_trades:
+
+                    price = await self.client.get_latest_price(
+                        t.symbol
+                    )
+
+                    pnl = (
+                        price - t.entry_price
+                    ) / t.entry_price
+
+                    if pnl < worst_pnl:
+                        worst_pnl = pnl
+                        worst_trade = t
+
+                if worst_trade:
+
+                    current_price = await self.client.get_latest_price(
+                        worst_trade.symbol
+                    )
+
+                    self.trade_manager.close_trade(
+                        worst_trade,
+                        current_price
+                    )
+
+                    await send_message(
+                        f"Closed least profitable trade "
+                        f"{worst_trade.symbol}"
+                    )
+
+            await asyncio.sleep(60)
+
+        await asyncio.sleep(10)
+
     async def _get_symbols(self) -> List[str]:
         try:
             items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])

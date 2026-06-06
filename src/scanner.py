@@ -924,7 +924,43 @@ for tf in MTF_TFS:
     if prev is not None and prev <= 0 and cur > 0:
         flip_detected = True
             
-            one_d_slope = None
+        accept = False
+
+if all_positive:
+    accept = True
+
+elif flip_detected:
+    accept = True
+
+else:
+    daily = mtf_state.get("D")
+
+    if daily:
+        d_cur = daily["cur"]
+
+        positive_others = True
+
+        for tf in ["5", "15", "60", "240"]:
+            st = mtf_state.get(tf)
+
+            if not st:
+                positive_others = False
+                break
+
+            if st["cur"] is None or st["cur"] <= 0:
+                positive_others = False
+                break
+
+        if (
+            positive_others
+            and d_cur is not None
+            and d_cur < 0
+            and one_d_slope is not None
+            and one_d_slope > 0
+        ):
+            accept = True   
+        
+        one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
                 _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
                 one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None

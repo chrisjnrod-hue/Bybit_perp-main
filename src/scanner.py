@@ -918,20 +918,7 @@ class Scanner:
             if vol_change is not None and vol_change > 0:
                 score += min(vol_change, 1.0)
             
-            if MTF_FILTER:
-                positive_rising_count = 0
-                for tf, vals in mtf_state.items():
-                    cur = vals.get("cur")
-                    prev = vals.get("prev")
-                    if cur is not None and prev is not None and cur > prev and cur > 0:
-                        positive_rising_count += 1
-                score += positive_rising_count * 0.8
-                one_d = mtf_state.get("1d")
-                if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
-                    if one_d_slope is not None and one_d_slope > 0:
-                        score += 0.5
-            
-            evaluated.append({
+                evaluated.append({
                 "symbol": sym,
                 "root": root,
                 "price": price,

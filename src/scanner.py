@@ -623,7 +623,7 @@ class Scanner:
                            symbol, tf, prev, cur, hist_threshold, result)
             
             if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)", 
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ cur=%.8f (change=%.8f)", 
                               symbol, tf, prev, cur, hist_change)
             
             return result
@@ -817,7 +817,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
-                                logger.info("Ã¢Å“â€œ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                logger.info("ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                                 if DEBUG_SURGICAL_LOGS:
                                     logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
                     except Exception:
@@ -865,7 +865,7 @@ class Scanner:
                 
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                    logger.info("ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
                                checked_count, len(root_signals), candidates_count)
                 except Exception:
                     pass
@@ -1012,7 +1012,7 @@ class Scanner:
                 if v is None:
                     lines.append(f"- {s} @ {p}")
                 else:
-                    lines.append(f"- {s} @ {p} (24h vol ÃŽâ€ {v:.2f})")
+                    lines.append(f"- {s} @ {p} (24h vol ÃƒÅ½Ã¢â‚¬Â {v:.2f})")
         open_sum = self.trade_manager.summary()
         if open_sum:
             lines.append("\nOpen trades:")

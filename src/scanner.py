@@ -58,6 +58,32 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
+        for sym in list(self.pending_alignment.keys()):
+
+    remaining_negative = []
+
+    for tf in MTF_TFS:
+
+        _, _, h = self.compute_macd_for(
+            sym,
+            tf,
+            use_ws_current=True
+        )
+
+        cur = h[-1] if len(h) else None
+
+        if cur is None or cur <= 0:
+            remaining_negative.append(tf)
+
+    if len(remaining_negative) == 0:
+
+        candidate = self.pending_alignment.pop(sym)
+
+        root_signals.append({
+            "symbol": sym,
+            "root": candidate["root"],
+            "price": candidate["price"]
+        })
         logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
                    bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 

@@ -1105,27 +1105,23 @@ else:
             await send_message("Root scan: no signals this interval.")
             return
         grouped = {}
-        for it in root_signals:
-            grouped.setdefault(it["root"], []).append((it["symbol"], it["price"], it.get("vol_change")))
-        lines = []
-        lines.append(f"Root scan summary ({len(root_signals)} signals)")
-        for rt in ROOT_TFS:
-            lst = grouped.get(rt, [])
-            if not lst:
-                continue
-            lines.append(f"\nRoot {rt} signals:")
-            for s, p, v in lst:
-                if v is None:
-                    lines.append(f"- {s} @ {p}")
-                else:
-                    lines.append(f"- {s} @ {p} (24h vol ÃŽâ€ {v:.2f})")
-        open_sum = self.trade_manager.summary()
-        if open_sum:
-            lines.append("\nOpen trades:")
-            for ot in open_sum:
-                lines.append(f"- {ot['symbol']} {ot['qty']} @ {ot['entry']}")
-        text = "\n".join(lines)
-        await send_message(text)
+        ROOT SIGNAL SUMMARY
+        1H ROOT SIGNALS
+        BYBIT PERP BTCUSDT
+Price: 108500
+
+Strength: 8.4
+
+24h Vol Change: +18%
+
+MTF:
+5m +
+15m +
+1h +
+4h +
+1d rising negative
+
+Status: ACCEPTED
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())
@@ -1138,6 +1134,45 @@ else:
                 await self.client.close()
             except Exception:
                 logger.exception("Error closing client")
+
+4H ROOT SIGNALS
+
+BYBIT PERP
+
+BTCUSDT
+Price: 108500
+
+Strength: 8.4
+
+24h Vol Change: +18%
+
+MTF:
+5m +
+15m +
+1h +
+4h +
+1d rising negative
+
+Status: ACCEPTED
+
+1D ROOT SIGNALS 
+BYBIT PERP
+
+BTCUSDT
+Price: 108500
+
+Strength: 8.4
+
+24h Vol Change: +18%
+
+MTF:
+5m +
+15m +
+1h +
+4h +
+1d rising negative
+
+Status: ACCEPTED
 
     def stop(self):
         logger.info("Stopping scanner...")

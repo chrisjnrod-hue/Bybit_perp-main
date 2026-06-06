@@ -39,6 +39,11 @@ DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "tru
 
 class Scanner:
     def __init__(self):
+        self.pending_alignment[sym] = {
+    "root": root,
+    "price": price,
+    "negative_tfs": negative_tfs
+        }
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()

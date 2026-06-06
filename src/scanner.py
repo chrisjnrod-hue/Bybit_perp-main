@@ -897,15 +897,32 @@ class Scanner:
             positive_count = 0
             any_positive_mtfflip = False
             
-            for tf in MTF_TFS:
-                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
-                cur_hist = h[-1] if h and len(h) >= 1 else None
-                prev_hist = h[-2] if h and len(h) >= 2 else None
-                mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
-                if cur_hist is not None and cur_hist > 0:
-                    positive_count += 1
-                if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
-                    any_positive_mtfflip = True
+            all_positive = True
+negative_tfs = []
+flip_detected = False
+
+for tf in MTF_TFS:
+    _, _, h = self.compute_macd_for(
+        sym,
+        tf,
+        include_price=price,
+        use_ws_current=True
+    )
+
+    cur = h[-1] if len(h) >= 1 else None
+    prev = h[-2] if len(h) >= 2 else None
+
+    if cur is None:
+        all_positive = False
+        negative_tfs.append(tf)
+        continue
+
+    if cur <= 0:
+        all_positive = False
+        negative_tfs.append(tf)
+
+    if prev is not None and prev <= 0 and cur > 0:
+        flip_detected = True
             
             one_d_slope = None
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:

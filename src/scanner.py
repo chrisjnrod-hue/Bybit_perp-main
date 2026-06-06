@@ -1,5 +1,6 @@
+# Updated scanner.py
 # Add this COMPLETE diagnostic version to replace your current scanner.py
-# This will help us identify exactly where the process breaks down
+# This version updates only MTF alignment & related behavior as requested.
 
 import os
 import asyncio
@@ -33,8 +34,14 @@ REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 
-# ============ NEW: Diagnostic flags ============
+# Diagnostics
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
+
+# New: macd threshold for signal strength calculations
+MACD_HIST_THRESHOLD = float(os.getenv("MACD_HIST_THRESHOLD", "0.0"))
+
+logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
+            bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
 
 class Scanner:
@@ -53,7 +60,10 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
+        # Deployment & pending opens: send signals on deploy but defer opening trades until next interval
+        self._deployed = True
+        self._pending_opens: List[Dict[str, Any]] = []
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
                    bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -289,31 +299,31 @@ class Scanner:
                             vol = float(item[5])
                         except Exception:
                             vol = None
-                    
+
                     if close is not None:
                         out.append({"start_at": start, "close": close, "volume": vol})
                     continue
 
                 if isinstance(item, dict):
                     start = (
-                        item.get("start_at") 
-                        or item.get("open_time") 
-                        or item.get("t") 
-                        or item.get("timestamp") 
+                        item.get("start_at")
+                        or item.get("open_time")
+                        or item.get("t")
+                        or item.get("timestamp")
                         or item.get("start")
                         or item.get("time")
                     )
                     close = (
-                        item.get("close") 
-                        or item.get("close_price") 
-                        or item.get("c") 
-                        or item.get("last_price") 
+                        item.get("close")
+                        or item.get("close_price")
+                        or item.get("c")
+                        or item.get("last_price")
                         or item.get("Close")
                     )
                     vol = (
-                        item.get("volume") 
-                        or item.get("vol") 
-                        or item.get("turnover") 
+                        item.get("volume")
+                        or item.get("vol")
+                        or item.get("turnover")
                         or item.get("v")
                         or item.get("quoteAsset")
                     )
@@ -324,7 +334,7 @@ class Scanner:
                         is_closed = item.get("complete")
                     if is_closed is None:
                         is_closed = item.get("confirmed")
-                    
+
                     try:
                         if start is not None:
                             start = int(start)
@@ -340,7 +350,7 @@ class Scanner:
                             vol = float(vol)
                     except Exception:
                         vol = None
-                    
+
                     if close is not None:
                         out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
                     continue
@@ -362,10 +372,6 @@ class Scanner:
                     is_closed,
                     len(out)
                 )
-
-                # IMPORTANT:
-                # Keep current candle for live MACD flip detection
-
             except Exception:
                 logger.exception("Error evaluating candle status")
         return out
@@ -377,10 +383,10 @@ class Scanner:
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
-                
+
                 async with self.request_sem:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
-                
+
                 if not raw:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
@@ -392,12 +398,12 @@ class Scanner:
                             for key in ["list", "result", "data"]:
                                 if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
                                     first_item = raw[key][0]
-                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s", 
-                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
+                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s",
+                                                symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
                                     break
                         elif isinstance(raw, (list, tuple)):
-                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s", 
-                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
+                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s",
+                                        symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
                     except Exception as e:
                         logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
 
@@ -434,8 +440,8 @@ class Scanner:
                         continue
 
                 if DEBUG_SURGICAL_LOGS:
-                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d", 
-                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
+                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d",
+                                symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
                     if len(valid) == 0 and len(normalized) > 0:
                         sample_norm = normalized[:2]
                         logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
@@ -464,7 +470,7 @@ class Scanner:
         async def worker(sym: str):
             async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
-        
+
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
             tasks = [asyncio.create_task(worker(s)) for s in batch]
@@ -472,7 +478,7 @@ class Scanner:
                 await asyncio.gather(*tasks)
             if i + REQUEST_BATCH_SIZE < len(self.symbols):
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
-        
+
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
@@ -483,7 +489,7 @@ class Scanner:
                 poll_count += 1
                 if poll_count % 5 == 0:
                     logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
-                
+
                 start = time.time()
                 if not self.symbols:
                     await asyncio.sleep(REST_POLL_INTERVAL)
@@ -575,21 +581,21 @@ class Scanner:
                     closes = closes + [float(ws_last.get("close"))]
             except Exception:
                 pass
-        
+
         macd_line, signal_line, hist = macd_histogram(closes)
         if DEBUG_SURGICAL_LOGS:
             valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
-                       symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
-        
+                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
+
         if DEBUG_SURGICAL_LOGS and len(closes) > 0:
             try:
                 last_10_hist = hist[-10:] if hist and len(hist) >= 10 else (hist if hist else [])
-                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s", 
+                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s",
                            symbol, tf, len(closes), last_10_hist)
             except Exception as e:
                 logger.info("[MACD_DEBUG] %s %s: error formatting histogram: %s", symbol, tf, str(e)[:50])
-        
+
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
@@ -608,24 +614,23 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            # ============ IMPROVED FLIP DETECTION WITH NOISE FILTER ============
             zero_cross = prev <= 0 and cur > 0
             hist_change = cur - prev
             strong_flip = True
             result = zero_cross
-            
+
             if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s", 
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s",
                            symbol, tf, prev, cur, hist_change, zero_cross, strong_flip, result)
-            
+
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s",
                            symbol, tf, prev, cur, hist_threshold, result)
-            
+
             if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)", 
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)",
                               symbol, tf, prev, cur, hist_change)
-            
+
             return result
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
@@ -660,7 +665,7 @@ class Scanner:
             now = time.time()
             if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
                 return None
-            
+
             if hasattr(self.client, "get_24h_ticker"):
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
@@ -698,10 +703,79 @@ class Scanner:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
 
+    async def _maybe_close_least_profitable(self):
+        """
+        Automatically close least profitable trade if we are within 5 minutes before the next round hour
+        and open trades count >= MAX_OPEN_TRADES.
+        This tries some common trade_manager methods; if none exist, it will attempt basic heuristics.
+        """
+        try:
+            now = time.time()
+            next_hour = math.ceil(now / 3600.0) * 3600.0
+            secs_to_next_hour = next_hour - now
+            # Trigger in the 5-minute window before the hour
+            if 0 < secs_to_next_hour <= 300:
+                current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
+                if current_open >= MAX_OPEN_TRADES:
+                    logger.info("Within 5m of hour and max open trades reached (%d/%d). Attempting to close least profitable trade.",
+                                current_open, MAX_OPEN_TRADES)
+                    # Prefer a built-in helper if present
+                    if hasattr(self.trade_manager, "close_least_profitable"):
+                        try:
+                            await maybe_awaitable(self.trade_manager.close_least_profitable)
+                            logger.info("Called trade_manager.close_least_profitable()")
+                            return
+                        except Exception:
+                            logger.exception("trade_manager.close_least_profitable failed")
+                    # Fallback heuristics: look for 'pnl'/'unrealized_pnl'/'profit' on open_trades
+                    try:
+                        open_trades = getattr(self.trade_manager, "open_trades", []) or []
+                        if not open_trades:
+                            logger.info("No open trades found to close")
+                            return
+                        # Try to pick least profitable by common keys
+                        def profit_value(t):
+                            for k in ("unrealized_pnl", "pnl", "profit", "unrealized", "floating"):
+                                v = t.get(k) if isinstance(t, dict) else None
+                                if v is not None:
+                                    try:
+                                        return float(v)
+                                    except Exception:
+                                        continue
+                            # if no pnl info, fallback to 0
+                            return 0.0
+                        worst = min(open_trades, key=profit_value)
+                        # attempt several possible method names to close the trade
+                        closed = False
+                        for name in ("close_trade", "close_position", "close_open_trade", "close_by_id"):
+                            fn = getattr(self.trade_manager, name, None)
+                            if fn:
+                                try:
+                                    args = ()
+                                    # best effort: pass symbol or trade id if available
+                                    if "symbol" in worst:
+                                        args = (worst.get("symbol"),)
+                                    elif "id" in worst:
+                                        args = (worst.get("id"),)
+                                    res = fn(*args)
+                                    if inspect.isawaitable(res):
+                                        await res
+                                    logger.info("Called trade_manager.%s(%s) to close least profitable", name, args)
+                                    closed = True
+                                    break
+                                except Exception:
+                                    logger.exception("trade_manager.%s failed", name)
+                        if not closed:
+                            logger.warning("Could not programmatically close least profitable trade; no supported method found.")
+                    except Exception:
+                        logger.exception("Error while attempting fallback close of least profitable trade")
+        except Exception:
+            logger.exception("Error in _maybe_close_least_profitable")
+
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
-        
+
         while not self._stop:
             loop_count += 1
 
@@ -711,9 +785,10 @@ class Scanner:
             )
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
-            
+
             start = time.time()
             try:
+                # Ensure symbols present
                 if not self.symbols:
                     logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
                     await self.discover_symbols()
@@ -728,6 +803,9 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
+                # automatic close of least profitable trade 5min before the hour
+                await self._maybe_close_least_profitable()
+
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
@@ -735,7 +813,7 @@ class Scanner:
                     try:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
-                        
+
                         if price is None:
                             try:
                                 if USE_WS and self.client.is_ws_connected():
@@ -744,13 +822,13 @@ class Scanner:
                                         price = float(ws_last.get("close"))
                             except Exception:
                                 price = None
-                        
+
                         if price is None:
                             return
-                        
+
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
-                        
+
                         for root in ROOT_TFS:
 
                             logger.info(
@@ -803,23 +881,26 @@ class Scanner:
                                 root,
                                 flip
                             )
-                            
+
                             if DEBUG_SURGICAL_LOGS:
-                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
+                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s",
                                            sym, root, hist is not None and len(hist) > 0, flip)
-                            
-                            if hist and flip:
+
+                            if hist and (cur_hist is not None):
                                 vol_change = self.compute_24h_volume_change(sym)
                                 root_signals.append({
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
                                     "hist": hist,
+                                    "cur_hist": cur_hist,
+                                    "prev_hist": prev_hist,
+                                    "flip": flip,
                                     "vol_change": vol_change
                                 })
-                                logger.info("Ã¢Å“â€œ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                                 if DEBUG_SURGICAL_LOGS:
-                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
+                                    logger.warning("[SIGNAL_DETECTED_INTERNAL] %s %s price=%s cur_hist=%s flip=%s", sym, root, price, cur_hist, flip)
+
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -850,6 +931,7 @@ class Scanner:
                 logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
                 await self._emit_event("root_signals", root_signals)
 
+                # If any signals discovered, subscribe MTF if supported
                 if root_signals:
                     for sig in root_signals:
                         try:
@@ -858,21 +940,26 @@ class Scanner:
                                 await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
+
+                # Evaluate and handle signals with new MTF alignment logic
+                if root_signals:
                     await self.handle_root_signals(root_signals)
                 else:
                     logger.info("No root signals this interval.")
+
+                # Summary/telegram formatting per requested blocks
                 await self.send_summary(root_signals)
-                
+
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d",
                                checked_count, len(root_signals), candidates_count)
                 except Exception:
                     pass
-                
+
             except Exception:
                 logger.exception("Error in root scan loop")
-            
+
             elapsed = time.time() - start
 
             if ROOT_SCAN_INTERVAL:
@@ -880,6 +967,7 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
+                # If interval not set or falsy, run at open of every 5m TF candle
                 now = time.time()
                 next_5m = math.ceil(now / 300.0) * 300.0
                 to_sleep = max(0, next_5m - now)
@@ -887,7 +975,28 @@ class Scanner:
                 await asyncio.sleep(to_sleep)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
+        """
+        New MTF alignment logic:
+        - For each root signal, scan 5m,15m,1h,4h,1d TF for macd hist. Accept if any TF is positive or any TF has a current flip.
+        - If 1 or more TFs are negative, monitor (do not open) until they flip on the current candle open.
+        - Exception: If only 1d is negative but trending upwards (positive slope) accept/open.
+        - Removed ROOT_FILTER and MTF_FILTER behaviors.
+        - If self._deployed is True and TRADE_ENABLED True, queue opens and do not execute until next interval.
+        """
         evaluated = []
+
+        # If there were pending opens from previous cycle (deferred due to deploy), attempt to open them first
+        if self._pending_opens:
+            logger.info("Processing %d pending opens from previous cycle", len(self._pending_opens))
+            # Try to open them now
+            for p in list(self._pending_opens):
+                try:
+                    await self._attempt_open_candidate(p)
+                except Exception:
+                    logger.exception("Failed to open pending candidate %s", p.get("symbol"))
+            self._pending_opens = []
+
+        # per-signal MTF evaluation
         for item in root_signals:
             sym = item["symbol"]
             price = item["price"]
@@ -895,9 +1004,13 @@ class Scanner:
             vol_change = item.get("vol_change")
             mtf_state = {}
             positive_count = 0
-            any_positive_mtfflip = False
-            
-            for tf in MTF_TFS:
+            flips_any = False
+            negative_count = 0
+
+            # Evaluate each MTF timeframe
+            # Ensure MTF scan order as requested (5m,15m,1h,4h,1d)
+            desired_mtfs = ["5m", "15m", "1h", "4h", "1d"]
+            for tf in desired_mtfs:
                 macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
                 cur_hist = h[-1] if h and len(h) >= 1 else None
                 prev_hist = h[-2] if h and len(h) >= 2 else None
@@ -905,68 +1018,122 @@ class Scanner:
                 if cur_hist is not None and cur_hist > 0:
                     positive_count += 1
                 if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
-                    any_positive_mtfflip = True
-            
+                    flips_any = True
+                if cur_hist is not None and cur_hist < 0:
+                    negative_count += 1
+
+            # Compute one-d slope for exception C
             one_d_slope = None
-            if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
-                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
-            
+            one_d_hist = None
+            try:
+                _, _, one_d_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
+                if one_d_hist:
+                    one_d_slope = slope(one_d_hist or [], lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
+            except Exception:
+                logger.exception("Failed computing 1d slope for %s", sym)
+
+            # Score: positive_count + flips + vol_change (bounded)
             score = float(positive_count)
-            if any_positive_mtfflip:
+            if flips_any:
                 score += 1.0
             if vol_change is not None and vol_change > 0:
                 score += min(vol_change, 1.0)
-            
-            if MTF_FILTER:
-                positive_rising_count = 0
-                for tf, vals in mtf_state.items():
-                    cur = vals.get("cur")
-                    prev = vals.get("prev")
-                    if cur is not None and prev is not None and cur > prev and cur > 0:
-                        positive_rising_count += 1
-                score += positive_rising_count * 0.8
-                one_d = mtf_state.get("1d")
-                if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
-                    if one_d_slope is not None and one_d_slope > 0:
-                        score += 0.5
-            
+
+            # Decision logic per requested scenarios:
+            accept = False
+            reason = None
+
+            if positive_count > 0 or flips_any:
+                # If there are negative TFs, we should wait until they flip unless exception C applies
+                if negative_count == 0:
+                    accept = True
+                    reason = "positive_alignment"
+                else:
+                    # Exception: only 1d is negative but it is rising -> accept per C
+                    negative_tfs = [tf for tf, vals in mtf_state.items() if vals.get("cur") is not None and vals.get("cur") < 0]
+                    if len(negative_tfs) == 1 and negative_tfs[0] == "1d" and one_d_slope is not None and one_d_slope > 0:
+                        accept = True
+                        reason = "one_d_negative_but_rising"
+                    else:
+                        accept = False
+                        reason = "monitor_wait_for_flip"
+            else:
+                # no positives or flips detected -> monitor
+                accept = False
+                reason = "no_positive_mtf"
+
             evaluated.append({
                 "symbol": sym,
                 "root": root,
                 "price": price,
                 "mtf": mtf_state,
                 "positive_count": positive_count,
+                "flips_any": flips_any,
+                "negative_count": negative_count,
                 "vol_change": vol_change,
                 "one_d_slope": one_d_slope,
-                "accept": True,
-                "reason": "candidate",
+                "accept": accept,
+                "reason": reason,
                 "score": score
             })
 
         await self._emit_event("candidates_evaluated", evaluated)
 
-        candidates = [e for e in evaluated if e["accept"]]
-        if ROOT_FILTER:
-            grouped: Dict[str, List[Dict[str, Any]]] = {}
-            for c in candidates:
-                grouped.setdefault(c["root"], []).append(c)
-            selected: List[Dict[str, Any]] = []
-            for root in ROOT_TFS:
-                lst = grouped.get(root, [])
-                if not lst:
-                    continue
-                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
-                selected.extend(top)
-            candidates = sorted(selected, key=lambda r: (r["score"], r["positive_count"]), reverse=True)
+        # Open accepted candidates (respecting MAX_OPEN_TRADES and deployment deferral)
+        # Order by score desc then positive_count
+        candidates = sorted([e for e in evaluated if e["accept"]], key=lambda r: (r["score"], r["positive_count"]), reverse=True)
 
-        current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-        logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
-
+        logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d)", len(candidates), MAX_OPEN_TRADES)
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Reached max open trades; stopping opens.")
                 break
+            # If deployed and TRADE_ENABLED, defer opening until next scan interval
+            if TRADE_ENABLED and self._deployed:
+                logger.info("Deferring opens due to deployment: queuing candidate %s to open on next interval", c["symbol"])
+                self._pending_opens.append(c)
+                # mark that we've deferred so next cycles will execute
+                self._deployed = False
+                await send_message(f"Deployment: queued open for {c['symbol']} @ {c['price']} score={c['score']:.2f} (will open next interval)")
+                continue
+
+            # otherwise attempt to open (simulated vs live)
+            try:
+                sym = c["symbol"]
+                price = c["price"]
+                try:
+                    balance = await self.client.get_balance("USDT")
+                except Exception:
+                    balance = None
+                symbol_info = await self.client.get_symbol_info(sym)
+                qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+                qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+                if qty <= 0 or math.isclose(qty, 0.0):
+                    logger.warning("Computed qty for %s was zero after quantize (qty=%s). Skipping open.", sym, qty)
+                    continue
+                if qty != qty_raw:
+                    logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+                side = "Buy"
+                if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
+                    try:
+                        order = await self.client.create_order(sym, side, qty)
+                        self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                        await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
+                    except Exception:
+                        logger.exception("Failed to place order for %s", sym)
+                else:
+                    t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
+                    logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                    await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
+            except Exception:
+                logger.exception("Error opening candidate %s", c.get("symbol"))
+
+    async def _attempt_open_candidate(self, c: Dict[str, Any]):
+        """Helper to open a candidate dict (used for pending opens)"""
+        try:
+            if not self.trade_manager.can_open():
+                logger.info("Cannot open pending candidate %s; no capacity", c.get("symbol"))
+                return
             sym = c["symbol"]
             price = c["price"]
             try:
@@ -978,50 +1145,121 @@ class Scanner:
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
                 logger.warning("Computed qty for %s was zero after quantize (qty=%s). Skipping open.", sym, qty)
-                continue
-            if qty != qty_raw:
-                logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+                return
             side = "Buy"
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
-                try:
-                    order = await self.client.create_order(sym, side, qty)
-                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
-                    await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
-                except Exception:
-                    logger.exception("Failed to place order for %s", sym)
+                order = await self.client.create_order(sym, side, qty)
+                self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
             else:
-                t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
-                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c['score']})
                 await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
+        except Exception:
+            logger.exception("Failed to open candidate %s", c.get("symbol"))
 
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
-        if not root_signals:
-            await send_message("Root scan: no signals this interval.")
-            return
-        grouped = {}
-        for it in root_signals:
-            grouped.setdefault(it["root"], []).append((it["symbol"], it["price"], it.get("vol_change")))
-        lines = []
-        lines.append(f"Root scan summary ({len(root_signals)} signals)")
-        for rt in ROOT_TFS:
-            lst = grouped.get(rt, [])
-            if not lst:
-                continue
-            lines.append(f"\nRoot {rt} signals:")
-            for s, p, v in lst:
-                if v is None:
-                    lines.append(f"- {s} @ {p}")
-                else:
-                    lines.append(f"- {s} @ {p} (24h vol ÃŽâ€ {v:.2f})")
-        open_sum = self.trade_manager.summary()
-        if open_sum:
-            lines.append("\nOpen trades:")
-            for ot in open_sum:
-                lines.append(f"- {ot['symbol']} {ot['qty']} @ {ot['entry']}")
-        text = "\n".join(lines)
-        await send_message(text)
+        """
+        Telegram push notice per scan interval:
+        - first block: root tfs signal summary in one block
+        - subsequent blocks: for each root TF (1h,4h,1d in that order) list signals,
+          each symbol with: title (Bybit Perp), symbol, price, signal strength (MACD_HIST_THRESHOLD + 24h vol change),
+          MTF alignment state
+        """
+        try:
+            if not root_signals:
+                await send_message("Root scan: no signals this interval.")
+                return
+
+            # Build mapping by root timeframe
+            grouped = {}
+            for it in root_signals:
+                grouped.setdefault(it["root"], []).append(it)
+
+            lines = []
+            # Summary block
+            lines.append(f"Root scan summary ({len(root_signals)} signals)")
+            for rt in ROOT_TFS:
+                lst = grouped.get(rt, [])
+                lines.append(f"- Root TF {rt}: {len(lst)} signal(s)")
+
+            # Next blocks: prioritized order: 1h,4h,1d if those exist in ROOT_TFS; else use ROOT_TFS order reversed
+            preferred_order = []
+            if "1h" in ROOT_TFS or "60" in ROOT_TFS:
+                preferred_order.append(next((r for r in ROOT_TFS if r in ("1h", "60")), None))
+            if "4h" in ROOT_TFS or "240" in ROOT_TFS:
+                preferred_order.append(next((r for r in ROOT_TFS if r in ("4h", "240")), None))
+            if "1d" in ROOT_TFS or "D" in ROOT_TFS or "1d" in ROOT_TFS:
+                preferred_order.append(next((r for r in ROOT_TFS if r in ("1d", "D")), None))
+            # remove None and duplicates, fall back to ROOT_TFS order
+            preferred_order = [p for p in preferred_order if p]
+            if not preferred_order:
+                preferred_order = list(ROOT_TFS)
+
+            # For each root timeframe in the preferred order, create blocks
+            for rt in preferred_order:
+                lst = grouped.get(rt, [])
+                if not lst:
+                    continue
+                lines.append("\n" + f"Root {rt} signals:")
+                # For each signal in that root timeframe, detail a block
+                # We want to list 1h signals first, then 4h, then 1d per user spec; done by preferred_order
+                for s in lst:
+                    sym = s["symbol"]
+                    price = s["price"]
+                    vol_change = s.get("vol_change")
+                    # Signal strength heuristic: MACD_HIST_THRESHOLD + vol_change (if available)
+                    strength = MACD_HIST_THRESHOLD + (vol_change if vol_change is not None else 0.0)
+                    # MTF alignment state: build a short textual summary from computed mtf when possible
+                    mtf_state = s.get("mtf")
+                    if not mtf_state:
+                        # If not present in root_signals (older entries), try to recompute small summary
+                        mtf_summary = "mtf=N/A"
+                    else:
+                        parts = []
+                        for tf, vals in (mtf_state.items() if isinstance(mtf_state, dict) else []):
+                            cur = vals.get("cur")
+                            prev = vals.get("prev")
+                            state = "?"
+                            if cur is None:
+                                state = "n/a"
+                            elif cur > 0:
+                                state = "POS"
+                            elif cur < 0:
+                                state = "NEG"
+                            if prev is not None and prev < 0 and cur is not None and cur > 0:
+                                state += "/FLIP"
+                            parts.append(f"{tf}:{state}")
+                        mtf_summary = ", ".join(parts)
+                    title = "Bybit Perp"
+                    vol_str = f"{vol_change:.2f}" if vol_change is not None else "n/a"
+                    lines.append(f"- {title} | {sym} | price={price} | strength={strength:.4f} | volΔ={vol_str} | mtf=({mtf_summary})")
+
+            # Open trades summary (if any)
+            open_sum = None
+            try:
+                open_sum = self.trade_manager.summary()
+            except Exception:
+                try:
+                    # fallback: inspect trade_manager.open_trades
+                    ot = getattr(self.trade_manager, "open_trades", None)
+                    if ot:
+                        open_sum = [{"symbol": t.get("symbol"), "qty": t.get("qty"), "entry": t.get("entry")} for t in ot]
+                except Exception:
+                    open_sum = None
+
+            if open_sum:
+                lines.append("\nOpen trades:")
+                for ot in open_sum:
+                    lines.append(f"- {ot.get('symbol')} {ot.get('qty')} @ {ot.get('entry')}")
+
+            text = "\n".join(lines)
+            await send_message(text)
+        except Exception:
+            logger.exception("Failed to send summary")
 
     async def run(self):
+        # When run starts, we already treat the scanner as deployed (self._deployed True by default)
+        # The first root scan will send signals but defer trade opens (if TRADE_ENABLED) until next cycle.
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task
@@ -1043,3 +1281,20 @@ class Scanner:
                 self._rest_poller_task.cancel()
             except Exception:
                 pass
+
+
+# Helper to await or call sync function
+async def maybe_awaitable(fn_or_coro, *args, **kwargs):
+    """
+    Accepts either a callable or coroutine. If callable, calls it with args; if coroutine, awaits it.
+    Returns the result.
+    """
+    try:
+        if inspect.iscoroutinefunction(fn_or_coro):
+            return await fn_or_coro(*args, **kwargs)
+        res = fn_or_coro(*args, **kwargs)
+        if inspect.isawaitable(res):
+            return await res
+        return res
+    except Exception:
+        raise

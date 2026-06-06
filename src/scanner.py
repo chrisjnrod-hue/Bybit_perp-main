@@ -17,7 +17,7 @@ from .macd import macd_histogram, slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MTF_FILTER, MAX_OPEN_TRADES, USE_WS
+    MTF_SLOPE_LOOKBACK, MAX_OPEN_TRADES, USE_WS
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -39,11 +39,6 @@ DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "tru
 
 class Scanner:
     def __init__(self):
-        self.pending_alignment[sym] = {
-    "root": root,
-    "price": price,
-    "negative_tfs": negative_tfs
-        }
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
         self.trade_manager = TradeManager()
@@ -58,32 +53,8 @@ class Scanner:
         self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
-        for sym in list(self.pending_alignment.keys()):
-
-    remaining_negative = []
-
-    for tf in MTF_TFS:
-
-        _, _, h = self.compute_macd_for(
-            sym,
-            tf,
-            use_ws_current=True
-        )
-
-        cur = h[-1] if len(h) else None
-
-        if cur is None or cur <= 0:
-            remaining_negative.append(tf)
-
-    if len(remaining_negative) == 0:
-
-        candidate = self.pending_alignment.pop(sym)
-
-        root_signals.append({
-            "symbol": sym,
-            "root": candidate["root"],
-            "price": candidate["price"]
-        })
+        # Task 5: monitor remaining negative TFs
+        self.pending_alignment: Dict[str, Dict[str, Any]] = {}
         logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
                    bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
@@ -119,53 +90,6 @@ class Scanner:
                 continue
         logger.debug("No client method among %s succeeded", names)
         return None
-
-    async def hourly_trade_cleanup(self):
-
-    while not self._stop:
-
-        now = time.localtime()
-
-        if now.tm_min == 55:
-
-            if len(self.trade_manager.open_trades) >= MAX_OPEN_TRADES:
-
-                worst_trade = None
-                worst_pnl = float("inf")
-
-                for t in self.trade_manager.open_trades:
-
-                    price = await self.client.get_latest_price(
-                        t.symbol
-                    )
-
-                    pnl = (
-                        price - t.entry_price
-                    ) / t.entry_price
-
-                    if pnl < worst_pnl:
-                        worst_pnl = pnl
-                        worst_trade = t
-
-                if worst_trade:
-
-                    current_price = await self.client.get_latest_price(
-                        worst_trade.symbol
-                    )
-
-                    self.trade_manager.close_trade(
-                        worst_trade,
-                        current_price
-                    )
-
-                    await send_message(
-                        f"Closed least profitable trade "
-                        f"{worst_trade.symbol}"
-                    )
-
-            await asyncio.sleep(60)
-
-        await asyncio.sleep(10)
 
     async def _get_symbols(self) -> List[str]:
         try:
@@ -807,6 +731,30 @@ class Scanner:
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
+
+                # Task 6: Check pending alignments at the start of scan and open when final TF flips
+                if self.pending_alignment:
+                    for sym in list(self.pending_alignment.keys()):
+                        remaining_negative: List[str] = []
+                        for tf in MTF_TFS:
+                            try:
+                                _, _, h = self.compute_macd_for(sym, tf, use_ws_current=True)
+                                cur = h[-1] if h and len(h) >= 1 else None
+                            except Exception:
+                                cur = None
+                            if cur is None or cur <= 0:
+                                remaining_negative.append(tf)
+                        if len(remaining_negative) == 0:
+                            candidate = self.pending_alignment.pop(sym)
+                            root_signals.append({
+                                "symbol": sym,
+                                "root": candidate.get("root"),
+                                "price": candidate.get("price"),
+                                "mtf": None,
+                                "vol_change": None
+                            })
+                            logger.info("Pending alignment matured and added to root_signals: %s", sym)
+
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
@@ -975,70 +923,18 @@ class Scanner:
             positive_count = 0
             any_positive_mtfflip = False
             
-            all_positive = True
-negative_tfs = []
-flip_detected = False
-
-for tf in MTF_TFS:
-    _, _, h = self.compute_macd_for(
-        sym,
-        tf,
-        include_price=price,
-        use_ws_current=True
-    )
-
-    cur = h[-1] if len(h) >= 1 else None
-    prev = h[-2] if len(h) >= 2 else None
-
-    if cur is None:
-        all_positive = False
-        negative_tfs.append(tf)
-        continue
-
-    if cur <= 0:
-        all_positive = False
-        negative_tfs.append(tf)
-
-    if prev is not None and prev <= 0 and cur > 0:
-        flip_detected = True
+            for tf in MTF_TFS:
+                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
+                cur_hist = h[-1] if h and len(h) >= 1 else None
+                prev_hist = h[-2] if h and len(h) >= 2 else None
+                mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
+                if cur_hist is not None and cur_hist > 0:
+                    positive_count += 1
+                if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
+                    any_positive_mtfflip = True
             
-        accept = False
-
-if all_positive:
-    accept = True
-
-elif flip_detected:
-    accept = True
-
-else:
-    daily = mtf_state.get("D")
-
-    if daily:
-        d_cur = daily["cur"]
-
-        positive_others = True
-
-        for tf in ["5", "15", "60", "240"]:
-            st = mtf_state.get(tf)
-
-            if not st:
-                positive_others = False
-                break
-
-            if st["cur"] is None or st["cur"] <= 0:
-                positive_others = False
-                break
-
-        if (
-            positive_others
-            and d_cur is not None
-            and d_cur < 0
-            and one_d_slope is not None
-            and one_d_slope > 0
-        ):
-            accept = True   
-        
-        one_d_slope = None
+            one_d_slope = None
+            # existing code used "1d" for daily; keep that intact and also handle "D" in acceptance logic below
             if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
                 _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
                 one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
@@ -1049,7 +945,72 @@ else:
             if vol_change is not None and vol_change > 0:
                 score += min(vol_change, 1.0)
             
-                evaluated.append({
+            # Task 2: remove MTF_FILTER scoring block (positive_rising_count etc)
+            # (previous MTF_FILTER block removed)
+
+            # Task 3: Replace MTF acceptance logic (safe indexing) and Task 4: Add Scenario C
+            all_positive = True
+            negative_tfs: List[str] = []
+            flip_detected = False
+
+            for tf in MTF_TFS:
+                vals = mtf_state.get(tf, {})
+                cur = vals.get("cur")
+                prev = vals.get("prev")
+                if cur is None:
+                    all_positive = False
+                    negative_tfs.append(tf)
+                    continue
+                if cur <= 0:
+                    all_positive = False
+                    negative_tfs.append(tf)
+                if prev is not None and prev <= 0 and cur > 0:
+                    flip_detected = True
+
+            accept = False
+            if all_positive:
+                accept = True
+            elif flip_detected:
+                accept = True
+            else:
+                # try both "D" and "1d" keys for daily TF (some configs use different tokens)
+                daily = mtf_state.get("D") or mtf_state.get("1d")
+                if daily:
+                    d_cur = daily.get("cur")
+                    positive_others = True
+                    for tf in ["5", "15", "60", "240"]:
+                        st = mtf_state.get(tf)
+                        if not st:
+                            positive_others = False
+                            break
+                        if st.get("cur") is None or st.get("cur") <= 0:
+                            positive_others = False
+                            break
+                    if (
+                        positive_others
+                        and d_cur is not None
+                        and d_cur < 0
+                        and one_d_slope is not None
+                        and one_d_slope > 0
+                    ):
+                        accept = True
+
+            # Task 5: Monitor remaining negative TFs: if not accepted, store pending_alignment (do NOT reject)
+            if not accept:
+                try:
+                    self.pending_alignment[sym] = {
+                        "root": root,
+                        "price": price,
+                        "negative_tfs": negative_tfs
+                    }
+                    reason = "pending_alignment"
+                except Exception:
+                    logger.exception("Failed to set pending_alignment for %s", sym)
+                    reason = "candidate"
+            else:
+                reason = "candidate"
+
+            evaluated.append({
                 "symbol": sym,
                 "root": root,
                 "price": price,
@@ -1057,15 +1018,19 @@ else:
                 "positive_count": positive_count,
                 "vol_change": vol_change,
                 "one_d_slope": one_d_slope,
-                "accept": True,
-                "reason": "candidate",
+                "accept": accept,
+                "reason": reason,
                 "score": score
             })
 
         await self._emit_event("candidates_evaluated", evaluated)
 
-        candidates = [e for e in evaluated if e["accept"]]
+        # previous behavior: candidates = [e for e in evaluated if e["accept"]]
+        candidates = [e for e in evaluated if e.get("accept")]
+
+        # Task 1: Remove all root filtering - replace with:
         candidates = evaluated
+
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
 
@@ -1100,28 +1065,163 @@ else:
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
                 await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
 
+    # Task 8: Auto-close least profitable trade (new coroutine)
+    async def hourly_trade_cleanup(self):
+
+        while not self._stop:
+
+            now = time.localtime()
+
+            if now.tm_min == 55:
+
+                if len(self.trade_manager.open_trades) >= MAX_OPEN_TRADES:
+
+                    worst_trade = None
+                    worst_pnl = float("inf")
+
+                    for t in self.trade_manager.open_trades:
+
+                        price = await self.client.get_latest_price(
+                            t.symbol
+                        )
+
+                        pnl = (
+                            price - t.entry_price
+                        ) / t.entry_price
+
+                        if pnl < worst_pnl:
+                            worst_pnl = pnl
+                            worst_trade = t
+
+                    if worst_trade:
+
+                        current_price = await self.client.get_latest_price(
+                            worst_trade.symbol
+                        )
+
+                        self.trade_manager.close_trade(
+                            worst_trade,
+                            current_price
+                        )
+
+                        await send_message(
+                            f"Closed least profitable trade "
+                            f"{worst_trade.symbol}"
+                        )
+
+                await asyncio.sleep(60)
+
+            await asyncio.sleep(10)
+
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
-        if not root_signals:
-            await send_message("Root scan: no signals this interval.")
-            return
-        grouped = {}
-        ROOT SIGNAL SUMMARY
-        1H ROOT SIGNALS
-        BYBIT PERP BTCUSDT
-Price: 108500
+        # Task 9: New Telegram format (three blocks)
+        try:
+            if not root_signals:
+                await send_message("Root scan: no signals this interval.")
+                return
 
-Strength: 8.4
+            # Group by root timeframe
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for it in root_signals:
+                grouped.setdefault(it.get("root"), []).append(it)
 
-24h Vol Change: +18%
+            # Top header
+            blocks: List[str] = []
+            blocks.append("ROOT SIGNAL SUMMARY\n")
 
-MTF:
-5m +
-15m +
-1h +
-4h +
-1d rising negative
+            # for each root timeframe, create a block
+            for rt in ROOT_TFS:
+                lst = grouped.get(rt, [])
+                if not lst:
+                    continue
+                blocks.append(f"{rt} ROOT SIGNALS\n")
+                for sig in lst:
+                    s = sig.get("symbol")
+                    p = sig.get("price")
+                    v = sig.get("vol_change")
+                    # compute MTF statuses for the symbol to include in the summary
+                    mtf_lines: List[str] = []
+                    try:
+                        for tf in MTF_TFS:
+                            _, _, h = self.compute_macd_for(s, tf, include_price=self._last_price_cache.get(s), use_ws_current=True)
+                            cur = h[-1] if h and len(h) >= 1 else None
+                            if cur is None:
+                                mtf_lines.append(f"{tf} ?")
+                            elif cur > 0:
+                                mtf_lines.append(f"{tf} +")
+                            else:
+                                mtf_lines.append(f"{tf} -")
+                        # check 1d rising negative pattern
+                        dkey = "1d"
+                        one_d_status = ""
+                        if (dkey in MTF_TFS or "D" in MTF_TFS) and (sig.get("mtf") or True):
+                            # attempt slope calc for presentation only
+                            try:
+                                # try both "1d" and "D"
+                                full_hist = None
+                                if "1d" in MTF_TFS:
+                                    _, _, full_hist = self.compute_macd_for(s, "1d", include_price=self._last_price_cache.get(s), use_ws_current=True)
+                                elif "D" in MTF_TFS:
+                                    _, _, full_hist = self.compute_macd_for(s, "D", include_price=self._last_price_cache.get(s), use_ws_current=True)
+                                one_d_slope_val = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
+                                dcur = None
+                                if sig.get("mtf"):
+                                    d_entry = sig["mtf"].get("1d") or sig["mtf"].get("D")
+                                    if d_entry:
+                                        dcur = d_entry.get("cur")
+                                if dcur is not None and dcur < 0 and one_d_slope_val is not None and one_d_slope_val > 0:
+                                    one_d_status = "1d rising negative"
+                            except Exception:
+                                one_d_status = ""
+                    except Exception:
+                        mtf_lines = [f"{tf} ?" for tf in MTF_TFS]
+                        one_d_status = ""
 
-Status: ACCEPTED
+                    # Determine status: OPEN/ACCEPTED if open trade exists for symbol, PENDING if pending_alignment entry exists, else DETECTED
+                    status = "DETECTED"
+                    try:
+                        open_sum = self.trade_manager.summary()
+                        if any(o.get("symbol") == s for o in open_sum):
+                            status = "ACCEPTED"
+                        elif s in self.pending_alignment:
+                            status = "PENDING"
+                    except Exception:
+                        # fallback: leave as DETECTED
+                        pass
+
+                    # Compose symbol block
+                    sym_lines: List[str] = []
+                    sym_lines.append("BYBIT PERP")
+                    sym_lines.append(f"{s}")
+                    sym_lines.append(f"Price: {p}")
+                    # strength: use positive_count estimate by counting pluses
+                    try:
+                        strength = sum(1 for l in mtf_lines if l.endswith("+"))
+                        sym_lines.append(f"\nStrength: {strength}")
+                    except Exception:
+                        sym_lines.append("\nStrength: N/A")
+                    if v is None:
+                        sym_lines.append(f"\n24h Vol Change: N/A")
+                    else:
+                        try:
+                            sym_lines.append(f"\n24h Vol Change: {v*100:+.0f}%")
+                        except Exception:
+                            sym_lines.append(f"\n24h Vol Change: {v}")
+                    sym_lines.append("\nMTF:")
+                    sym_lines.extend(mtf_lines)
+                    if one_d_status:
+                        sym_lines.append(one_d_status)
+                    sym_lines.append(f"\nStatus: {status}\n")
+                    blocks.append("\n".join(sym_lines))
+            text = "\n\n".join(blocks)
+            await send_message(text)
+        except Exception:
+            logger.exception("send_summary failed")
+            # fallback minimal message
+            try:
+                await send_message(f"Root scan summary ({len(root_signals)} signals)")
+            except Exception:
+                pass
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())
@@ -1134,45 +1234,6 @@ Status: ACCEPTED
                 await self.client.close()
             except Exception:
                 logger.exception("Error closing client")
-
-4H ROOT SIGNALS
-
-BYBIT PERP
-
-BTCUSDT
-Price: 108500
-
-Strength: 8.4
-
-24h Vol Change: +18%
-
-MTF:
-5m +
-15m +
-1h +
-4h +
-1d rising negative
-
-Status: ACCEPTED
-
-1D ROOT SIGNALS 
-BYBIT PERP
-
-BTCUSDT
-Price: 108500
-
-Strength: 8.4
-
-24h Vol Change: +18%
-
-MTF:
-5m +
-15m +
-1h +
-4h +
-1d rising negative
-
-Status: ACCEPTED
 
     def stop(self):
         logger.info("Stopping scanner...")

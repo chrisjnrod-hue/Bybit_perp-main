@@ -947,19 +947,7 @@ class Scanner:
         await self._emit_event("candidates_evaluated", evaluated)
 
         candidates = [e for e in evaluated if e["accept"]]
-        if ROOT_FILTER:
-            grouped: Dict[str, List[Dict[str, Any]]] = {}
-            for c in candidates:
-                grouped.setdefault(c["root"], []).append(c)
-            selected: List[Dict[str, Any]] = []
-            for root in ROOT_TFS:
-                lst = grouped.get(root, [])
-                if not lst:
-                    continue
-                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
-                selected.extend(top)
-            candidates = sorted(selected, key=lambda r: (r["score"], r["positive_count"]), reverse=True)
-
+        candidates = evaluated
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
 

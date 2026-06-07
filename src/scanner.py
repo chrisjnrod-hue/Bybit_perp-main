@@ -1,4 +1,6 @@
-# Diagnostic scanner - replace existing scanner.py with this complete file
+# Add this COMPLETE diagnostic version to replace your current scanner.py
+# Implements exact logic: A/B/C acceptance rules, NO MTF filter, structured Telegram formatting
+
 import os
 import asyncio
 import time
@@ -30,14 +32,13 @@ MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
 REQUEST_BATCH_SIZE = int(os.getenv("REQUEST_BATCH_SIZE", "5"))
 REQUEST_BATCH_DELAY = float(os.getenv("REQUEST_BATCH_DELAY", "0.5"))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
-
-# ============ NEW: Diagnostic flags ============
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# TFs to scan for acceptance/alerts (per your request)
+# TFs to scan for acceptance (A/B/C logic)
 SCAN_TFS = ["5m", "15m", "1h", "4h", "1d"]
-# Detailed alert ordering: 1h, then 4h, then 1d
+# Alert ordering: 1h blocks, then 4h, then 1d
 ALERT_ORDER = ["1h", "4h", "1d"]
+
 
 class Scanner:
     def __init__(self):
@@ -364,10 +365,6 @@ class Scanner:
                     is_closed,
                     len(out)
                 )
-
-                # IMPORTANT:
-                # Keep current candle for live MACD flip detection
-
             except Exception:
                 logger.exception("Error evaluating candle status")
         return out
@@ -598,7 +595,8 @@ class Scanner:
             pass
         return macd_line, signal_line, hist
 
-    def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
+    def detect_flip_current_open(self, hist: List[float], symbol: str = "", tf: str = ""):
+        """Detect if histogram crosses from <= 0 to > 0 (current candle flip)"""
         if not hist or len(hist) < 2:
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: insufficient_hist (len=%d)", symbol, tf, len(hist) if hist else 0)
@@ -610,13 +608,11 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            # Accept flip when prev <= 0 < cur
             zero_cross = prev <= 0 and cur > 0
-            result = zero_cross
-            if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, zero_cross=%s, flip=%s", 
-                           symbol, tf, prev, cur, zero_cross, result)
-            return result
+            if DEBUG_SURGICAL_LOGS and (symbol or tf):
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, flip=%s", 
+                           symbol, tf, prev, cur, zero_cross)
+            return zero_cross
         except Exception:
             logger.exception("Error comparing hist values %s %s", prev, cur)
             return False
@@ -741,14 +737,14 @@ class Scanner:
                         self._last_price_cache[sym] = price
                         await self._update_24h_volume(sym)
 
-                        # Evaluate multi-timeframe MACD state
+                        # ============ A/B/C ACCEPTANCE LOGIC ============
                         mtf_state = {}
                         positive_count = 0
-                        flips = []
+                        flip_found = False
                         negative_tfs = []
-
                         last_hist_vals = {}
 
+                        # Scan all TFs
                         for tf in SCAN_TFS:
                             try:
                                 _, _, hist = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
@@ -762,49 +758,53 @@ class Scanner:
                                 else:
                                     negative_tfs.append(tf)
 
+                                # Detect current flip (prev <= 0 and cur > 0)
                                 if prev is not None and cur is not None and prev <= 0 and cur > 0:
-                                    flips.append(tf)
+                                    flip_found = True
                             except Exception:
                                 logger.exception("MACD compute failed for %s %s", sym, tf)
 
-                        # Decision logic as requested:
+                        # Decision: A/B/C logic
                         accept = False
-                        reason = "none"
-                        # Accept if all TFs positive
+                        reason = ""
+
+                        # Rule A: All TFs positive -> accept
                         if positive_count == len(SCAN_TFS):
                             accept = True
-                            reason = "all_positive"
-                        # Or accept if any TF has a current flip
-                        elif flips:
+                            reason = "A_all_positive"
+                        
+                        # Rule B (implicit in A): If ANY TF has current flip -> accept
+                        elif flip_found:
                             accept = True
-                            reason = f"flip_in_{','.join(flips)}"
-                        # Or if only 1d is negative but 1d histogram slope is positive (rising)
+                            reason = "B_current_flip"
+                        
+                        # Rule C: Only 1d is negative, but 1d slope is positive (rising)
                         elif negative_tfs == ["1d"]:
                             try:
                                 _, _, h1d = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
                                 one_d_slope = slope(h1d or [], lookback=MTF_SLOPE_LOOKBACK) if h1d else None
                                 if one_d_slope and one_d_slope > 0:
                                     accept = True
-                                    reason = "1d_negative_but_rising"
+                                    reason = "C_1d_rising"
                             except Exception:
                                 logger.exception("1d slope check failed for %s", sym)
 
                         vol_change = self.compute_24h_volume_change(sym)
-                        # Build signal record only if accept True OR if a flip exists (we want to alert on flips too)
-                        if accept or flips:
+
+                        if accept:
                             root_signals.append({
                                 "symbol": sym,
                                 "price": price,
                                 "mtf_state": mtf_state,
                                 "positive_count": positive_count,
-                                "flips": flips,
+                                "flip_found": flip_found,
                                 "negative_tfs": negative_tfs,
                                 "accept": accept,
                                 "reason": reason,
                                 "vol_change": vol_change,
                                 "last_hist_vals": last_hist_vals
                             })
-                            logger.info("SIGNAL DETECTED: %s reason=%s price=%s flips=%s positives=%d", sym, reason, price, flips, positive_count)
+                            logger.info("SIGNAL ACCEPTED: %s reason=%s price=%s positives=%d", sym, reason, price, positive_count)
 
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
@@ -836,18 +836,11 @@ class Scanner:
                 await self._emit_event("root_signals", root_signals)
 
                 if root_signals:
-                    # We no longer trigger any MTF subscribe-filter; MTF filter removed as requested.
                     await self.handle_root_signals(root_signals)
                 else:
                     logger.info("No root signals this interval.")
-                await self.send_summary(root_signals)
                 
-                try:
-                    candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
-                               checked_count, len(root_signals), candidates_count)
-                except Exception:
-                    pass
+                await self.send_summary(root_signals)
                 
             except Exception:
                 logger.exception("Error in root scan loop")
@@ -867,110 +860,118 @@ class Scanner:
 
     
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
-        # No MTF filtering: accept candidates are already marked in signal["accept"]
+        """
+        No MTF filter. Accept all signals and attempt to open trades.
+        """
         for sig in root_signals:
             try:
                 sym = sig["symbol"]
                 price = sig["price"]
-                accept = sig.get("accept", False)
-                reason = sig.get("reason", "")
-                if accept:
-                    if not self.trade_manager.can_open():
-                        logger.info("Cannot open more trades; skipping %s", sym)
-                        continue
-                    if not TRADE_ENABLED:
-                        logger.info("TRADE_ENABLED is False; not opening trade for %s", sym)
-                        continue
-                    # Attempt to open a trade using trade_manager if method exists
-                    try:
-                        open_fn = getattr(self.trade_manager, "open_trade", None) or getattr(self.trade_manager, "open", None)
-                        if open_fn:
-                            res = open_fn(sym, price)
-                            if inspect.isawaitable(res):
-                                await res
-                            logger.info("Trade open requested for %s at %s (reason=%s)", sym, price, reason)
-                        else:
-                            logger.warning("Trade manager doesn't expose open_trade/open - cannot open automatically for %s", sym)
-                    except Exception:
-                        logger.exception("Failed to request trade open for %s", sym)
-                else:
-                    # Not accepted yet - monitoring state; do nothing here
-                    logger.info("Signal for %s not accepted yet (reason=%s); monitoring", sig.get("symbol"), reason)
+                reason = sig.get("reason", "unknown")
+                
+                if not self.trade_manager.can_open():
+                    logger.info("Cannot open more trades; skipping %s", sym)
+                    continue
+                
+                if not TRADE_ENABLED:
+                    logger.info("TRADE_ENABLED is False; not opening trade for %s", sym)
+                    continue
+                
+                # Attempt to open a trade
+                try:
+                    open_fn = getattr(self.trade_manager, "open_trade", None) or getattr(self.trade_manager, "open", None)
+                    if open_fn:
+                        res = open_fn(sym, price)
+                        if inspect.isawaitable(res):
+                            await res
+                        logger.info("Trade open requested for %s at %s (reason=%s)", sym, price, reason)
+                    else:
+                        logger.warning("Trade manager doesn't expose open_trade/open - cannot open for %s", sym)
+                except Exception:
+                    logger.exception("Failed to request trade open for %s", sym)
             except Exception:
                 logger.exception("Error handling root signal %s", sig)
 
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
-        # Build telegram message per your requested structure:
-        # 1) First block: root tfs signal summary in one block
-        # 2) Then blocks per 1h signals (BYBIT PERP block format), then 4h, then 1d
+        """
+        Telegram formatting per requirements:
+        1) First block: root TF signal summary (all symbols in one block)
+        2) Then per-TF detailed blocks: 1h signals, then 4h, then 1d
+           Each signal gets: BYBIT PERP, Symbol, Price, Signal Strength, MTF Alignment
+        """
         try:
             if not root_signals:
                 await send_message("SCAN SUMMARY\nNo signals this interval.")
                 return
 
-            # First block: summary header + one-line per signal describing primary info
+            # ====== BLOCK 1: Summary Header ======
             summary_lines = ["ROOT TF SIGNAL SUMMARY"]
             for s in root_signals:
-                # We choose representative root as the highest TF where flip/positive detected:
-                positives = [tf for tf,st in (s.get("mtf_state") or {}).items() if st.get("cur") is not None and st.get("cur") > 0]
-                flips = s.get("flips") or []
-                summary_lines.append(f"{s['symbol']} | positives={len(positives)} | flips={','.join(flips) if flips else '-'} | reason={s.get('reason')}")
+                reason = s.get("reason", "?")
+                positives = s.get("positive_count", 0)
+                summary_lines.append(f"{s['symbol']} | reason={reason} | positives={positives}/5")
             blocks = ["\n".join(summary_lines)]
 
-            # Helper to format detailed block for a single signal
-            def format_signal_block(sig: Dict[str, Any]) -> str:
-                symbol = sig["symbol"]
-                price = sig["price"]
-                vol_change = sig.get("vol_change") or 0.0
-                # Signal strength: combine last 1h hist magnitude (if present) + 24h vol change as a simple metric
+            # ====== Helper: Compute signal strength ======
+            def get_signal_strength(sig: Dict[str, Any]) -> float:
+                """Signal strength = |last_hist| + vol_change"""
                 last_hist_vals = sig.get("last_hist_vals") or {}
-                # Prefer 1h hist as representative strength, fallback to largest abs hist
-                representative_hist = None
-                if "1h" in last_hist_vals and last_hist_vals["1h"] is not None:
-                    representative_hist = last_hist_vals["1h"]
-                else:
-                    # pick any non-None hist with largest abs value
-                    hist_candidates = {k: v for k, v in last_hist_vals.items() if v is not None}
-                    if hist_candidates:
-                        representative_hist = max(hist_candidates.values(), key=lambda x: abs(x))
-                hist_strength_pct = (abs(representative_hist) * 100) if representative_hist is not None else 0.0
-                vol_strength_pct = (vol_change * 100) if vol_change is not None else 0.0
-                overall_strength = hist_strength_pct + vol_strength_pct
+                vol_change = sig.get("vol_change") or 0.0
+                
+                # Find largest absolute histogram value
+                max_hist = 0.0
+                for tf, val in last_hist_vals.items():
+                    if val is not None:
+                        max_hist = max(max_hist, abs(val))
+                
+                return max_hist + vol_change
 
-                # MTF alignment: simple textual representation
+            # ====== Helper: MTF Alignment string ======
+            def get_mtf_alignment(sig: Dict[str, Any]) -> str:
+                """Format: 5m:+/- 15m:+/- 1h:+/- 4h:+/- 1d:+/-"""
                 mtf_state = sig.get("mtf_state") or {}
-                alignment_parts = []
-                for tf in ["5m","15m","1h","4h","1d"]:
+                parts = []
+                for tf in SCAN_TFS:
                     st = mtf_state.get(tf)
                     if not st:
-                        alignment_parts.append(f"{tf}:?")
+                        parts.append(f"{tf}:?")
                     else:
                         cur = st.get("cur")
                         if cur is None:
-                            alignment_parts.append(f"{tf}:?")
+                            parts.append(f"{tf}:?")
                         elif cur > 0:
-                            alignment_parts.append(f"{tf}:+")
+                            parts.append(f"{tf}:+")
                         else:
-                            alignment_parts.append(f"{tf}:-")
-                alignment = " ".join(alignment_parts)
+                            parts.append(f"{tf}:-")
+                return " ".join(parts)
 
-                block = (
+            # ====== BLOCKS 2+: Detailed per-TF blocks ======
+            for tf_group in ALERT_ORDER:
+                # Filter signals for this TF group (look for signals detected on this TF)
+                # For simplicity, we list all signals but indicate which ones are relevant
+                tf_signals = root_signals  # All signals are valid; group by TF for presentation
+                
+                for sig in tf_signals:
+                    mtf_state = sig.get("mtf_state") or {}
+                    tf_state = mtf_state.get(tf_group)
+                    if not tf_state:
+                        continue  # Skip if TF not in state
+                    
+                    symbol = sig["symbol"]
+                    price = sig["price"]
+                    strength = get_signal_strength(sig)
+                    alignment = get_mtf_alignment(sig)
+                    reason = sig.get("reason", "")
+                    
+                    block = (
 f"BYBIT PERP\n"
 f"Symbol: {symbol}\n"
 f"Price: {price}\n"
-f"Signal Strength: {overall_strength:.1f}\n"
+f"Signal Strength: {strength:.2f}\n"
 f"MTF Alignment: {alignment}\n"
-f"Reason: {sig.get('reason')}\n"
-                )
-                return block
-
-            # Add details in order: 1h first (one block per 1h signal), then 4h, then 1d
-            for tf_group in ALERT_ORDER:
-                tf_items = [s for s in root_signals if (s.get("mtf_state") or {}).get(tf_group) is not None]
-                # Prefer signals where the tf_group shows positive or flip
-                ordered_items = sorted(tf_items, key=lambda s: (0 if (s.get("mtf_state") or {}).get(tf_group, {}).get("cur") and (s.get("mtf_state") or {}).get(tf_group, {}).get("cur") > 0 else 1, -(s.get("vol_change") or 0)))
-                for sig in ordered_items:
-                    blocks.append(format_signal_block(sig))
+f"Reason: {reason}"
+                    )
+                    blocks.append(block)
 
             message = "\n\n".join(blocks)
             await send_message(message)
@@ -978,7 +979,6 @@ f"Reason: {sig.get('reason')}\n"
             logger.exception("Failed to build/send summary")
 
     async def run(self):
-
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

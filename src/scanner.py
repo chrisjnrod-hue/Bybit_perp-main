@@ -886,57 +886,51 @@ class Scanner:
                 logger.debug("ROOT_SCAN_INTERVAL not set; sleeping until next 5m open in %.1fs", to_sleep)
                 await asyncio.sleep(to_sleep)
 
-    
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]):
         evaluated = []
-        mtf_scan_tfs = ["5m","15m","1h","4h","1d"]
-
         for item in root_signals:
             sym = item["symbol"]
             price = item["price"]
             root = item["root"]
             vol_change = item.get("vol_change")
-
             mtf_state = {}
             positive_count = 0
-            current_flip_found = False
-            negative_tfs = []
-
-            for tf in mtf_scan_tfs:
-                _, _, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
-                cur = h[-1] if h and len(h) >= 1 else None
-                prev = h[-2] if h and len(h) >= 2 else None
-
-                mtf_state[tf] = {"prev": prev, "cur": cur}
-
-                if cur is not None and cur > 0:
+            any_positive_mtfflip = False
+            
+            for tf in MTF_TFS:
+                macd_line, sig, h = self.compute_macd_for(sym, tf, include_price=price, use_ws_current=True)
+                cur_hist = h[-1] if h and len(h) >= 1 else None
+                prev_hist = h[-2] if h and len(h) >= 2 else None
+                mtf_state[tf] = {"prev": prev_hist, "cur": cur_hist}
+                if cur_hist is not None and cur_hist > 0:
                     positive_count += 1
-                else:
-                    negative_tfs.append(tf)
-
-                if prev is not None and cur is not None and prev <= 0 and cur > 0:
-                    current_flip_found = True
-
-            accept = False
-            reason = "waiting"
-
-            if positive_count == len(mtf_scan_tfs):
-                accept = True
-                reason = "all_positive"
-
-            elif current_flip_found:
-                accept = True
-                reason = "current_flip"
-
-            elif negative_tfs == ["1d"]:
-                _, _, h1d = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
-                one_d_slope = slope(h1d or [], lookback=MTF_SLOPE_LOOKBACK) if h1d else None
-                if one_d_slope and one_d_slope > 0:
-                    accept = True
-                    reason = "1d_negative_but_rising"
-
-            score = positive_count + (vol_change or 0)
-
+                if prev_hist is not None and prev_hist < 0 and cur_hist is not None and cur_hist > 0:
+                    any_positive_mtfflip = True
+            
+            one_d_slope = None
+            if mtf_state.get("1d") and mtf_state["1d"]["cur"] is not None:
+                _, _, full_hist = self.compute_macd_for(sym, "1d", include_price=price, use_ws_current=True)
+                one_d_slope = slope(full_hist or [], lookback=MTF_SLOPE_LOOKBACK) if full_hist else None
+            
+            score = float(positive_count)
+            if any_positive_mtfflip:
+                score += 1.0
+            if vol_change is not None and vol_change > 0:
+                score += min(vol_change, 1.0)
+            
+            if MTF_FILTER:
+                positive_rising_count = 0
+                for tf, vals in mtf_state.items():
+                    cur = vals.get("cur")
+                    prev = vals.get("prev")
+                    if cur is not None and prev is not None and cur > prev and cur > 0:
+                        positive_rising_count += 1
+                score += positive_rising_count * 0.8
+                one_d = mtf_state.get("1d")
+                if one_d and one_d["cur"] is not None and one_d["cur"] < 0:
+                    if one_d_slope is not None and one_d_slope > 0:
+                        score += 0.5
+            
             evaluated.append({
                 "symbol": sym,
                 "root": root,
@@ -944,55 +938,90 @@ class Scanner:
                 "mtf": mtf_state,
                 "positive_count": positive_count,
                 "vol_change": vol_change,
-                "accept": accept,
-                "reason": reason,
-                "score": score,
-                "mtf_alignment": f"{positive_count}/5 positive"
+                "one_d_slope": one_d_slope,
+                "accept": True,
+                "reason": "candidate",
+                "score": score
             })
 
+        await self._emit_event("candidates_evaluated", evaluated)
+
         candidates = [e for e in evaluated if e["accept"]]
+        if ROOT_FILTER:
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for c in candidates:
+                grouped.setdefault(c["root"], []).append(c)
+            selected: List[Dict[str, Any]] = []
+            for root in ROOT_TFS:
+                lst = grouped.get(root, [])
+                if not lst:
+                    continue
+                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
+                selected.extend(top)
+            candidates = sorted(selected, key=lambda r: (r["score"], r["positive_count"]), reverse=True)
+
+        current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
+        logger.info("Opening candidates count=%d (MAX_OPEN_TRADES=%d, currently_open=%d)", len(candidates), MAX_OPEN_TRADES, current_open)
 
         for c in candidates:
             if not self.trade_manager.can_open():
+                logger.info("Reached max open trades; stopping opens.")
                 break
-            if not TRADE_ENABLED:
+            sym = c["symbol"]
+            price = c["price"]
+            try:
+                balance = await self.client.get_balance("USDT")
+            except Exception:
+                balance = None
+            symbol_info = await self.client.get_symbol_info(sym)
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+            if qty <= 0 or math.isclose(qty, 0.0):
+                logger.warning("Computed qty for %s was zero after quantize (qty=%s). Skipping open.", sym, qty)
                 continue
+            if qty != qty_raw:
+                logger.debug("Qty for %s adjusted from %s to %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+            side = "Buy"
+            if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
+                try:
+                    order = await self.client.create_order(sym, side, qty)
+                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    await send_message(f"Opened trade {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f}")
+                except Exception:
+                    logger.exception("Failed to place order for %s", sym)
+            else:
+                t = self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
+                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                await send_message(f"Simulated open {sym} {side} @ {price} qty={qty:.6f} score={c['score']:.2f} reason={c['reason']}")
 
-
-    
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
         if not root_signals:
-            await send_message("SCAN SUMMARY
-No signals this interval.")
+            await send_message("Root scan: no signals this interval.")
             return
-
-        grouped = {"1h": [], "4h": [], "1d": []}
-        summary = ["ROOT TF SIGNAL SUMMARY"]
-
-        for s in root_signals:
-            summary.append(f"{s['root']}: {s['symbol']}")
-
-        blocks = ["
-".join(summary)]
-
-        for tf in ["1h","4h","1d"]:
-            tf_items = [x for x in root_signals if x.get("root")==tf]
-            for sig in tf_items:
-                strength = f"{((sig.get('vol_change') or 0)*100):.1f}"
-                blocks.append(
-f"""BYBIT PERP
-Symbol: {sig['symbol']}
-Price: {sig['price']}
-Signal Strength: {strength}
-MTF Alignment: runtime"""
-                )
-
-        await send_message("
-
-".join(blocks))
+        grouped = {}
+        for it in root_signals:
+            grouped.setdefault(it["root"], []).append((it["symbol"], it["price"], it.get("vol_change")))
+        lines = []
+        lines.append(f"Root scan summary ({len(root_signals)} signals)")
+        for rt in ROOT_TFS:
+            lst = grouped.get(rt, [])
+            if not lst:
+                continue
+            lines.append(f"\nRoot {rt} signals:")
+            for s, p, v in lst:
+                if v is None:
+                    lines.append(f"- {s} @ {p}")
+                else:
+                    lines.append(f"- {s} @ {p} (24h vol ÃŽâ€ {v:.2f})")
+        open_sum = self.trade_manager.summary()
+        if open_sum:
+            lines.append("\nOpen trades:")
+            for ot in open_sum:
+                lines.append(f"- {ot['symbol']} {ot['qty']} @ {ot['entry']}")
+        text = "\n".join(lines)
+        await send_message(text)
 
     async def run(self):
-
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

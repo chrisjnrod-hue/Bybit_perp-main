@@ -895,9 +895,9 @@ class Scanner:
     async def send_summary(self, root_signals: List[Dict[str, Any]]):
         """
         Telegram formatting per requirements:
-        1) First block: root TF signal summary (all symbols in one block)
-        2) Then per-TF detailed blocks: 1h signals, then 4h, then 1d
-           Each signal gets: BYBIT PERP, Symbol, Price, Signal Strength, MTF Alignment
+        1) First block: root TF signal summary (all signals grouped by ROOT_TFS)
+        2) Then detailed blocks: 1h signals, then 4h, then 1d (one block per signal)
+           Each signal block: BYBIT PERP, Symbol, Price, Signal Strength, MTF Alignment
         """
         try:
             if not root_signals:
@@ -946,16 +946,14 @@ class Scanner:
                 return " ".join(parts)
 
             # ====== BLOCKS 2+: Detailed per-TF blocks ======
-            for tf_group in ALERT_ORDER:
-                # Filter signals for this TF group (look for signals detected on this TF)
-                # For simplicity, we list all signals but indicate which ones are relevant
-                tf_signals = root_signals  # All signals are valid; group by TF for presentation
-                
-                for sig in tf_signals:
+            # Group signals by which TF they match ALERT_ORDER
+            for alert_tf in ALERT_ORDER:
+                for sig in root_signals:
                     mtf_state = sig.get("mtf_state") or {}
-                    tf_state = mtf_state.get(tf_group)
+                    tf_state = mtf_state.get(alert_tf)
+                    
                     if not tf_state:
-                        continue  # Skip if TF not in state
+                        continue  # Skip if this TF not in state
                     
                     symbol = sig["symbol"]
                     price = sig["price"]

@@ -231,6 +231,59 @@ class BybitClient:
             logger.exception("get_latest_price error for %s", symbol)
         return None
 
+    async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch 24h ticker stats for a symbol.
+        Returns a dict with at minimum:
+          - volume24h      : float  (base-asset volume over last 24 h)
+          - turnover24h    : float  (quote-asset turnover over last 24 h)
+          - price24hPcnt   : float  (price change % as decimal, e.g. 0.023 = +2.3 %)
+          - volume24hPcnt  : float  (volume change % vs prior 24 h window — synthesised
+                                     from prevVolume24h when available, else None)
+        Returns None on failure.
+        """
+        try:
+            params = {"symbol": symbol, "category": "linear"}
+            data = await self._get("/v5/market/tickers", params=params)
+            if isinstance(data, dict) and "result" in data:
+                res = data["result"]
+                entry = None
+                if isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and res["list"]:
+                    entry = res["list"][0]
+                elif isinstance(res, list) and res:
+                    entry = res[0]
+                elif isinstance(res, dict):
+                    entry = res
+
+                if entry and isinstance(entry, dict):
+                    def _f(v):
+                        try:
+                            return float(v) if v is not None else None
+                        except Exception:
+                            return None
+
+                    vol24h     = _f(entry.get("volume24h") or entry.get("volume") or entry.get("vol24h"))
+                    turnover24h = _f(entry.get("turnover24h") or entry.get("turnover"))
+                    price_pct  = _f(entry.get("price24hPcnt") or entry.get("priceChangePercent"))
+                    prev_vol   = _f(entry.get("prevVolume24h") or entry.get("volume24h_prev"))
+
+                    vol_pct = None
+                    if vol24h is not None and prev_vol is not None and prev_vol > 0:
+                        vol_pct = (vol24h - prev_vol) / prev_vol
+
+                    return {
+                        "symbol":        symbol,
+                        "volume24h":     vol24h,
+                        "turnover24h":   turnover24h,
+                        "price24hPcnt":  price_pct,
+                        "volume24hPcnt": vol_pct,
+                        "prevVolume24h": prev_vol,
+                        "raw":           entry,
+                    }
+        except Exception:
+            logger.exception("get_24h_ticker error for %s", symbol)
+        return None
+
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         try:
             syms = await self.get_symbols()

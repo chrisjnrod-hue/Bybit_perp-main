@@ -84,6 +84,15 @@ FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
+# ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----
+# VOLUME_FILTER_ENABLED=true  → block trade opens when 24h vol change % is negative
+# VOLUME_FILTER_ENABLED=false → ignore volume, open trades freely (default: true)
+VOLUME_FILTER_ENABLED = safe_bool_env("VOLUME_FILTER_ENABLED", True)
+
+# Minimum 24h volume change % required for a trade open (decimal; 0.0 = any positive change)
+# e.g. VOLUME_MIN_CHANGE_PCT=0.05 requires +5 % volume growth before opening
+VOLUME_MIN_CHANGE_PCT = safe_float_env("VOLUME_MIN_CHANGE_PCT", 0.0)
+
 # Filters toggles
 ROOT_FILTER = safe_bool_env("ROOT_FILTER", False)
 ROOT_TOP_N = safe_int_env("ROOT_TOP_N", MAX_OPEN_TRADES)

@@ -1108,27 +1108,45 @@ class Scanner:
         # Scenario B: 1+ TFs negative and Scenario C not met
         return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
-    def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
+    def _build_mtf_state_str(self, tf_states: Dict[str, Any], scenario: str = "") -> str:
         """
         Build compact MTF state string for Telegram.
         Example: '5m✅ 15m🔄 1h✅ 4h❌ 1d📈'
 
-        Legend:
-          ✅  positive histogram
-          🔄  just flipped positive (prev<0 → cur>0) this candle open
-          📈  negative but rising slope (1d Scenario C)
-          ❌  negative
+        Icons are strictly derived from the active MTF alignment scenario:
+
+          Scenario A ("aligned")      — all TFs positive:
+            ✅  positive histogram  |  🔄  flipped positive this candle
+
+          Scenario C ("daily_rising") — only 1d negative but rising slope:
+            ✅ / 🔄 for positive TFs  |  📈  for 1d (negative but slope > 0)
+
+          Scenario B ("monitoring")   — 1+ TFs negative, Scenario C not met:
+            ✅ / 🔄 for positive TFs  |  ❌  for any negative TF
+
+        The `scenario` param (A/B/C status string) gates which icons are allowed
+        so the displayed row can never contradict the evaluated outcome.
         """
         parts = []
         for tf in MTF_ALIGN_TFS:
             d = tf_states.get(tf, {})
-            if d.get("is_flip"):
+            is_positive = d.get("is_positive", False)
+            is_flip     = d.get("is_flip", False)
+
+            if is_flip:
+                # Flip (prev<0 → cur>0) is a positive state in all scenarios
                 parts.append(f"{tf}🔄")
-            elif d.get("is_positive"):
+            elif is_positive:
+                # Straightforward positive histogram — valid in all scenarios
                 parts.append(f"{tf}✅")
-            elif tf == "1d" and d.get("slope") is not None and d.get("slope", 0) > 0:
+            elif tf == "1d" and scenario == "daily_rising":
+                # Scenario C only: 1d is negative but rising — show 📈
+                # (slope > 0 is already guaranteed by _compute_mtf_alignment before
+                #  returning status="daily_rising", so we don't re-check it here)
                 parts.append(f"{tf}📈")
             else:
+                # Negative in Scenario B (or 1d negative in Scenario C for any
+                # tf other than 1d, which can't happen but is safe to handle)
                 parts.append(f"{tf}❌")
         return " ".join(parts)
 
@@ -1175,7 +1193,7 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     logger.info("MONITORING RESOLVED: %s → %s — queuing trade open", sym, status)
                     to_remove.append(sym)
-                    tf_str = self._build_mtf_state_str(mtf_align["tfs"])
+                    tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario=status)
                     await send_message(
                         f"✅ MTF Aligned — {sym}\n"
                         f"Root: {info['root']} | Price: {price}\n"
@@ -1200,7 +1218,7 @@ class Scanner:
                         newly_flipped = prev_neg - curr_neg
                         if newly_flipped and (now - info.get("last_alert", 0) > PARTIAL_ALERT_COOLDOWN):
                             self._mtf_monitoring[sym]["last_alert"] = now
-                            tf_str = self._build_mtf_state_str(mtf_align["tfs"])
+                            tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario="monitoring")
                             await send_message(
                                 f"📈 Monitoring Update — {sym}\n"
                                 f"Root: {info['root']} | Price: {price}\n"
@@ -1287,7 +1305,7 @@ class Scanner:
                         "last_alert":  0.0,
                     }
                     logger.info("MTF MONITORING: %s added — waiting on: %s", sym, negative_tfs)
-                    tf_str = self._build_mtf_state_str(mtf_align["tfs"])
+                    tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario="monitoring")
                     await send_message(
                         f"⏳ Monitoring Started — {sym}\n"
                         f"Root: {root} | Price: {price}\n"
@@ -1537,7 +1555,7 @@ class Scanner:
                     else:
                         align_str = "❓ Unknown"
 
-                    mtf_str = self._build_mtf_state_str(mtf_tfs_state) if mtf_tfs_state else "N/A"
+                    mtf_str = self._build_mtf_state_str(mtf_tfs_state, scenario=mtf_status) if mtf_tfs_state else "N/A"
 
                     # ── Volume gate indicator (display only; never hides signal) ──
                     if vol_change is None:

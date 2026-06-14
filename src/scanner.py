@@ -1484,6 +1484,9 @@ class Scanner:
             return
 
         # ── Build evaluation lookup keyed by (symbol, root) ─────────────────
+        # Used as a cache: prefer pre-computed MTF from handle_root_signals when
+        # available, but always fall back to a fresh _compute_mtf_alignment call
+        # so the MTF status per block is NEVER left as "unknown".
         eval_map: Dict[tuple, Dict[str, Any]] = {}
         if evaluated:
             for e in evaluated:
@@ -1512,31 +1515,47 @@ class Scanner:
 
             for (_, sig, ev, macd_hist_val, vol_change, strength) in enriched:
                 try:
-                    sym           = sig["symbol"]
-                    price         = sig["price"]
-                    mtf_tfs_state = ev.get("mtf", {})
-                    mtf_status    = ev.get("mtf_status", "unknown")
-                    negative_tfs  = ev.get("negative_tfs", [])
-                    one_d_slope   = ev.get("one_d_slope")
+                    sym   = sig["symbol"]
+                    price = sig["price"]
 
-                    # ── Dedup / repeat check ──────────────────────────────
-                    mtf_align_for_key = {"tfs": mtf_tfs_state} if mtf_tfs_state else {}
-                    snap_key = self._mtf_snapshot_key(mtf_align_for_key) if mtf_tfs_state else ""
+                    # ── MTF alignment: always use a live evaluation ───────────
+                    # eval_map may be empty (no root signals passed evaluated) or
+                    # the entry may exist but have stale / missing mtf_status.
+                    # Re-compute directly so the three Scenario rules always apply.
+                    ev_mtf_status = ev.get("mtf_status", "")
+                    if ev_mtf_status in ("aligned", "daily_rising", "monitoring"):
+                        # Trust the pre-computed result from handle_root_signals
+                        mtf_align    = {"status": ev_mtf_status, "tfs": ev.get("mtf", {}),
+                                        "negative_tfs": ev.get("negative_tfs", []),
+                                        "one_d_slope":  ev.get("one_d_slope")}
+                    else:
+                        # Fall back: compute fresh so State is never "❓ Unknown"
+                        mtf_align = self._compute_mtf_alignment(sym, price)
+
+                    mtf_status   = mtf_align["status"]           # "aligned" | "daily_rising" | "monitoring"
+                    mtf_tfs_state = mtf_align["tfs"]             # per-TF state dicts
+                    negative_tfs  = mtf_align.get("negative_tfs", [])
+                    one_d_slope   = mtf_align.get("one_d_slope")
+
+                    # Reflect fresh alignment back into ev so accepted_signals is accurate
+                    ev_accept = mtf_status in ("aligned", "daily_rising")
+
+                    # ── Dedup / repeat check ──────────────────────────────────
+                    snap_key   = self._mtf_snapshot_key({"tfs": mtf_tfs_state}) if mtf_tfs_state else ""
                     signal_key = (sym, rt)
-                    last_snap = self._sent_signal_mtf.get(signal_key)
+                    last_snap  = self._sent_signal_mtf.get(signal_key)
 
                     if last_snap is not None and last_snap == snap_key:
                         # MTF alignment unchanged — suppress repeat
                         logger.debug("Signal suppressed (no MTF change): %s %s", sym, rt)
-                        # Still add to accepted list for recommendations block
-                        if ev.get("accept"):
+                        if ev_accept:
                             accepted_signals.append((strength["score"], sym, rt, price, vol_change, strength, ev))
                         continue
 
                     # Update snapshot
                     self._sent_signal_mtf[signal_key] = snap_key
 
-                    # ── Price formatting ──────────────────────────────────
+                    # ── Price formatting ──────────────────────────────────────
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
                     elif price >= 1:
@@ -1544,26 +1563,28 @@ class Scanner:
                     else:
                         price_str = f"${price:.8f}"
 
-                    # ── MTF state / status line ───────────────────────────
+                    # ── State line — strictly one of three scenario labels ─────
+                    #   Scenario A → "✅ MTF Aligned"
+                    #   Scenario C → "📈 Daily Rising (1d slope …)"
+                    #   Scenario B → "⏳ Monitoring → waiting: <tfs>"
                     if mtf_status == "aligned":
                         align_str = "✅ MTF Aligned"
                     elif mtf_status == "daily_rising":
                         slope_note = f" (1d slope {one_d_slope:+.4f})" if one_d_slope is not None else ""
                         align_str = f"📈 Daily Rising{slope_note}"
-                    elif mtf_status == "monitoring":
+                    else:  # "monitoring"
                         align_str = f"⏳ Monitoring → waiting: {', '.join(negative_tfs)}"
-                    else:
-                        align_str = "❓ Unknown"
 
+                    # ── MTF row — icons derived strictly from active scenario ──
                     mtf_str = self._build_mtf_state_str(mtf_tfs_state, scenario=mtf_status) if mtf_tfs_state else "N/A"
 
                     # ── Volume gate indicator (display only; never hides signal) ──
                     if vol_change is None:
-                        vol_gate_icon = "⚪"   # unknown
+                        vol_gate_icon = "⚪"
                     elif vol_change > VOLUME_MIN_CHANGE_PCT:
-                        vol_gate_icon = "✅"   # passes trade gate
+                        vol_gate_icon = "✅"
                     else:
-                        vol_gate_icon = "🚫"   # signal shown, trade blocked
+                        vol_gate_icon = "🚫"
 
                     block_lines = [
                         f"📌 *Bybit Perp | {tf_label} Signal*",
@@ -1579,7 +1600,7 @@ class Scanner:
                     ]
                     await send_message("\n".join(block_lines))
 
-                    if ev.get("accept"):
+                    if ev_accept:
                         accepted_signals.append((strength["score"], sym, rt, price, vol_change, strength, ev))
 
                 except Exception:

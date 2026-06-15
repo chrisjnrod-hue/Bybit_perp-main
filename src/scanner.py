@@ -1,5 +1,10 @@
-# Add this COMPLETE diagnostic version to replace your current scanner.py
-# This will help us identify exactly where the process breaks down
+# Updated scanner (diagnostic) with websocket subscriptions for 5m & 15m,
+# removed telegram monitoring alerts, and reworked telegram summary layout:
+#  - First block: Bybit Perp Root summary + listing of all root-tf signals
+#  - Following blocks: one block per signal ordered by root TFs (1h -> 4h -> 1d)
+#  - Last block: recommended signals for trading limited by MAX_OPEN_TRADES
+#
+# This replaces the prior behavior that sent monitoring/partial alerts via Telegram.
 
 import os
 import asyncio
@@ -17,8 +22,7 @@ from .macd import macd_histogram, slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
-    MACD_HIST_THRESHOLD, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT
+    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -59,12 +63,8 @@ class Scanner:
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}  # Scenario B watch-list
-        # ---- Signal dedup & repeat tracking ----
-        # Keyed by (symbol, root_tf) → last MTF alignment snapshot sent
-        # A signal is repeated only when the MTF alignment snapshot changes
-        self._sent_signal_mtf: Dict[tuple, str] = {}
-        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s VOLUME_FILTER=%s)", 
-                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE, VOLUME_FILTER_ENABLED)
+        logger.info("scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d MAX_CONCURRENT=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)", 
+                   bool(USE_WS), SEED_KLINES_LIMIT, MAX_CONCURRENT_REQUESTS, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE)
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -214,30 +214,19 @@ class Scanner:
             if USE_WS:
                 try:
                     await self.client.start_kline_ws()
-                    # Wire the scanner's kline store into the WS feed so live candle
-                    # pushes update kline_store — without this, WS data never reaches
-                    # compute_macd_for and the store stays at seed values forever.
-                    if hasattr(self.client, "register_kline_callback"):
-                        self.client.register_kline_callback(self._on_ws_kline)
-                        logger.info("WS kline callback registered → kline_store will receive live updates")
-                    else:
-                        logger.warning(
-                            "BybitClient has no register_kline_callback — "
-                            "kline_store will not receive WS updates; REST poller will compensate"
-                        )
                 except Exception:
                     logger.exception("Failed to start client WS")
             else:
                 logger.info("USE_WS is False; websocket startup and subscriptions skipped (REST-only mode)")
 
+            # Subscribe websocket kline feeds for root TFs AND 5m/15m (for MTF alignment)
             if USE_WS and syms:
-                # Subscribe ROOT_TFS for flip detection + MTF_ALIGN_TFS (5m, 15m, 1h, 4h, 1d)
-                # for alignment checks. Deduped so overlapping TFs are not double-subscribed.
-                sub_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))
                 tasks = []
                 sem = asyncio.Semaphore(max(1, CONCURRENCY))
+                # Ensure we subscribe to short MTF align TFs (5m, 15m) in addition to ROOT_TFS
+                tfs_to_sub = list(set(list(ROOT_TFS) + ["5m", "15m"]))
                 for sym in syms:
-                    for tf in sub_tfs:
+                    for tf in tfs_to_sub:
                         async def worker(s=sym, t=tf):
                             async with sem:
                                 try:
@@ -246,10 +235,6 @@ class Scanner:
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
-                logger.info(
-                    "WS subscribing %d symbols x %d TFs %s = %d streams",
-                    len(syms), len(sub_tfs), sub_tfs, len(syms) * len(sub_tfs),
-                )
                 if tasks:
                     await asyncio.gather(*tasks)
 
@@ -503,46 +488,11 @@ class Scanner:
         
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
-    def _on_ws_kline(self, symbol: str, tf: str, kline: Dict[str, Any]):
-        """
-        Callback invoked by BybitClient for every WS kline push.
-        Updates kline_store in-place so compute_macd_for always sees live data.
-
-        Expected kline dict keys (normalized, same as _normalize_klines output):
-          close    : float  (required)
-          start_at : int    (candle open timestamp, optional)
-          volume   : float  (optional)
-        """
-        try:
-            close = kline.get("close")
-            if close is None:
-                return
-            close = float(close)
-            start_at = kline.get("start_at") or kline.get("start") or kline.get("t")
-            volume   = kline.get("volume") or kline.get("vol")
-            new_candle = {"start_at": start_at, "close": close, "volume": volume}
-
-            store = self.kline_store.setdefault(symbol, {})
-            lst   = store.get(tf, [])
-            if lst and lst[-1].get("start_at") == start_at:
-                lst[-1] = new_candle          # update current candle in-place
-            elif lst:
-                lst.append(new_candle)        # new candle opened
-                # Trim to avoid unbounded growth (keep SEED_KLINES_LIMIT candles)
-                if len(lst) > SEED_KLINES_LIMIT:
-                    store[tf] = lst[-SEED_KLINES_LIMIT:]
-            else:
-                store[tf] = [new_candle]      # first candle for this tf
-        except Exception:
-            logger.debug("_on_ws_kline error for %s %s", symbol, tf, exc_info=True)
-
     async def _rest_poller(self):
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
         poll_count = 0
         try:
-            # Run REST poller unconditionally — even in WS mode it keeps kline_store
-            # updated for TFs or symbols where WS callback is not registered/firing.
-            while not self._stop:
+            while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
                 poll_count += 1
                 if poll_count % 5 == 0:
                     logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
@@ -554,12 +504,7 @@ class Scanner:
 
                 async def poll_symbol(sym: str):
                     async with self.request_sem:
-                        # Poll ROOT_TFS for flip detection AND MTF_ALIGN_TFS for alignment checks.
-                        # Without polling 5m/15m here they stay at seed values and
-                        # _compute_mtf_alignment evaluates stale histograms, producing
-                        # wrong Scenario A/B/C outcomes.
-                        poll_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))  # deduped, order preserved
-                        for root in poll_tfs:
+                        for root in ROOT_TFS:
                             try:
                                 data = await self.client.get_klines(sym, root, limit=3)
                                 normalized = self._normalize_klines(data, root) if data else []
@@ -596,6 +541,9 @@ class Scanner:
 
                 elapsed = time.time() - start
                 to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
+                if USE_WS and self.client.is_ws_connected():
+                    logger.info("WS reconnected; stopping REST poller")
+                    break
                 await asyncio.sleep(to_sleep)
         except asyncio.CancelledError:
             logger.info("REST poller cancelled")
@@ -688,7 +636,7 @@ class Scanner:
                            symbol, tf, prev, cur, hist_threshold, result)
             
             if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f Ã¢â€ â€™ cur=%.8f (change=%.8f)", 
+                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f -> cur=%.8f (change=%.8f)", 
                               symbol, tf, prev, cur, hist_change)
             
             return result
@@ -720,51 +668,13 @@ class Scanner:
         return float(quant)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """
-        Fetch 24h ticker for symbol and cache both the current and previous 24h volume.
-        Returns the 24h volume-change percentage (decimal) or None on failure.
-
-        Priority:
-          1. Use prevVolume24h from Bybit API when present  → exact window comparison
-          2. Fall back to comparing successive scanner-poll snapshots (same as before)
-        """
+        """Update and track 24h volume data with caching"""
         try:
             now = time.time()
-            # Rate-limit cache refresh to once per 60 s per symbol
             if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
-                return self.compute_24h_volume_change(symbol)
-
-            ticker = None
+                return None
+            
             if hasattr(self.client, "get_24h_ticker"):
-                async with self.request_sem:
-                    ticker = await self.client.get_24h_ticker(symbol)
-
-            if ticker and isinstance(ticker, dict):
-                vol24h   = ticker.get("volume24h")
-                prev_vol = ticker.get("prevVolume24h")
-                vol_pct  = ticker.get("volume24hPcnt")   # pre-computed when prev_vol present
-
-                if vol24h is not None:
-                    if symbol not in self._24h_volumes:
-                        self._24h_volumes[symbol] = {"current": vol24h, "previous": vol24h}
-                    else:
-                        self._24h_volumes[symbol]["previous"] = (
-                            prev_vol if prev_vol is not None
-                            else self._24h_volumes[symbol]["current"]
-                        )
-                        self._24h_volumes[symbol]["current"] = vol24h
-
-                    # Store pre-computed pct when API gives it directly
-                    if vol_pct is not None:
-                        self._24h_volumes[symbol]["api_pct"] = vol_pct
-
-                    self._last_price_time[symbol] = now
-                    return self.compute_24h_volume_change(symbol)
-
-            # Fallback: try get_24h_ticker's generic volume field
-            if hasattr(self.client, "get_24h_ticker"):
-                pass  # already tried above
-            elif hasattr(self.client, "get_24h_ticker"):
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
                 if data and isinstance(data, dict):
@@ -778,7 +688,7 @@ class Scanner:
                                 self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                                 self._24h_volumes[symbol]["current"] = vol
                             self._last_price_time[symbol] = now
-                            return self.compute_24h_volume_change(symbol)
+                            return vol
                         except Exception:
                             pass
         except Exception:
@@ -786,132 +696,20 @@ class Scanner:
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """
-        Return 24h volume change as a decimal percentage (e.g. 0.05 = +5 %).
-        Prefers the API-provided value (prevVolume24h comparison) over
-        the fallback successive-poll comparison.
-        Returns None when data is unavailable.
-        """
+        """Compute percentage change in 24h volume"""
         try:
             if symbol not in self._24h_volumes:
                 return None
             vol_data = self._24h_volumes[symbol]
-
-            # API pre-computed pct (most accurate)
-            if "api_pct" in vol_data and vol_data["api_pct"] is not None:
-                return float(vol_data["api_pct"])
-
             prev_vol = vol_data.get("previous", 0)
             curr_vol = vol_data.get("current", 0)
-            if prev_vol is None or prev_vol <= 0:
+            if prev_vol <= 0:
                 return None
             change = (curr_vol - prev_vol) / prev_vol
-            return change
+            return min(change, 1.0)
         except Exception:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
-
-    # ------------------------------------------------------------------
-    # Signal strength & volume gate helpers
-    # ------------------------------------------------------------------
-
-    def _signal_strength_rating(self, macd_hist_val: float, vol_change: Optional[float]) -> Dict[str, Any]:
-        """
-        Combine MACD histogram momentum and 24h volume change % into a single
-        signal strength score and label.
-
-        Score components (both normalised to 0-1 range then combined):
-          • MACD component : clamped by MACD_HIST_THRESHOLD baseline
-          • Volume component: positive vol_change contribution (max 1.0)
-
-        Returns dict with:
-          score        : float 0-2 (higher = stronger)
-          label        : str  "🔥 Strong" | "🟡 Moderate" | "⭕ Weak"
-          macd_rating  : str  descriptive MACD momentum
-          vol_rating   : str  descriptive volume momentum
-        """
-        # MACD component — relative to threshold baseline
-        threshold = max(float(MACD_HIST_THRESHOLD), 0.0)
-        macd_excess = max(0.0, float(macd_hist_val) - threshold)
-        # Normalise: treat 5× threshold (or 0.001 if threshold=0) as "full" MACD score
-        ref = threshold * 5 if threshold > 0 else 0.001
-        macd_score = min(macd_excess / ref, 1.0) if ref > 0 else 0.0
-
-        # Volume component
-        vol_score = 0.0
-        if vol_change is not None and vol_change > 0:
-            vol_score = min(float(vol_change), 1.0)  # cap at 100 %
-
-        combined = macd_score + vol_score   # range 0 – 2
-
-        if combined >= 1.4:
-            label = "🔥 Strong"
-        elif combined >= 0.6:
-            label = "🟡 Moderate"
-        else:
-            label = "⭕ Weak"
-
-        # MACD descriptive
-        if macd_hist_val >= threshold * 3 if threshold > 0 else macd_hist_val >= 0.005:
-            macd_rating = "Surging"
-        elif macd_hist_val > threshold:
-            macd_rating = "Rising"
-        else:
-            macd_rating = "Crossing"
-
-        # Volume descriptive
-        if vol_change is None:
-            vol_rating = "Unknown"
-        elif vol_change >= 0.30:
-            vol_rating = f"+{vol_change * 100:.1f}% 🔥"
-        elif vol_change >= 0.05:
-            vol_rating = f"+{vol_change * 100:.1f}% 📈"
-        elif vol_change > 0:
-            vol_rating = f"+{vol_change * 100:.1f}%"
-        else:
-            vol_rating = f"{vol_change * 100:.1f}% ⚠️"
-
-        return {
-            "score":       combined,
-            "label":       label,
-            "macd_rating": macd_rating,
-            "vol_rating":  vol_rating,
-        }
-
-    def _passes_volume_gate(self, vol_change: Optional[float]) -> bool:
-        """
-        Trade-open volume gate (never used to reject signals from Telegram).
-        Returns True when vol_change satisfies the filter criteria, False blocks the open.
-
-        Controlled by env vars:
-          VOLUME_FILTER_ENABLED  (default true)
-          VOLUME_MIN_CHANGE_PCT  (default 0.0 → any positive change passes)
-        """
-        if not VOLUME_FILTER_ENABLED:
-            return True
-        if vol_change is None:
-            # Cannot confirm volume is positive — default allow (conservative)
-            return True
-        return vol_change > VOLUME_MIN_CHANGE_PCT
-
-    def _mtf_snapshot_key(self, mtf_align: Dict[str, Any]) -> str:
-        """
-        Produce a compact string fingerprint of the current MTF alignment state.
-        A signal is re-sent only when this key changes vs the last sent snapshot.
-        """
-        tfs = mtf_align.get("tfs", {})
-        parts = []
-        for tf in MTF_ALIGN_TFS:
-            d = tfs.get(tf, {})
-            if d.get("is_flip"):
-                parts.append(f"{tf}:flip")
-            elif d.get("is_positive"):
-                parts.append(f"{tf}:pos")
-            elif tf == "1d" and d.get("slope", 0) and d["slope"] > 0:
-                parts.append(f"{tf}:rising")
-            else:
-                parts.append(f"{tf}:neg")
-        return "|".join(parts)
 
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
@@ -1032,7 +830,7 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change
                                 })
-                                logger.info("Ã¢Å“â€œ SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                logger.info("SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                                 if DEBUG_SURGICAL_LOGS:
                                     logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
                     except Exception:
@@ -1069,17 +867,11 @@ class Scanner:
                 await self._check_monitored_symbols()
 
                 if root_signals:
-                    # Ensure WS streams cover ROOT_TFS + MTF_ALIGN_TFS (5m, 15m) for every
-                    # signal symbol so alignment checks always use live candle data.
-                    _sub_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))
                     for sig in root_signals:
                         try:
                             sym = sig["symbol"]
                             if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                                await self.client.subscribe_mtf_for_symbol(sym, _sub_tfs)
-                            elif USE_WS and hasattr(self.client, "sub_kline"):
-                                for _tf in _sub_tfs:
-                                    await self.client.sub_kline(sym, _tf)
+                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
                     evaluated = await self.handle_root_signals(root_signals)
@@ -1090,7 +882,7 @@ class Scanner:
                 
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("Ã¢Å“â€œ ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
+                    logger.info("ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
                                checked_count, len(root_signals), candidates_count)
                 except Exception:
                     pass
@@ -1165,55 +957,31 @@ class Scanner:
                     "negative_tfs": ["1d"],
                     "one_d_slope": one_d_slope,
                 }
-            # Scenario C not met: 1d negative but slope is flat/negative or no 1d data.
-            # Falls through to Scenario B (monitoring) — log so it's visible.
-            logger.debug(
-                "MTF Scenario C not met for %s: 1d negative, slope=%s (needs >0) — classifying as monitoring",
-                symbol, one_d_slope,
-            )
 
         # Scenario B: 1+ TFs negative and Scenario C not met
         return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
-    def _build_mtf_state_str(self, tf_states: Dict[str, Any], scenario: str = "") -> str:
+    def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
         """
         Build compact MTF state string for Telegram.
         Example: '5m✅ 15m🔄 1h✅ 4h❌ 1d📈'
 
-        Icons are strictly derived from the active MTF alignment scenario:
-
-          Scenario A ("aligned")      — all TFs positive:
-            ✅  positive histogram  |  🔄  flipped positive this candle
-
-          Scenario C ("daily_rising") — only 1d negative but rising slope:
-            ✅ / 🔄 for positive TFs  |  📈  for 1d (negative but slope > 0)
-
-          Scenario B ("monitoring")   — 1+ TFs negative, Scenario C not met:
-            ✅ / 🔄 for positive TFs  |  ❌  for any negative TF
-
-        The `scenario` param (A/B/C status string) gates which icons are allowed
-        so the displayed row can never contradict the evaluated outcome.
+        Legend:
+          ✅  positive histogram
+          🔄  just flipped positive (prev<0 → cur>0) this candle open
+          📈  negative but rising slope (1d Scenario C)
+          ❌  negative
         """
         parts = []
         for tf in MTF_ALIGN_TFS:
             d = tf_states.get(tf, {})
-            is_positive = d.get("is_positive", False)
-            is_flip     = d.get("is_flip", False)
-
-            if is_flip:
-                # Flip (prev<0 → cur>0) is a positive state in all scenarios
+            if d.get("is_flip"):
                 parts.append(f"{tf}🔄")
-            elif is_positive:
-                # Straightforward positive histogram — valid in all scenarios
+            elif d.get("is_positive"):
                 parts.append(f"{tf}✅")
-            elif tf == "1d" and scenario == "daily_rising":
-                # Scenario C only: 1d is negative but rising — show 📈
-                # (slope > 0 is already guaranteed by _compute_mtf_alignment before
-                #  returning status="daily_rising", so we don't re-check it here)
+            elif tf == "1d" and d.get("slope") is not None and d.get("slope", 0) > 0:
                 parts.append(f"{tf}📈")
             else:
-                # Negative in Scenario B (or 1d negative in Scenario C for any
-                # tf other than 1d, which can't happen but is safe to handle)
                 parts.append(f"{tf}❌")
         return " ".join(parts)
 
@@ -1222,15 +990,15 @@ class Scanner:
         Scenario B monitor: re-evaluate symbols waiting for their last negative TF
         to flip positive on the current candle open.
 
-        - When all TFs align (A or C)  → opens trade via handle_root_signals
-        - When a partial flip occurs   → sends Telegram update (rate-limited, 5 min)
-        - Entries older than 24 h      → expired and removed
+        NOTE: Monitoring alerts/partial updates are intentionally NOT sent via Telegram
+        per requested update — monitoring is internal only. When monitoring resolves,
+        the symbol is queued for handling via handle_root_signals (no direct send_message here).
         """
         if not self._mtf_monitoring:
             return
 
         MONITORING_MAX_AGE    = 86400  # 24 hours
-        PARTIAL_ALERT_COOLDOWN = 300   # 5 minutes between partial alerts
+        PARTIAL_ALERT_COOLDOWN = 300   # kept for logic throttle though no alerts are sent
         now = time.time()
         to_remove: List[str] = []
         newly_aligned: List[Dict[str, Any]] = []
@@ -1260,14 +1028,6 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     logger.info("MONITORING RESOLVED: %s → %s — queuing trade open", sym, status)
                     to_remove.append(sym)
-                    tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario=status)
-                    await send_message(
-                        f"✅ MTF Aligned — {sym}\n"
-                        f"Root: {info['root']} | Price: {price}\n"
-                        f"Status: {status.replace('_', ' ').title()}\n"
-                        f"MTF: {tf_str}\n"
-                        f"Opening trade..."
-                    )
                     newly_aligned.append({
                         "symbol": sym,
                         "root": info["root"],
@@ -1277,22 +1037,12 @@ class Scanner:
                         "from_monitoring": True,
                     })
                 else:
-                    # Check for partial progress
+                    # Update internal monitoring negative_tfs and last_alert time for bookkeeping
                     prev_neg = set(info.get("negative_tfs", []))
                     curr_neg = set(mtf_align.get("negative_tfs", []))
                     if curr_neg != prev_neg:
                         self._mtf_monitoring[sym]["negative_tfs"] = list(curr_neg)
-                        newly_flipped = prev_neg - curr_neg
-                        if newly_flipped and (now - info.get("last_alert", 0) > PARTIAL_ALERT_COOLDOWN):
-                            self._mtf_monitoring[sym]["last_alert"] = now
-                            tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario="monitoring")
-                            await send_message(
-                                f"📈 Monitoring Update — {sym}\n"
-                                f"Root: {info['root']} | Price: {price}\n"
-                                f"Flipped ✅: {', '.join(sorted(newly_flipped))}\n"
-                                f"Still waiting: {', '.join(sorted(curr_neg))}\n"
-                                f"MTF: {tf_str}"
-                            )
+                        self._mtf_monitoring[sym]["last_alert"] = now
             except Exception:
                 logger.exception("Error checking monitored symbol %s", sym)
 
@@ -1372,13 +1122,7 @@ class Scanner:
                         "last_alert":  0.0,
                     }
                     logger.info("MTF MONITORING: %s added — waiting on: %s", sym, negative_tfs)
-                    tf_str = self._build_mtf_state_str(mtf_align["tfs"], scenario="monitoring")
-                    await send_message(
-                        f"⏳ Monitoring Started — {sym}\n"
-                        f"Root: {root} | Price: {price}\n"
-                        f"Waiting for TFs to flip: {', '.join(negative_tfs)}\n"
-                        f"MTF: {tf_str}"
-                    )
+                    # NOTE: Monitoring alerts to Telegram were intentionally removed
 
             evaluated.append(entry)
 
@@ -1409,34 +1153,8 @@ class Scanner:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached — halting further opens.")
                 break
-            sym        = c["symbol"]
-            price      = c["price"]
-            vol_change = c.get("vol_change")
-            reason_tag = c.get("reason", "signal")
-
-            # ── Volume gate: blocks trade open only, never hides the signal ──
-            if not self._passes_volume_gate(vol_change):
-                vol_pct_str = f"{vol_change * 100:.1f}%" if vol_change is not None else "N/A"
-                logger.info(
-                    "VOLUME GATE BLOCKED trade open for %s — vol_change=%s (VOLUME_MIN_CHANGE_PCT=%.2f%%)",
-                    sym, vol_pct_str, VOLUME_MIN_CHANGE_PCT * 100,
-                )
-                await send_message(
-                    f"⛔ Trade blocked by volume gate — {sym}\n"
-                    f"24h Vol Δ: {vol_pct_str} (requires > {VOLUME_MIN_CHANGE_PCT * 100:.1f}%)\n"
-                    f"Signal remains active — waiting for volume to confirm."
-                )
-                continue
-
-            # ── MACD histogram threshold check ────────────────────────────
-            macd_hist_val = float(c.get("macd_hist_val") or 0.0)
-            if macd_hist_val < MACD_HIST_THRESHOLD:
-                logger.info(
-                    "MACD THRESHOLD BLOCKED trade open for %s — hist_val=%.6f threshold=%.6f",
-                    sym, macd_hist_val, MACD_HIST_THRESHOLD,
-                )
-                continue
-
+            sym   = c["symbol"]
+            price = c["price"]
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
@@ -1452,22 +1170,15 @@ class Scanner:
                     "Qty for %s adjusted %s → %s (step=%s min=%s)",
                     sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"),
                 )
-            side = "Buy"
-
-            # Strength for trade notice
-            strength = self._signal_strength_rating(macd_hist_val, vol_change)
-            vol_display = strength["vol_rating"]
-
+            side       = "Buy"
+            reason_tag = c.get("reason", "signal")
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     await send_message(
-                        f"✅ *Trade Opened* — {sym} {side}\n"
+                        f"✅ Trade Opened — {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
-                        f"Strength: {strength['label']}\n"
-                        f"  MACD Hist: {macd_hist_val:+.6f}\n"
-                        f"  24h Vol Δ: {vol_display}\n"
                         f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                     )
                 except Exception:
@@ -1476,11 +1187,8 @@ class Scanner:
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
                 await send_message(
-                    f"📊 *Simulated Trade* — {sym} {side}\n"
+                    f"📊 Simulated Trade — {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
-                    f"Strength: {strength['label']}\n"
-                    f"  MACD Hist: {macd_hist_val:+.6f}\n"
-                    f"  24h Vol Δ: {vol_display}\n"
                     f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                 )
             # Remove from monitoring watch-list if it was queued there
@@ -1490,139 +1198,98 @@ class Scanner:
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
         """
-        Send structured Telegram push notices on each scan interval.
+        New Telegram summary layout:
 
-        LAYOUT
-        ──────
-        Block 1  — «Bybit Perps» header block
-                   Title, timestamp, per-TF signal counts, monitoring queue, open trades
+        First block:
+          - Bybit Perp Root summary (time + counts per root TF with windows: 1h=30, 4h=12, 1d=5)
+          - Listing of ALL root-tf signals (symbol | root | price) in the same first block
 
-        Block 2…N — One block per signal symbol, ordered:
-                    • All 1h root signals first (sorted by signal strength desc)
-                    • Then all 4h root signals
-                    • Then all 1d root signals
-                    Each block shows: symbol, price, MTF alignment / monitoring TFs,
-                    signal-strength rating (MACD histogram + 24h vol Δ combined).
+        Following blocks:
+          - One block per signal (ordered by ROOT_TFS: 1h -> 4h -> 1d)
+            Each block shows:
+              Bybit Perp | <root> Signal
+              Symbol, Price, MACD histogram (latest), 24h vol % change, MTF status (aligned/daily_rising/monitoring)
 
-        Last Block — Recommendations: top picks from accepted signals up to MAX_OPEN_TRADES
-
-        REPEAT LOGIC
-        ────────────
-        Signals are sent immediately on first detection.
-        A signal for (symbol, tf) is re-sent only when its MTF alignment snapshot
-        changes between scan intervals (e.g. last negative TF flips positive).
+        Last block:
+          - Recommended signals for trading (based on accepted candidates and remaining open slots)
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
-        # ── Block 1: Bybit Perps header ─────────────────────────────────────
-        tf_counts: Dict[str, int] = {}
-        for sig in root_signals:
-            rt = sig.get("root", "?")
-            tf_counts[rt] = tf_counts.get(rt, 0) + 1
-
-        header_lines = [
-            "📡 *Bybit Perps*",
-            f"🕐 {now_str}",
-        ]
-
-        if root_signals:
-            summary_parts = []
-            for rt in ROOT_TFS:
-                cnt = tf_counts.get(rt, 0)
-                if cnt:
-                    # Map numeric TF to human-readable
-                    tf_label = {"60": "1h", "240": "4h", "D": "1d", "1h": "1h", "4h": "4h", "1d": "1d"}.get(rt, rt)
-                    summary_parts.append(f"{tf_label} {cnt}")
-            header_lines.append("Signals: " + " │ ".join(summary_parts) if summary_parts else "Signals: 0")
-        else:
-            header_lines.append("No new root signals this interval.")
-
-        monitoring_count = len(self._mtf_monitoring)
-        if monitoring_count:
-            header_lines.append(f"⏳ Monitoring: {monitoring_count} pending MTF")
-
-        open_sum = self.trade_manager.summary() if hasattr(self.trade_manager, "summary") else []
-        if open_sum:
-            header_lines.append(f"📂 Open trades: {len(open_sum)}/{MAX_OPEN_TRADES}")
-
-        await send_message("\n".join(header_lines))
-
-        if not root_signals:
-            return
-
-        # ── Build evaluation lookup keyed by (symbol, root) ─────────────────
-        # Used as a cache: prefer pre-computed MTF from handle_root_signals when
-        # available, but always fall back to a fresh _compute_mtf_alignment call
-        # so the MTF status per block is NEVER left as "unknown".
+        # Build evaluation lookup keyed by (symbol, root)
         eval_map: Dict[tuple, Dict[str, Any]] = {}
         if evaluated:
             for e in evaluated:
                 eval_map[(e["symbol"], e["root"])] = e
 
-        # ── Blocks 2…N: per-symbol signal blocks ────────────────────────────
-        # Order: 1h → 4h → 1d  (ROOT_TFS order), within each TF sorted by strength desc
-        signal_tfs = [rt for rt in ROOT_TFS if rt in tf_counts]
-        accepted_signals: List[Dict[str, Any]] = []   # collect for recommendations block
+        # Block 1: overall summary + listing of all root-tf signals
+        tf_counts: Dict[str, int] = {}
+        for sig in root_signals:
+            rt = sig.get("root", "?")
+            tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
-        for rt in signal_tfs:
-            tf_label = {"60": "1h", "240": "4h", "D": "1d", "1h": "1h", "4h": "4h", "1d": "1d"}.get(rt, rt)
-            tf_sigs = [s for s in root_signals if s.get("root") == rt]
+        # Window sizes as requested (informational)
+        window_map = {"1h": 30, "4h": 12, "1d": 5}
+        header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
+        # Show root counts with window hint if available
+        for rt in ROOT_TFS:
+            cnt = tf_counts.get(rt, 0)
+            win = window_map.get(rt)
+            if cnt:
+                if win:
+                    header_lines.append(f"  {rt}: {cnt} (window: {win})")
+                else:
+                    header_lines.append(f"  {rt}: {cnt}")
 
-            # Attach strength rating to each sig for sorting
-            enriched = []
-            for sig in tf_sigs:
-                sym        = sig["symbol"]
-                ev         = eval_map.get((sym, rt), {})
-                macd_val   = float(ev.get("macd_hist_val") or (sig.get("hist") or [0.0])[-1] if sig.get("hist") else 0.0)
-                vol_change = sig.get("vol_change")
-                strength   = self._signal_strength_rating(macd_val, vol_change)
-                enriched.append((strength["score"], sig, ev, macd_val, vol_change, strength))
-
-            enriched.sort(key=lambda x: x[0], reverse=True)
-
-            for (_, sig, ev, macd_hist_val, vol_change, strength) in enriched:
+        header_lines.append("")
+        header_lines.append("Signals (all root TF signals):")
+        if not root_signals:
+            header_lines.append("  None")
+        else:
+            for sig in root_signals:
+                sym = sig.get("symbol")
+                rt = sig.get("root")
+                price = sig.get("price")
                 try:
-                    sym   = sig["symbol"]
-                    price = sig["price"]
-
-                    # ── MTF alignment: always use a live evaluation ───────────
-                    # eval_map may be empty (no root signals passed evaluated) or
-                    # the entry may exist but have stale / missing mtf_status.
-                    # Re-compute directly so the three Scenario rules always apply.
-                    ev_mtf_status = ev.get("mtf_status", "")
-                    if ev_mtf_status in ("aligned", "daily_rising", "monitoring"):
-                        # Trust the pre-computed result from handle_root_signals
-                        mtf_align    = {"status": ev_mtf_status, "tfs": ev.get("mtf", {}),
-                                        "negative_tfs": ev.get("negative_tfs", []),
-                                        "one_d_slope":  ev.get("one_d_slope")}
+                    if price >= 1000:
+                        price_str = f"${price:,.2f}"
+                    elif price >= 1:
+                        price_str = f"${price:.4f}"
                     else:
-                        # Fall back: compute fresh so State is never "❓ Unknown"
-                        mtf_align = self._compute_mtf_alignment(sym, price)
+                        price_str = f"${price:.8f}"
+                except Exception:
+                    price_str = str(price)
+                header_lines.append(f"  - {sym} | {rt} | {price_str}")
 
-                    mtf_status   = mtf_align["status"]           # "aligned" | "daily_rising" | "monitoring"
-                    mtf_tfs_state = mtf_align["tfs"]             # per-TF state dicts
-                    negative_tfs  = mtf_align.get("negative_tfs", [])
-                    one_d_slope   = mtf_align.get("one_d_slope")
+        first_block = "\n".join(header_lines)
+        try:
+            await send_message(first_block)
+        except Exception:
+            logger.exception("Failed to send first summary block")
 
-                    # Reflect fresh alignment back into ev so accepted_signals is accurate
-                    ev_accept = mtf_status in ("aligned", "daily_rising")
+        # Per-signal blocks ordered by ROOT_TFS (1h -> 4h -> 1d)
+        signal_tfs = [rt for rt in ROOT_TFS if rt in tf_counts]
+        for rt in signal_tfs:
+            tf_sigs = [s for s in root_signals if s.get("root") == rt]
+            tf_sigs_sorted = sorted(
+                tf_sigs,
+                key=lambda s: eval_map.get((s["symbol"], s["root"]), {}).get("score", 0.0),
+                reverse=True,
+            )
+            for sig in tf_sigs_sorted:
+                try:
+                    sym        = sig["symbol"]
+                    price      = sig["price"]
+                    vol_change = sig.get("vol_change")
+                    ev         = eval_map.get((sym, rt), {})
 
-                    # ── Dedup / repeat check ──────────────────────────────────
-                    snap_key   = self._mtf_snapshot_key({"tfs": mtf_tfs_state}) if mtf_tfs_state else ""
-                    signal_key = (sym, rt)
-                    last_snap  = self._sent_signal_mtf.get(signal_key)
+                    macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
+                    score         = float(ev.get("score")         or 0.0)
+                    mtf_tfs_state = ev.get("mtf", {})
+                    mtf_status    = ev.get("mtf_status", "unknown")
+                    negative_tfs  = ev.get("negative_tfs", [])
+                    one_d_slope   = ev.get("one_d_slope")
 
-                    if last_snap is not None and last_snap == snap_key:
-                        # MTF alignment unchanged — suppress repeat
-                        logger.debug("Signal suppressed (no MTF change): %s %s", sym, rt)
-                        if ev_accept:
-                            accepted_signals.append((strength["score"], sym, rt, price, vol_change, strength, ev))
-                        continue
-
-                    # Update snapshot
-                    self._sent_signal_mtf[signal_key] = snap_key
-
-                    # ── Price formatting ──────────────────────────────────────
+                    # Price formatting
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
                     elif price >= 1:
@@ -1630,74 +1297,76 @@ class Scanner:
                     else:
                         price_str = f"${price:.8f}"
 
-                    # ── State line — strictly one of three scenario labels ─────
-                    #   Scenario A → "✅ MTF Aligned"
-                    #   Scenario C → "📈 Daily Rising (1d slope …)"
-                    #   Scenario B → "⏳ Monitoring → waiting: <tfs>"
+                    # Format vol change %
+                    vol_str = "N/A"
+                    if vol_change is not None:
+                        try:
+                            vol_str = f"{vol_change * 100:+.1f}%"
+                        except Exception:
+                            vol_str = str(vol_change)
+
+                    # MTF state string e.g. "5m✅ 15m🔄 1h✅ 4h❌ 1d📈"
+                    mtf_str = self._build_mtf_state_str(mtf_tfs_state) if mtf_tfs_state else "N/A"
+
+                    # MTF status label (how it relates to acceptance rule)
                     if mtf_status == "aligned":
-                        align_str = "✅ MTF Aligned"
+                        state_str = "✅ Aligned (Accept)"
                     elif mtf_status == "daily_rising":
-                        slope_note = f" (1d slope {one_d_slope:+.4f})" if one_d_slope is not None else ""
-                        align_str = f"📈 Daily Rising{slope_note}"
-                    else:  # "monitoring"
-                        align_str = f"⏳ Monitoring → waiting: {', '.join(negative_tfs)}"
-
-                    # ── MTF row — icons derived strictly from active scenario ──
-                    mtf_str = self._build_mtf_state_str(mtf_tfs_state, scenario=mtf_status) if mtf_tfs_state else "N/A"
-
-                    # ── Volume gate indicator (display only; never hides signal) ──
-                    if vol_change is None:
-                        vol_gate_icon = "⚪"
-                    elif vol_change > VOLUME_MIN_CHANGE_PCT:
-                        vol_gate_icon = "✅"
+                        slope_note = f" (1d slope: {one_d_slope:+.4f})" if one_d_slope is not None else ""
+                        state_str = f"📈 Daily Rising (Accept){slope_note}"
+                    elif mtf_status == "monitoring":
+                        state_str = f"⏳ Monitoring (Not accepted yet)"
                     else:
-                        vol_gate_icon = "🚫"
+                        state_str = "❓ Unknown"
 
-                    block_lines = [
-                        f"📌 *Bybit Perp | {tf_label} Signal*",
-                        f"Symbol: `{sym}`",
-                        f"Price:  {price_str}",
-                        f"",
-                        f"Strength: {strength['label']}",
-                        f"  MACD Hist: {macd_hist_val:+.6f}  ({strength['macd_rating']})",
-                        f"  24h Vol Δ: {strength['vol_rating']} {vol_gate_icon}",
-                        f"",
+                    block = "\n".join([
+                        f"📌 Bybit Perp | {rt} Signal",
+                        f"Symbol: {sym}",
+                        f"Price: {price_str}",
+                        f"MACD H: {macd_hist_val:+.6f}",
+                        f"24h Vol Δ: {vol_str}",
                         f"MTF: {mtf_str}",
-                        f"State: {align_str}",
-                    ]
-                    await send_message("\n".join(block_lines))
-
-                    if ev_accept:
-                        accepted_signals.append((strength["score"], sym, rt, price, vol_change, strength, ev))
-
+                        f"MTF Status: {state_str}",
+                    ])
+                    await send_message(block)
                 except Exception:
                     logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
 
-        # ── Last Block: Recommendations ──────────────────────────────────────
-        if not accepted_signals:
-            return
+        # Last block: recommended signals for trading (depending on MAX_OPEN_TRADES)
+        try:
+            current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
+            remaining = max(0, MAX_OPEN_TRADES - current_open)
+            # Gather accepted candidates from evaluated
+            accepted = []
+            if evaluated:
+                for e in evaluated:
+                    if e.get("accept"):
+                        accepted.append(e)
+            accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
+            recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
-        accepted_signals.sort(key=lambda x: x[0], reverse=True)
-        top_n = accepted_signals[:MAX_OPEN_TRADES]
-
-        rec_lines = [
-            f"🏆 *Top Picks* (best {len(top_n)} of {len(accepted_signals)} aligned signals)",
-            f"Max open trades: {MAX_OPEN_TRADES}",
-            "",
-        ]
-        for rank, (score, sym, rt, price, vol_change, strength, ev) in enumerate(top_n, 1):
-            tf_label = {"60": "1h", "240": "4h", "D": "1d", "1h": "1h", "4h": "4h", "1d": "1d"}.get(rt, rt)
-            if price >= 1000:
-                price_str = f"${price:,.2f}"
-            elif price >= 1:
-                price_str = f"${price:.4f}"
+            rec_lines = [f"📣 Recommended Signals for Trading — {now_str}"]
+            rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
+            rec_lines.append(f"Slots available: {remaining}")
+            if not recommended:
+                rec_lines.append("No recommended signals to open at this time.")
             else:
-                price_str = f"${price:.8f}"
-            vol_pass = self._passes_volume_gate(vol_change)
-            gate_note = "" if vol_pass else " ⛔ vol gate"
-            rec_lines.append(f"{rank}. {sym} ({tf_label}) — {price_str} {strength['label']}{gate_note}")
+                for r in recommended:
+                    sym = r["symbol"]
+                    rt = r["root"]
+                    price = r["price"]
+                    score = r.get("score", 0.0)
+                    if price >= 1000:
+                        price_str = f"${price:,.2f}"
+                    elif price >= 1:
+                        price_str = f"${price:.4f}"
+                    else:
+                        price_str = f"${price:.8f}"
+                    rec_lines.append(f"  - {sym} | {rt} | {price_str} | score={score:.2f}")
 
-        await send_message("\n".join(rec_lines))
+            await send_message("\n".join(rec_lines))
+        except Exception:
+            logger.exception("Failed to send recommended signals block")
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

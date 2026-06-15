@@ -214,6 +214,17 @@ class Scanner:
             if USE_WS:
                 try:
                     await self.client.start_kline_ws()
+                    # Wire the scanner's kline store into the WS feed so live candle
+                    # pushes update kline_store — without this, WS data never reaches
+                    # compute_macd_for and the store stays at seed values forever.
+                    if hasattr(self.client, "register_kline_callback"):
+                        self.client.register_kline_callback(self._on_ws_kline)
+                        logger.info("WS kline callback registered → kline_store will receive live updates")
+                    else:
+                        logger.warning(
+                            "BybitClient has no register_kline_callback — "
+                            "kline_store will not receive WS updates; REST poller will compensate"
+                        )
                 except Exception:
                     logger.exception("Failed to start client WS")
             else:
@@ -492,11 +503,46 @@ class Scanner:
         
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
+    def _on_ws_kline(self, symbol: str, tf: str, kline: Dict[str, Any]):
+        """
+        Callback invoked by BybitClient for every WS kline push.
+        Updates kline_store in-place so compute_macd_for always sees live data.
+
+        Expected kline dict keys (normalized, same as _normalize_klines output):
+          close    : float  (required)
+          start_at : int    (candle open timestamp, optional)
+          volume   : float  (optional)
+        """
+        try:
+            close = kline.get("close")
+            if close is None:
+                return
+            close = float(close)
+            start_at = kline.get("start_at") or kline.get("start") or kline.get("t")
+            volume   = kline.get("volume") or kline.get("vol")
+            new_candle = {"start_at": start_at, "close": close, "volume": volume}
+
+            store = self.kline_store.setdefault(symbol, {})
+            lst   = store.get(tf, [])
+            if lst and lst[-1].get("start_at") == start_at:
+                lst[-1] = new_candle          # update current candle in-place
+            elif lst:
+                lst.append(new_candle)        # new candle opened
+                # Trim to avoid unbounded growth (keep SEED_KLINES_LIMIT candles)
+                if len(lst) > SEED_KLINES_LIMIT:
+                    store[tf] = lst[-SEED_KLINES_LIMIT:]
+            else:
+                store[tf] = [new_candle]      # first candle for this tf
+        except Exception:
+            logger.debug("_on_ws_kline error for %s %s", symbol, tf, exc_info=True)
+
     async def _rest_poller(self):
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
         poll_count = 0
         try:
-            while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
+            # Run REST poller unconditionally — even in WS mode it keeps kline_store
+            # updated for TFs or symbols where WS callback is not registered/firing.
+            while not self._stop:
                 poll_count += 1
                 if poll_count % 5 == 0:
                     logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
@@ -550,9 +596,6 @@ class Scanner:
 
                 elapsed = time.time() - start
                 to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
-                if USE_WS and self.client.is_ws_connected():
-                    logger.info("WS reconnected; stopping REST poller")
-                    break
                 await asyncio.sleep(to_sleep)
         except asyncio.CancelledError:
             logger.info("REST poller cancelled")

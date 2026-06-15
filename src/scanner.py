@@ -220,10 +220,13 @@ class Scanner:
                 logger.info("USE_WS is False; websocket startup and subscriptions skipped (REST-only mode)")
 
             if USE_WS and syms:
+                # Subscribe ROOT_TFS for flip detection + MTF_ALIGN_TFS (5m, 15m, 1h, 4h, 1d)
+                # for alignment checks. Deduped so overlapping TFs are not double-subscribed.
+                sub_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))
                 tasks = []
                 sem = asyncio.Semaphore(max(1, CONCURRENCY))
                 for sym in syms:
-                    for tf in ROOT_TFS:
+                    for tf in sub_tfs:
                         async def worker(s=sym, t=tf):
                             async with sem:
                                 try:
@@ -232,6 +235,10 @@ class Scanner:
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
+                logger.info(
+                    "WS subscribing %d symbols x %d TFs %s = %d streams",
+                    len(syms), len(sub_tfs), sub_tfs, len(syms) * len(sub_tfs),
+                )
                 if tasks:
                     await asyncio.gather(*tasks)
 
@@ -501,7 +508,12 @@ class Scanner:
 
                 async def poll_symbol(sym: str):
                     async with self.request_sem:
-                        for root in ROOT_TFS:
+                        # Poll ROOT_TFS for flip detection AND MTF_ALIGN_TFS for alignment checks.
+                        # Without polling 5m/15m here they stay at seed values and
+                        # _compute_mtf_alignment evaluates stale histograms, producing
+                        # wrong Scenario A/B/C outcomes.
+                        poll_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))  # deduped, order preserved
+                        for root in poll_tfs:
                             try:
                                 data = await self.client.get_klines(sym, root, limit=3)
                                 normalized = self._normalize_klines(data, root) if data else []
@@ -1014,11 +1026,17 @@ class Scanner:
                 await self._check_monitored_symbols()
 
                 if root_signals:
+                    # Ensure WS streams cover ROOT_TFS + MTF_ALIGN_TFS (5m, 15m) for every
+                    # signal symbol so alignment checks always use live candle data.
+                    _sub_tfs = list(dict.fromkeys(ROOT_TFS + MTF_ALIGN_TFS))
                     for sig in root_signals:
                         try:
                             sym = sig["symbol"]
                             if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                                await self.client.subscribe_mtf_for_symbol(sym, _sub_tfs)
+                            elif USE_WS and hasattr(self.client, "sub_kline"):
+                                for _tf in _sub_tfs:
+                                    await self.client.sub_kline(sym, _tf)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
                     evaluated = await self.handle_root_signals(root_signals)
@@ -1104,6 +1122,12 @@ class Scanner:
                     "negative_tfs": ["1d"],
                     "one_d_slope": one_d_slope,
                 }
+            # Scenario C not met: 1d negative but slope is flat/negative or no 1d data.
+            # Falls through to Scenario B (monitoring) — log so it's visible.
+            logger.debug(
+                "MTF Scenario C not met for %s: 1d negative, slope=%s (needs >0) — classifying as monitoring",
+                symbol, one_d_slope,
+            )
 
         # Scenario B: 1+ TFs negative and Scenario C not met
         return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}

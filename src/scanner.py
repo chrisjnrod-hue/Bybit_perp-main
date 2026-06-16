@@ -540,7 +540,7 @@ class Scanner:
                         pass
 
                 elapsed = time.time() - start
-                to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
+                to_sleep = max(0, REST_POLLER_INTERVAL - elapsed) if 'REST_POLLER_INTERVAL' in globals() else max(0, REST_POLL_INTERVAL - elapsed)
                 if USE_WS and self.client.is_ws_connected():
                     logger.info("WS reconnected; stopping REST poller")
                     break
@@ -1201,8 +1201,8 @@ class Scanner:
         New Telegram summary layout:
 
         First block:
-          - Bybit Perp Root summary (time + counts per root TF with windows: 1h=30, 4h=12, 1d=5)
-          - Listing of ALL root-tf signals (symbol | root | price) in the same first block
+          - Bybit Perp Root summary (time + counts per root TF with windows: 1h 30, 4h 12, 1d 5)
+          - Listing of ALL root-tf signals (symbol + price + root) in the same first block
 
         Following blocks:
           - One block per signal (ordered by ROOT_TFS: 1h -> 4h -> 1d)
@@ -1284,8 +1284,15 @@ class Scanner:
 
                     macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
                     score         = float(ev.get("score")         or 0.0)
-                    mtf_tfs_state = ev.get("mtf", {})
-                    mtf_status    = ev.get("mtf_status", "unknown")
+                    mtf_status    = ev.get("mtf_status")
+
+                    # If evaluated entry isn't available, compute MTF alignment to show exact status
+                    if not mtf_status:
+                        try:
+                            mtf_status = self._compute_mtf_alignment(sym, price)["status"]
+                        except Exception:
+                            mtf_status = "unknown"
+
                     negative_tfs  = ev.get("negative_tfs", [])
                     one_d_slope   = ev.get("one_d_slope")
 
@@ -1305,9 +1312,6 @@ class Scanner:
                         except Exception:
                             vol_str = str(vol_change)
 
-                    # MTF state string e.g. "5m✅ 15m🔄 1h✅ 4h❌ 1d📈"
-                    mtf_str = self._build_mtf_state_str(mtf_tfs_state) if mtf_tfs_state else "N/A"
-
                     # MTF status label (how it relates to acceptance rule)
                     if mtf_status == "aligned":
                         state_str = "✅ Aligned (Accept)"
@@ -1325,7 +1329,6 @@ class Scanner:
                         f"Price: {price_str}",
                         f"MACD H: {macd_hist_val:+.6f}",
                         f"24h Vol Δ: {vol_str}",
-                        f"MTF: {mtf_str}",
                         f"MTF Status: {state_str}",
                     ])
                     await send_message(block)

@@ -1,10 +1,17 @@
 # Updated scanner (diagnostic) with websocket subscriptions for 5m & 15m,
-# removed telegram monitoring alerts, and reworked telegram summary layout:
+# removed telegram monitoring alerts, reworked MTF acceptance logic (A/B/C),
+# and reworked telegram summary layout:
 #  - First block: Bybit Perp Root summary + listing of all root-tf signals
 #  - Following blocks: one block per signal ordered by root TFs (1h -> 4h -> 1d)
 #  - Last block: recommended signals for trading limited by MAX_OPEN_TRADES
 #
-# This replaces the prior behavior that sent monitoring/partial alerts via Telegram.
+# MTF acceptance rules implemented strictly:
+#  A — All TFs positive OR flipped positive on current candle -> accept
+#  C — Only 1d negative but 1d slope > 0 -> accept
+#  B — Any other negative TFs -> monitoring (not accepted yet)
+#
+# The per-signal telegram block shows a single MTF Status label that strictly
+# reflects the computed mtf_status and whether it is accepted (mtf_accept).
 
 import os
 import asyncio
@@ -540,7 +547,7 @@ class Scanner:
                         pass
 
                 elapsed = time.time() - start
-                to_sleep = max(0, REST_POLLER_INTERVAL - elapsed) if 'REST_POLLER_INTERVAL' in globals() else max(0, REST_POLL_INTERVAL - elapsed)
+                to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
                 if USE_WS and self.client.is_ws_connected():
                     logger.info("WS reconnected; stopping REST poller")
                     break
@@ -913,14 +920,10 @@ class Scanner:
 
         Returns dict:
           status       : "aligned" | "daily_rising" | "monitoring"
-          tfs          : per-TF state dicts (cur, prev, is_positive, is_flip, slope)
-          negative_tfs : list of TF names with non-positive histogram
+          tfs          : per-TF state dicts (cur, prev, is_positive, is_flip, slope, positive_or_flip)
+          negative_tfs : list of TF names with non-positive_or_flip histogram
           one_d_slope  : 1d slope value (Scenario C only, else None)
-
-        Scenarios:
-          A — all TFs positive (a flip, prev<0→cur>0, counts as positive) → "aligned"
-          C — only 1d negative but histogram rising (upward slope)        → "daily_rising"
-          B — 1+ TFs negative (not meeting C)                             → "monitoring"
+          accept       : boolean indicating whether MTF acceptance rules are met
         """
         tf_states: Dict[str, Dict[str, Any]] = {}
         negative_tfs: List[str] = []
@@ -933,20 +936,28 @@ class Scanner:
             prev = hist[-2] if len(hist) >= 2 else None
             is_positive = cur is not None and cur > 0
             is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
+            positive_or_flip = is_positive or is_flip
             tf_states[tf] = {
                 "cur": cur, "prev": prev,
                 "is_positive": is_positive, "is_flip": is_flip, "slope": None,
+                "positive_or_flip": positive_or_flip,
             }
             if tf == "1d":
                 one_d_hist = hist
-            if not is_positive:
+            if not positive_or_flip:
                 negative_tfs.append(tf)
 
-        # Scenario A: all TFs positive
+        # Scenario A: all TFs positive or flipped positive
         if not negative_tfs:
-            return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
+            return {
+                "status": "aligned",
+                "tfs": tf_states,
+                "negative_tfs": [],
+                "one_d_slope": None,
+                "accept": True,
+            }
 
-        # Scenario C: only 1d is negative but rising
+        # Scenario C: only 1d is negative but rising slope
         if negative_tfs == ["1d"]:
             one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
             if one_d_slope is not None and one_d_slope > 0:
@@ -956,21 +967,24 @@ class Scanner:
                     "tfs": tf_states,
                     "negative_tfs": ["1d"],
                     "one_d_slope": one_d_slope,
+                    "accept": True,
                 }
 
         # Scenario B: 1+ TFs negative and Scenario C not met
-        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
+        return {
+            "status": "monitoring",
+            "tfs": tf_states,
+            "negative_tfs": negative_tfs,
+            "one_d_slope": None,
+            "accept": False,
+        }
 
     def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
         """
-        Build compact MTF state string for Telegram.
+        Build compact MTF state string for debugging or optional display.
         Example: '5m✅ 15m🔄 1h✅ 4h❌ 1d📈'
-
-        Legend:
-          ✅  positive histogram
-          🔄  just flipped positive (prev<0 → cur>0) this candle open
-          📈  negative but rising slope (1d Scenario C)
-          ❌  negative
+        (This helper remains available but per-signal telegram blocks use only the
+         single authoritative MTF Status label.)
         """
         parts = []
         for tf in MTF_ALIGN_TFS:
@@ -990,9 +1004,7 @@ class Scanner:
         Scenario B monitor: re-evaluate symbols waiting for their last negative TF
         to flip positive on the current candle open.
 
-        NOTE: Monitoring alerts/partial updates are intentionally NOT sent via Telegram
-        per requested update — monitoring is internal only. When monitoring resolves,
-        the symbol is queued for handling via handle_root_signals (no direct send_message here).
+        NOTE: Monitoring alerts/partial updates are intentionally NOT sent via Telegram.
         """
         if not self._mtf_monitoring:
             return
@@ -1024,8 +1036,9 @@ class Scanner:
 
                 mtf_align = self._compute_mtf_alignment(sym, price)
                 status = mtf_align["status"]
+                accepted = bool(mtf_align.get("accept", False))
 
-                if status in ("aligned", "daily_rising"):
+                if accepted:
                     logger.info("MONITORING RESOLVED: %s → %s — queuing trade open", sym, status)
                     to_remove.append(sym)
                     newly_aligned.append({
@@ -1056,11 +1069,7 @@ class Scanner:
         """
         Evaluate MTF alignment for each root signal and act on each scenario.
 
-        Scenario A  (aligned)       — all 5 MTF TFs positive → open trade if TRADE_ENABLED
-        Scenario C  (daily_rising)  — only 1d negative but rising slope → open trade
-        Scenario B  (monitoring)    — 1+ TFs negative → add to watch-list until last flip
-
-        Returns the full evaluated list consumed by send_summary for block formatting.
+        Now uses the explicit mtf_accept boolean returned by _compute_mtf_alignment.
         """
         evaluated: List[Dict[str, Any]] = []
         to_open:   List[Dict[str, Any]] = []
@@ -1078,10 +1087,11 @@ class Scanner:
                 hist = hist or []
             macd_hist_val = hist[-1] if hist else 0.0
 
-            # Evaluate MTF alignment (Scenarios A / B / C)
+            # Evaluate MTF alignment (Scenarios A / B / C) and acceptance
             mtf_align    = self._compute_mtf_alignment(sym, price)
             mtf_status   = mtf_align["status"]
             negative_tfs = mtf_align.get("negative_tfs", [])
+            mtf_accept   = bool(mtf_align.get("accept", False))
 
             # Composite score for ranking
             score  = sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive"))
@@ -1090,39 +1100,40 @@ class Scanner:
                 score += min(vol_change, 1.0)
 
             entry: Dict[str, Any] = {
-                "symbol":       sym,
-                "root":         root,
-                "price":        price,
-                "hist":         hist,
+                "symbol":        sym,
+                "root":          root,
+                "price":         price,
+                "hist":          hist,
                 "macd_hist_val": macd_hist_val,
-                "mtf":          mtf_align["tfs"],
-                "mtf_status":   mtf_status,
-                "negative_tfs": negative_tfs,
-                "one_d_slope":  mtf_align.get("one_d_slope"),
-                "vol_change":   vol_change,
-                "score":        score,
-                "accept":       False,
-                "reason":       "pending",
+                "mtf":           mtf_align["tfs"],
+                "mtf_status":    mtf_status,
+                "mtf_accept":    mtf_accept,
+                "negative_tfs":  negative_tfs,
+                "one_d_slope":   mtf_align.get("one_d_slope"),
+                "vol_change":    vol_change,
+                "score":         score,
+                "accept":        False,   # trade-level accept flag
+                "reason":        "pending",
             }
 
-            if mtf_status in ("aligned", "daily_rising"):
+            # If the MTF check accepted the symbol, mark the entry for trade-opening
+            if mtf_accept:
                 entry["accept"] = True
                 entry["reason"] = mtf_status
                 to_open.append(entry)
                 logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
-
-            elif mtf_status == "monitoring":
+            else:
+                # Monitoring: add to internal watch-list (no telegram alerts here)
                 entry["reason"] = "monitoring"
                 if sym not in self._mtf_monitoring:
                     self._mtf_monitoring[sym] = {
-                        "root":        root,
-                        "price":       price,
-                        "started_at":  time.time(),
+                        "root":         root,
+                        "price":        price,
+                        "started_at":   time.time(),
                         "negative_tfs": list(negative_tfs),
-                        "last_alert":  0.0,
+                        "last_alert":   0.0,
                     }
                     logger.info("MTF MONITORING: %s added — waiting on: %s", sym, negative_tfs)
-                    # NOTE: Monitoring alerts to Telegram were intentionally removed
 
             evaluated.append(entry)
 
@@ -1198,7 +1209,7 @@ class Scanner:
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
         """
-        New Telegram summary layout:
+        Telegram summary layout:
 
         First block:
           - Bybit Perp Root summary (time + counts per root TF with windows: 1h 30, 4h 12, 1d 5)
@@ -1208,7 +1219,8 @@ class Scanner:
           - One block per signal (ordered by ROOT_TFS: 1h -> 4h -> 1d)
             Each block shows:
               Bybit Perp | <root> Signal
-              Symbol, Price, MACD histogram (latest), 24h vol % change, MTF status (aligned/daily_rising/monitoring)
+              Symbol, Price, MACD histogram (latest), 24h vol % change, MTF Status (aligned/daily_rising/monitoring)
+              The block uses the evaluated mtf_status and mtf_accept fields (if available).
 
         Last block:
           - Recommended signals for trading (based on accepted candidates and remaining open slots)
@@ -1280,21 +1292,22 @@ class Scanner:
                     sym        = sig["symbol"]
                     price      = sig["price"]
                     vol_change = sig.get("vol_change")
-                    ev         = eval_map.get((sym, rt), {})
-
-                    macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
-                    score         = float(ev.get("score")         or 0.0)
-                    mtf_status    = ev.get("mtf_status")
+                    ev         = eval_map.get((sym, rt))
 
                     # If evaluated entry isn't available, compute MTF alignment to show exact status
-                    if not mtf_status:
-                        try:
-                            mtf_status = self._compute_mtf_alignment(sym, price)["status"]
-                        except Exception:
-                            mtf_status = "unknown"
-
-                    negative_tfs  = ev.get("negative_tfs", [])
-                    one_d_slope   = ev.get("one_d_slope")
+                    if ev:
+                        macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
+                        mtf_status = ev.get("mtf_status")
+                        mtf_accept = bool(ev.get("mtf_accept", False))
+                        one_d_slope = ev.get("one_d_slope")
+                    else:
+                        # Fallback: compute a minimal set to present status
+                        _, _, h = self.compute_macd_for(sym, rt, include_price=price, use_ws_current=True)
+                        macd_hist_val = float(h[-1]) if h else 0.0
+                        mtf_align = self._compute_mtf_alignment(sym, price)
+                        mtf_status = mtf_align.get("status", "unknown")
+                        mtf_accept = bool(mtf_align.get("accept", False))
+                        one_d_slope = mtf_align.get("one_d_slope")
 
                     # Price formatting
                     if price >= 1000:
@@ -1312,14 +1325,14 @@ class Scanner:
                         except Exception:
                             vol_str = str(vol_change)
 
-                    # MTF status label (how it relates to acceptance rule)
+                    # MTF status label (strictly reflect alignment check & acceptance)
                     if mtf_status == "aligned":
-                        state_str = "✅ Aligned (Accept)"
+                        state_str = "✅ Aligned (Accept)" if mtf_accept else "✅ Aligned"
                     elif mtf_status == "daily_rising":
                         slope_note = f" (1d slope: {one_d_slope:+.4f})" if one_d_slope is not None else ""
-                        state_str = f"📈 Daily Rising (Accept){slope_note}"
+                        state_str = f"📈 Daily Rising (Accept){slope_note}" if mtf_accept else f"📈 Daily Rising{slope_note}"
                     elif mtf_status == "monitoring":
-                        state_str = f"⏳ Monitoring (Not accepted yet)"
+                        state_str = "⏳ Monitoring (Not accepted yet)"
                     else:
                         state_str = "❓ Unknown"
 

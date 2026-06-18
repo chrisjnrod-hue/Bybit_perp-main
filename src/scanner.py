@@ -5,8 +5,7 @@
 #  - Last block: recommended signals for trading limited by MAX_OPEN_TRADES
 #
 # This replaces the prior behavior that sent monitoring/partial alerts via Telegram.
-# NOTE: Only the MTF alignment logic and MTF status representation were changed.
-# Everything else was preserved from your original file.
+# NOTE: MTF_ALIGN diagnostic logging added to trace alignment checks
 
 import os
 import asyncio
@@ -713,32 +712,6 @@ class Scanner:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
 
-    # ------------------------------------------------------------------
-    # Helper: Get last N numeric (non-None) values from histogram list
-    # ------------------------------------------------------------------
-    def _last_n_numeric(self, hist: List[Optional[float]], n: int = 2) -> List[Optional[float]]:
-        """
-        Return last n numeric values from hist skipping None.
-        If fewer than n numeric values exist, pad with None on the left.
-        Example: hist=[None, -0.2, 0.1] -> _last_n_numeric(hist,2) => [-0.2, 0.1]
-        """
-        if not hist:
-            return [None] * n
-        nums: List[float] = []
-        for v in reversed(hist):
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except Exception:
-                continue
-            nums.append(fv)
-            if len(nums) >= n:
-                break
-        nums = list(reversed(nums))
-        pad = [None] * (n - len(nums))
-        return pad + nums
-
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
@@ -935,98 +908,84 @@ class Scanner:
     # MTF Alignment helpers
     # ------------------------------------------------------------------
 
-    def _compute_mtf_alignment(self, symbol: str, price: float, root_tf: Optional[str] = None) -> Dict[str, Any]:
+    def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
         """
         Evaluate MTF alignment across MTF_ALIGN_TFS = [5m, 15m, 1h, 4h, 1d].
 
-        Strict rules (applied AFTER a root flip):
-          1) If ALL checked TFs are positive (positive includes a flip prev<0->cur>0) -> "aligned"
-          2) If one or more TFs are negative -> "monitoring" (wait until they flip)
-          3) If the ONLY negative TF is the 1d, accept only if 1d is rising (cur > prev) -> "daily_rising"
+        Returns dict:
+          status       : "aligned" | "daily_rising" | "monitoring"
+          tfs          : per-TF state dicts (cur, prev, is_positive, is_flip, slope)
+          negative_tfs : list of TF names with non-positive histogram
+          one_d_slope  : 1d slope value (Scenario C only, else None)
 
-        root_tf (optional) — if provided the root timeframe is excluded from the higher-TF check
-        Returns:
-          {
-            "status": "aligned" | "daily_rising" | "monitoring",
-            "tfs": {tf: {"cur": float|None, "prev": float|None, "is_positive": bool, "is_flip": bool, "slope": Optional[float], "raw_len": int}},
-            "negative_tfs": [...],
-            "one_d_slope": Optional[float]
-          }
+        Scenarios:
+          A — all TFs positive (a flip, prev<0→cur>0, counts as positive) → "aligned"
+          C — only 1d negative but histogram rising (upward slope)        → "daily_rising"
+          B — 1+ TFs negative (not meeting C)                             → "monitoring"
         """
         tf_states: Dict[str, Dict[str, Any]] = {}
         negative_tfs: List[str] = []
-        one_d_hist_numeric: List[float] = []
-        one_d_slope: Optional[float] = None
+        one_d_hist: List[float] = []
+
+        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
 
         for tf in MTF_ALIGN_TFS:
-            # don't include the root timeframe in the acceptance decision (we're checking other TFs)
-            if root_tf is not None and tf == root_tf:
-                tf_states[tf] = {"cur": None, "prev": None, "is_positive": True, "is_flip": False, "slope": None, "raw_len": 0}
-                continue
-
             _, _, hist = self.compute_macd_for(symbol, tf, include_price=price, use_ws_current=True)
             hist = hist or []
-
-            # Get last two numeric values (skip None). _last_n_numeric returns [prev, cur]
-            prev, cur = self._last_n_numeric(hist, n=2)
-
-            is_flip = (prev is not None and prev < 0 and cur is not None and cur > 0)
-            is_positive = (cur is not None and cur > 0) or is_flip
-
+            cur  = hist[-1] if hist else None
+            prev = hist[-2] if len(hist) >= 2 else None
+            is_positive = cur is not None and cur > 0
+            is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
+            
+            # *** DIAGNOSTIC LOG FOR EACH TF ***
+            numeric_count = sum(1 for v in hist if v is not None)
+            logger.warning(
+                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
+                tf,
+                len(hist),
+                numeric_count,
+                f"{prev:.8f}" if prev is not None else "None",
+                f"{cur:.8f}" if cur is not None else "None",
+                is_positive,
+                is_flip
+            )
+            
             tf_states[tf] = {
-                "cur": cur,
-                "prev": prev,
-                "is_positive": bool(is_positive),
-                "is_flip": bool(is_flip),
-                "slope": None,
-                "raw_len": len(hist),
+                "cur": cur, "prev": prev,
+                "is_positive": is_positive, "is_flip": is_flip, "slope": None,
             }
-
-            # Determine "negative" membership conservatively:
-            # - If current numeric value exists and <= 0 -> negative
-            # - If no numeric history at all -> treat as negative (conservative)
-            # - If current is None but older numeric exists -> use last numeric sign
-            if cur is None:
-                numeric_present = any(v is not None for v in hist)
-                if not numeric_present:
-                    negative_tfs.append(tf)
-                else:
-                    # find last numeric
-                    last_numeric = None
-                    for v in reversed(hist):
-                        if v is not None:
-                            try:
-                                last_numeric = float(v)
-                            except Exception:
-                                last_numeric = None
-                            break
-                    if last_numeric is None or last_numeric <= 0:
-                        negative_tfs.append(tf)
-            else:
-                if not is_positive:
-                    negative_tfs.append(tf)
-
-            # capture 1d numeric series for slope calculation
             if tf == "1d":
-                one_d_hist_numeric = [float(v) for v in hist if v is not None]
-                if len(one_d_hist_numeric) >= 2:
-                    # compute simple slope (difference of last two numeric histogram values)
-                    one_d_slope = one_d_hist_numeric[-1] - one_d_hist_numeric[-2]
-                    tf_states[tf]["slope"] = one_d_slope
+                one_d_hist = hist
+            if not is_positive:
+                negative_tfs.append(tf)
+                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
+
+        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
 
         # Scenario A: all TFs positive
         if not negative_tfs:
+            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
             return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
 
         # Scenario C: only 1d is negative but rising
         if negative_tfs == ["1d"]:
+            one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
+            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
             if one_d_slope is not None and one_d_slope > 0:
-                # annotate slope on state and accept
                 tf_states["1d"]["slope"] = one_d_slope
-                return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["1d"], "one_d_slope": one_d_slope}
+                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only 1d negative but slope=%.8f > 0)", symbol, one_d_slope)
+                return {
+                    "status": "daily_rising",
+                    "tfs": tf_states,
+                    "negative_tfs": ["1d"],
+                    "one_d_slope": one_d_slope,
+                }
+            else:
+                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
 
-        # Scenario B: monitoring (1+ TFs negative and Scenario C not met)
-        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": one_d_slope}
+        # Scenario B: 1+ TFs negative and Scenario C not met
+        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
+        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
         """
@@ -1089,9 +1048,7 @@ class Scanner:
                 if price is None:
                     continue
 
-                # Pass root timeframe so it is excluded from the higher-TF check
-                root_tf = info.get("root")
-                mtf_align = self._compute_mtf_alignment(sym, price, root_tf=root_tf)
+                mtf_align = self._compute_mtf_alignment(sym, price)
                 status = mtf_align["status"]
 
                 if status in ("aligned", "daily_rising"):
@@ -1148,16 +1105,13 @@ class Scanner:
             macd_hist_val = hist[-1] if hist else 0.0
 
             # Evaluate MTF alignment (Scenarios A / B / C)
-            # Pass root so that root TF is excluded from higher-TF checks
-            mtf_align    = self._compute_mtf_alignment(sym, price, root_tf=root)
+            mtf_align    = self._compute_mtf_alignment(sym, price)
             mtf_status   = mtf_align["status"]
             negative_tfs = mtf_align.get("negative_tfs", [])
-            one_d_slope  = mtf_align.get("one_d_slope")
-            tf_states    = mtf_align.get("tfs", {})
 
             # Composite score for ranking
-            score  = sum(1.0 for d in tf_states.values() if d.get("is_positive"))
-            score += sum(0.5 for d in tf_states.values() if d.get("is_flip"))
+            score  = sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive"))
+            score += sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip"))
             if vol_change is not None and vol_change > 0:
                 score += min(vol_change, 1.0)
 
@@ -1167,10 +1121,10 @@ class Scanner:
                 "price":        price,
                 "hist":         hist,
                 "macd_hist_val": macd_hist_val,
-                "mtf":          tf_states,
+                "mtf":          mtf_align["tfs"],
                 "mtf_status":   mtf_status,
                 "negative_tfs": negative_tfs,
-                "one_d_slope":  one_d_slope,
+                "one_d_slope":  mtf_align.get("one_d_slope"),
                 "vol_change":   vol_change,
                 "score":        score,
                 "accept":       False,
@@ -1361,14 +1315,12 @@ class Scanner:
                     # If evaluated entry isn't available, compute MTF alignment to show exact status
                     if not mtf_status:
                         try:
-                            # Pass root tf so display matches acceptance logic
-                            mtf_status = self._compute_mtf_alignment(sym, price, root_tf=rt)["status"]
+                            mtf_status = self._compute_mtf_alignment(sym, price)["status"]
                         except Exception:
                             mtf_status = "unknown"
 
                     negative_tfs  = ev.get("negative_tfs", [])
                     one_d_slope   = ev.get("one_d_slope")
-                    tf_states     = ev.get("mtf", {})
 
                     # Price formatting
                     if price >= 1000:
@@ -1397,9 +1349,6 @@ class Scanner:
                     else:
                         state_str = "❓ Unknown"
 
-                    # Build compact MTF state visual
-                    mtf_visual = self._build_mtf_state_str(tf_states) if tf_states else ""
-
                     block = "\n".join([
                         f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
@@ -1407,7 +1356,6 @@ class Scanner:
                         f"MACD H: {macd_hist_val:+.6f}",
                         f"24h Vol Δ: {vol_str}",
                         f"MTF Status: {state_str}",
-                        f"MTF: {mtf_visual}",
                     ])
                     await send_message(block)
                 except Exception:

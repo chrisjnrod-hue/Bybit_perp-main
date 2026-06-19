@@ -6,6 +6,7 @@
 #
 # This replaces the prior behavior that sent monitoring/partial alerts via Telegram.
 # NOTE: MTF_ALIGN diagnostic logging added to trace alignment checks
+# NOTE: REST poller now includes 5m/15m fallback with WS as primary option
 
 import os
 import asyncio
@@ -233,11 +234,13 @@ class Scanner:
                                 try:
                                     if hasattr(self.client, "sub_kline"):
                                         await self.client.sub_kline(s, t)
+                                        logger.debug("[WS_SUB] Successfully subscribed to %s %s", s, t)
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
                 if tasks:
                     await asyncio.gather(*tasks)
+                logger.info("[DIAGNOSTIC] WS subscriptions complete for %d timeframes", len(tasks))
 
             await self._ensure_rest_poller()
             logger.info("[DIAGNOSTIC] discover_symbols: COMPLETE - ready to scan")
@@ -377,9 +380,6 @@ class Scanner:
                     len(out)
                 )
 
-                # IMPORTANT:
-                # Keep current candle for live MACD flip detection
-
             except Exception:
                 logger.exception("Error evaluating candle status")
         return out
@@ -468,7 +468,10 @@ class Scanner:
                 except Exception:
                     klines_sorted = valid
                 self.kline_store[symbol][tf] = klines_sorted
-                logger.debug("Seeded %s %s candles=%d", symbol, tf, len(klines_sorted))
+                
+                # *** DIAGNOSTIC: Log seeding completion ***
+                logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
+                
                 await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
@@ -490,13 +493,19 @@ class Scanner:
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
-        logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
+        """
+        REST poller that falls back when WS is unavailable.
+        Polls both ROOT_TFS and short MTF TFs (5m, 15m) to ensure 5m/15m data is always available.
+        """
+        logger.info("REST poller started (interval=%s seconds) - PRIMARY FALLBACK FOR 5m/15m DATA", REST_POLL_INTERVAL)
         poll_count = 0
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
                 poll_count += 1
                 if poll_count % 5 == 0:
-                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
+                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d, USE_WS=%s, WS_CONNECTED=%s", 
+                               poll_count, len(self.symbols), USE_WS, 
+                               self.client.is_ws_connected() if hasattr(self.client, 'is_ws_connected') else "N/A")
                 
                 start = time.time()
                 if not self.symbols:
@@ -505,30 +514,47 @@ class Scanner:
 
                 async def poll_symbol(sym: str):
                     async with self.request_sem:
-                        for root in ROOT_TFS:
+                        # Poll both ROOT_TFS and short MTF TFs (5m, 15m)
+                        # This ensures 5m/15m data is always available, even if WS fails
+                        tfs_to_poll = list(set(ROOT_TFS + ["5m", "15m"]))
+                        
+                        for tf in tfs_to_poll:
                             try:
-                                data = await self.client.get_klines(sym, root, limit=3)
-                                normalized = self._normalize_klines(data, root) if data else []
+                                data = await self.client.get_klines(sym, tf, limit=3)
+                                normalized = self._normalize_klines(data, tf) if data else []
+                                
                                 if normalized:
-                                    lst = self.kline_store.get(sym, {}).get(root, [])
+                                    lst = self.kline_store.get(sym, {}).get(tf, [])
                                     last_new = None
+                                    
+                                    # Find the last valid candle
                                     for c in reversed(normalized):
                                         if c.get("close") is not None:
-                                            last_new = {"start_at": c.get("start_at"), "close": float(c.get("close")), "volume": c.get("volume")}
+                                            last_new = {
+                                                "start_at": c.get("start_at"), 
+                                                "close": float(c.get("close")), 
+                                                "volume": c.get("volume")
+                                            }
                                             break
+                                    
                                     if last_new:
                                         if lst:
                                             try:
+                                                # Update existing or append new candle
                                                 if lst[-1].get("start_at") == last_new.get("start_at"):
                                                     lst[-1] = last_new
                                                 else:
                                                     lst.append(last_new)
                                             except Exception:
-                                                self.kline_store.setdefault(sym, {})[root] = [last_new]
+                                                self.kline_store.setdefault(sym, {})[tf] = [last_new]
                                         else:
-                                            self.kline_store.setdefault(sym, {})[root] = [last_new]
+                                            self.kline_store.setdefault(sym, {})[tf] = [last_new]
+                                        
+                                        # Log 5m/15m updates for diagnostics
+                                        if tf in ["5m", "15m"]:
+                                            logger.debug("[REST_POLLER_UPDATE] %s %s: updated kline (close=%.8f)", sym, tf, last_new["close"])
                             except Exception:
-                                logger.debug("REST poll kline failed for %s %s", sym, root, exc_info=True)
+                                logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
                     if self._stop:
@@ -541,10 +567,13 @@ class Scanner:
                         pass
 
                 elapsed = time.time() - start
-                to_sleep = max(0, REST_POLLER_INTERVAL - elapsed) if 'REST_POLLER_INTERVAL' in globals() else max(0, REST_POLL_INTERVAL - elapsed)
+                to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
+                
+                # Check if WS reconnected
                 if USE_WS and self.client.is_ws_connected():
-                    logger.info("WS reconnected; stopping REST poller")
+                    logger.info("WS reconnected; stopping REST poller (WS is primary)")
                     break
+                
                 await asyncio.sleep(to_sleep)
         except asyncio.CancelledError:
             logger.info("REST poller cancelled")
@@ -553,16 +582,27 @@ class Scanner:
         logger.info("REST poller stopped")
 
     async def _ensure_rest_poller(self):
+        """
+        Ensure REST poller is running as fallback when WS is unavailable.
+        - If WS is connected, stop REST poller (WS is primary)
+        - If WS is not connected, ensure REST poller is running (fallback mode)
+        """
         if USE_WS and self.client.is_ws_connected():
+            # WS is connected, stop REST poller if running
             if self._rest_poller_task and not self._rest_poller_task.done():
                 try:
                     self._rest_poller_task.cancel()
+                    logger.info("[REST_POLLER_STOP] WS connected, stopping REST poller (WS is primary)")
                 except Exception:
                     pass
                 self._rest_poller_task = None
             return
+        
+        # WS is not available, ensure REST poller is running
         if self._rest_poller_task and not self._rest_poller_task.done():
             return
+        
+        logger.info("[REST_POLLER_START] WS unavailable, starting REST poller as fallback")
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
@@ -576,6 +616,7 @@ class Scanner:
                     closes.append(float(c))
             except Exception:
                 continue
+        
         # Replace current candle close instead of appending fake candle
         if include_price is not None:
             if closes:
@@ -622,19 +663,17 @@ class Scanner:
                 logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
-            # ============ IMPROVED FLIP DETECTION WITH NOISE FILTER ============
             zero_cross = prev <= 0 and cur > 0
             hist_change = cur - prev
-            strong_flip = True
             result = zero_cross
             
             if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, strong=%s, FLIP=%s", 
-                           symbol, tf, prev, cur, hist_change, zero_cross, strong_flip, result)
+                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, FLIP=%s", 
+                           symbol, tf, prev, cur, hist_change, zero_cross, result)
             
             if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, threshold=%s, flip=%s", 
-                           symbol, tf, prev, cur, hist_threshold, result)
+                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, flip=%s", 
+                           symbol, tf, prev, cur, result)
             
             if result and DEBUG_SURGICAL_LOGS:
                 logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f -> cur=%.8f (change=%.8f)", 
@@ -1148,7 +1187,6 @@ class Scanner:
                         "last_alert":  0.0,
                     }
                     logger.info("MTF MONITORING: %s added — waiting on: %s", sym, negative_tfs)
-                    # NOTE: Monitoring alerts to Telegram were intentionally removed
 
             evaluated.append(entry)
 
@@ -1224,20 +1262,7 @@ class Scanner:
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
         """
-        New Telegram summary layout:
-
-        First block:
-          - Bybit Perp Root summary (time + counts per root TF with windows: 1h 30, 4h 12, 1d 5)
-          - Listing of ALL root-tf signals (symbol + price + root) in the same first block
-
-        Following blocks:
-          - One block per signal (ordered by ROOT_TFS: 1h -> 4h -> 1d)
-            Each block shows:
-              Bybit Perp | <root> Signal
-              Symbol, Price, MACD histogram (latest), 24h vol % change, MTF status (aligned/daily_rising/monitoring)
-
-        Last block:
-          - Recommended signals for trading (based on accepted candidates and remaining open slots)
+        New Telegram summary layout with MTF alignment visualization
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -1253,10 +1278,8 @@ class Scanner:
             rt = sig.get("root", "?")
             tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
-        # Window sizes as requested (informational)
         window_map = {"1h": 30, "4h": 12, "1d": 5}
         header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
-        # Show root counts with window hint if available
         for rt in ROOT_TFS:
             cnt = tf_counts.get(rt, 0)
             win = window_map.get(rt)
@@ -1311,6 +1334,7 @@ class Scanner:
                     macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
                     score         = float(ev.get("score")         or 0.0)
                     mtf_status    = ev.get("mtf_status")
+                    mtf_tfs       = ev.get("mtf", {})
 
                     # If evaluated entry isn't available, compute MTF alignment to show exact status
                     if not mtf_status:
@@ -1338,6 +1362,9 @@ class Scanner:
                         except Exception:
                             vol_str = str(vol_change)
 
+                    # Build MTF state visualization
+                    mtf_state_str = self._build_mtf_state_str(mtf_tfs) if mtf_tfs else "N/A"
+
                     # MTF status label (how it relates to acceptance rule)
                     if mtf_status == "aligned":
                         state_str = "✅ Aligned (Accept)"
@@ -1355,7 +1382,8 @@ class Scanner:
                         f"Price: {price_str}",
                         f"MACD H: {macd_hist_val:+.6f}",
                         f"24h Vol Δ: {vol_str}",
-                        f"MTF Status: {state_str}",
+                        f"MTF State: {mtf_state_str}",
+                        f"Status: {state_str}",
                     ])
                     await send_message(block)
                 except Exception:

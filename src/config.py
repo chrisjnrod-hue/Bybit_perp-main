@@ -60,12 +60,16 @@ MTF_TFS = safe_csv_list("MTF_TFS", ["5", "15", "60", "240", "D"])
 
 # Intervals and seed sizes
 # NOTE: If ROOT_SCAN_INTERVAL is 0 (default here) the scanner will run on 5m-candle opens.
-ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 0)  # seconds; 0 => run at each 5m candle open
-KLINE_SEED_LIMIT = safe_int_env("KLINE_SEED_LIMIT", 200)
+ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 120)  # seconds; 0 => run at each 5m candle open
+KLINE_SEED_LIMIT = safe_int_env("KLINE_SEED_LIMIT", 50)
 
-# Concurrency / rate limiting
+# Concurrency / rate limiting (optimized for faster scans)
 RATE_LIMIT_RPS = safe_float_env("RATE_LIMIT_RPS", 5.0)
-CONCURRENCY = safe_int_env("CONCURRENCY", 10)
+CONCURRENCY = safe_int_env("CONCURRENCY", 30)
+MAX_CONCURRENT_REQUESTS = safe_int_env("MAX_CONCURRENT_REQUESTS", 10)
+REQUEST_BATCH_SIZE = safe_int_env("REQUEST_BATCH_SIZE", 15)
+REQUEST_BATCH_DELAY = safe_float_env("REQUEST_BATCH_DELAY", 0.2)
+REST_POLL_INTERVAL = safe_int_env("REST_POLL_INTERVAL", 10)
 
 # Trading and risk
 TRADE_ENABLED = safe_bool_env("TRADE_ENABLED", False)

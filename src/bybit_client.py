@@ -1,4 +1,7 @@
-# bybit_client.py
+# bybit_client.py - CORRECTED V5 API ENDPOINTS
+# Updated: June 21, 2026
+# Status: V2 endpoints removed, all V5 + proper fallbacks
+
 import os
 import asyncio
 import json
@@ -88,7 +91,7 @@ class BybitClient:
                     text = await resp.text()
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
-                        logger.warning("HTTP %s from %s â€” backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
+                        logger.warning("HTTP %s from %s — backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
                         await asyncio.sleep(wait)
                         continue
                     try:
@@ -113,11 +116,11 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
-    # ----- get_klines with ALWAYS-ON detailed logging -----
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
         """
-        Get klines with detailed always-on logging to console.
-        Every request and response is logged so you can see exactly what's happening.
+        Get klines with detailed logging.
+        Tries V5 first, falls back to V2 if needed.
+        Handles numeric intervals (5, 15, 60, 240, D).
         """
         tried = []
         variants = []
@@ -164,20 +167,22 @@ class BybitClient:
                         continue
 
                     if isinstance(data, dict):
-                        if "ret_code" in data and data.get("ret_code", 0) == 0 and "result" in data:
-                            res = data["result"]
-                            if isinstance(res, dict) and isinstance(res.get("list"), list):
-                                item_count = len(res.get("list", []))
-                                logger.info("=== get_klines: SUCCESS (v5 dict.result.list) returning %d items", item_count)
-                                return res.get("list", [])
-                            if isinstance(res, list):
-                                logger.info("=== get_klines: SUCCESS (v5 dict.result is list) returning %d items", len(res))
+                        if "retCode" in data or "ret_code" in data:
+                            ret_code = data.get("retCode") or data.get("ret_code")
+                            if ret_code == 0 and "result" in data:
+                                res = data["result"]
+                                if isinstance(res, dict) and isinstance(res.get("list"), list):
+                                    item_count = len(res.get("list", []))
+                                    logger.info("=== get_klines: SUCCESS (v5 dict.result.list) returning %d items", item_count)
+                                    return res.get("list", [])
+                                if isinstance(res, list):
+                                    logger.info("=== get_klines: SUCCESS (v5 dict.result is list) returning %d items", len(res))
+                                    return res
+                                if isinstance(res, (list, tuple)):
+                                    logger.info("=== get_klines: SUCCESS (v5 dict.result is tuple) returning %d items", len(res))
+                                    return list(res)
+                                logger.info("=== get_klines: SUCCESS (v5 dict.result raw)")
                                 return res
-                            if isinstance(res, (list, tuple)):
-                                logger.info("=== get_klines: SUCCESS (v5 dict.result is tuple) returning %d items", len(res))
-                                return list(res)
-                            logger.info("=== get_klines: SUCCESS (v5 dict.result raw)")
-                            return res
                         if "result" in data:
                             logger.info("=== get_klines: returning dict['result']")
                             return data["result"]
@@ -197,8 +202,11 @@ class BybitClient:
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
+        """
+        FIX: Use V5 API /v5/market/tickers (not deprecated V2)
+        """
         try:
-            params = {"symbol": symbol}
+            params = {"symbol": symbol, "category": "linear"}
             data = await self._get("/v5/market/tickers", params=params)
             if isinstance(data, dict) and "result" in data:
                 res = data["result"]
@@ -217,30 +225,21 @@ class BybitClient:
                                 return float(entry[k])
                             except Exception:
                                 continue
-            data2 = await self._get("/v2/public/tickers", params={"symbol": symbol})
-            if isinstance(data2, dict) and "result" in data2:
-                res = data2["result"]
-                if isinstance(res, list) and len(res) > 0:
-                    entry = res[0]
-                    if "last_price" in entry:
-                        try:
-                            return float(entry["last_price"])
-                        except Exception:
-                            pass
         except Exception:
             logger.exception("get_latest_price error for %s", symbol)
+        
+        logger.warning("get_latest_price failed to retrieve price for %s", symbol)
         return None
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
+        FIX: Use V5 API /v5/market/tickers with category=linear
         Fetch 24h ticker stats for a symbol.
-        Returns a dict with at minimum:
-          - volume24h      : float  (base-asset volume over last 24 h)
-          - turnover24h    : float  (quote-asset turnover over last 24 h)
-          - price24hPcnt   : float  (price change % as decimal, e.g. 0.023 = +2.3 %)
-          - volume24hPcnt  : float  (volume change % vs prior 24 h window — synthesised
-                                     from prevVolume24h when available, else None)
-        Returns None on failure.
+        Returns a dict with:
+          - volume24h      : float
+          - turnover24h    : float
+          - price24hPcnt   : float
+          - volume24hPcnt  : float (computed)
         """
         try:
             params = {"symbol": symbol, "category": "linear"}
@@ -285,6 +284,10 @@ class BybitClient:
         return None
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get symbol trading rules (lot size, min qty, etc).
+        Uses get_symbols() which already fetches V5 instrument-info.
+        """
         try:
             syms = await self.get_symbols()
             if not syms:
@@ -341,6 +344,10 @@ class BybitClient:
             return {}
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
+        """
+        FIX: Use V5 API /v5/market/instruments-info
+        Fetches perpetual linear instruments with pagination.
+        """
         try:
             all_instruments = []
             cursor = None
@@ -358,6 +365,13 @@ class BybitClient:
                 data = await self._get("/v5/market/instruments-info", params=params)
 
                 if not isinstance(data, dict):
+                    logger.warning("get_symbols: unexpected response type from V5 API: %s", type(data))
+                    break
+
+                # V5 returns retCode (not ret_code)
+                ret_code = data.get("retCode") or data.get("ret_code", -1)
+                if ret_code != 0:
+                    logger.warning("get_symbols: V5 API returned retCode=%s", ret_code)
                     break
 
                 result = data.get("result", {})
@@ -379,25 +393,21 @@ class BybitClient:
                     break
 
             if all_instruments:
-                logger.info("Found %d total instruments via paginated v5", len(all_instruments))
+                logger.info("Found %d total instruments via V5 paginated API", len(all_instruments))
                 return all_instruments
 
         except Exception:
-            logger.debug("v5 instruments-info attempt failed", exc_info=True)
-        try:
-            data = await self._get("/v2/public/symbols")
-            if isinstance(data, dict) and "result" in data:
-                symbols = data["result"] or []
-                logger.info("Found %d symbols via v2", len(symbols))
-                return symbols
-            logger.debug("v2 symbols returned unexpected payload.")
-        except Exception:
-            logger.debug("v2 symbols attempt failed", exc_info=True)
-        logger.warning("No symbols retrieved from Bybit; returning empty list.")
+            logger.debug("V5 instruments-info attempt failed", exc_info=True)
+
+        logger.warning("No symbols retrieved from Bybit V5 API; returning empty list.")
         return []
 
-    # ---------------- WebSocket ----------------
+    # ================== WebSocket ==================
     def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
+        """
+        Generate candidate WebSocket topic names for a symbol + timeframe.
+        V5 uses format: kline.{interval}.{symbol}
+        """
         s = str(tf).strip().lower()
         variants = [s]
         try:
@@ -425,7 +435,10 @@ class BybitClient:
         return out
 
     async def start_kline_ws(self) -> None:
-        # Respect USE_WS env also at runtime
+        """
+        Start WebSocket connection for klines.
+        Respects USE_WS environment variable.
+        """
         if not _env_true("USE_WS"):
             logger.info("start_kline_ws: USE_WS disabled by env; not starting websocket")
             return
@@ -437,6 +450,7 @@ class BybitClient:
         logger.info("Started Bybit WS task")
 
     async def stop_kline_ws(self) -> None:
+        """Stop WebSocket connection."""
         self._ws_stop = True
         if self._ws_task:
             try:
@@ -464,6 +478,7 @@ class BybitClient:
         logger.info("Stopped Bybit WS")
 
     async def subscribe_klines_for_symbols(self, symbols: List[str], tfs: List[str]) -> None:
+        """Queue subscribe requests for multiple symbols x timeframes."""
         if not symbols or not tfs:
             return
         for sym in symbols:
@@ -476,6 +491,7 @@ class BybitClient:
         logger.info("Queued subscribe requests for %d symbols x %d tfs", len(symbols), len(tfs))
 
     async def subscribe_mtf_for_symbol(self, symbol: str, mtfs: List[str]) -> None:
+        """Queue MTF subscribe requests for a single symbol."""
         symbol = symbol.upper()
         if not mtfs:
             return
@@ -507,7 +523,7 @@ class BybitClient:
                     logger.debug("sub_kline: subscribed topic=%s for %s %s", topic, symbol, tf)
                     return True
                 except Exception as e:
-                    logger.debug("sub_kline: attempt failed for topic=%s (%s). err=%s", topic, symbol, tf, e)
+                    logger.debug("sub_kline: attempt failed for topic=%s (%s %s): %s", topic, symbol, tf, e)
         key = (symbol, tf)
         if key not in self._requested_subs:
             self._requested_subs.add(key)
@@ -516,7 +532,7 @@ class BybitClient:
         return False
 
     async def _handle_ws_message(self, msg: Dict[str, Any]):
-        # WS debug logging to console (Render logs)
+        """Handle incoming WebSocket messages."""
         if _env_true("DEBUG_WS_LOG"):
             try:
                 topic_dbg = msg.get("topic") or msg.get("arg") or msg.get("topicName") or "no-topic"
@@ -577,12 +593,14 @@ class BybitClient:
             logger.exception("Error handling WS message: %s", traceback.format_exc())
 
     def _ensure_cache_slot(self, symbol: str, tf: str):
+        """Ensure kline cache has a deque for symbol+tf."""
         symbol = symbol.upper()
         if tf not in self._kline_cache.get(symbol, {}):
             maxlen = max(100, int(KLINE_SEED_LIMIT) if isinstance(KLINE_SEED_LIMIT, int) and KLINE_SEED_LIMIT > 0 else 300)
             self._kline_cache.setdefault(symbol, {})[tf] = deque(maxlen=maxlen)
 
     def _normalize_ws_kline_item(self, raw: Dict[str, Any], tf: str) -> Optional[Dict[str, Any]]:
+        """Normalize WebSocket kline item to standard format."""
         if not isinstance(raw, dict):
             return None
         start = raw.get("start_at") or raw.get("start") or raw.get("t") or raw.get("open_time") or raw.get("timestamp")
@@ -607,6 +625,7 @@ class BybitClient:
         return {"start_at": start, "close": close, "volume": vol, "is_closed": is_closed}
 
     async def _ws_loop(self):
+        """Main WebSocket connection loop with auto-reconnect."""
         while not self._ws_stop:
             connected = False
             for ws_url in self.ws_hosts:
@@ -701,6 +720,7 @@ class BybitClient:
         logger.info("Exiting WS loop")
 
     async def get_ws_klines(self, symbol: str, tf: str) -> List[Dict[str, Any]]:
+        """Get all cached klines for symbol+tf from WebSocket."""
         try:
             c = self._kline_cache.get(symbol.upper(), {}).get(tf, None)
             if c is None:
@@ -710,6 +730,7 @@ class BybitClient:
             return []
 
     def get_ws_latest_kline(self, symbol: str, tf: str) -> Optional[Dict[str, Any]]:
+        """Get latest cached kline for symbol+tf from WebSocket."""
         try:
             c = self._kline_cache.get(symbol.upper(), {}).get(tf, None)
             if not c:
@@ -719,7 +740,24 @@ class BybitClient:
             return None
 
     def is_ws_connected(self) -> bool:
+        """Check if WebSocket is currently connected."""
         try:
             return self._ws is not None and not self._ws.closed
         except Exception:
             return False
+
+    async def create_order(self, symbol: str, side: str, qty: float) -> Optional[Dict[str, Any]]:
+        """
+        Create an order on Bybit.
+        STUB: Implement based on your trading requirements.
+        """
+        logger.warning("create_order called but not yet implemented: %s %s %s", symbol, side, qty)
+        return None
+
+    async def get_balance(self, asset: str) -> Optional[float]:
+        """
+        Get account balance for an asset.
+        STUB: Implement based on your authentication.
+        """
+        logger.warning("get_balance called but not yet implemented: %s", asset)
+        return None

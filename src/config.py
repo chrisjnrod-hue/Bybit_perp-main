@@ -84,11 +84,12 @@ BREAKEVEN_HL = safe_bool_env("BREAKEVEN_HL", True)
 POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "auto")
 FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 
-# Scoring thresholds and weights
+# Scoring thresholds
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
 # ---- Signal Scoring Filters (never reject, only score/prioritize) ----
+# Weights control how much each factor contributes to overall signal score
 MACD_SCORE_ENABLED = safe_bool_env("MACD_SCORE_ENABLED", True)
 MACD_SCORE_WEIGHT = safe_float_env("MACD_SCORE_WEIGHT", 1.0)
 
@@ -99,7 +100,11 @@ SR_SCORE_ENABLED = safe_bool_env("SR_SCORE_ENABLED", True)
 SR_SCORE_WEIGHT = safe_float_env("SR_SCORE_WEIGHT", 1.0)
 
 # ---- Support/Resistance Configuration ----
-SR_METHOD = os.getenv("SR_METHOD", "hybrid")  # "hybrid", "woodie", "swing", "fibonacci"
+# SR_METHOD: "hybrid" = Woodie Pivots + Swing detection (recommended)
+#            "woodie" = Classic Woodie pivot points only
+#            "swing" = Swing highs/lows only
+#            "fibonacci" = Fibonacci pivot points
+SR_METHOD = os.getenv("SR_METHOD", "hybrid")
 SWING_LOOKBACK = safe_int_env("SWING_LOOKBACK", 20)  # candles to look back for swing highs/lows
 
 # ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----

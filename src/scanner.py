@@ -1,4 +1,4 @@
-# scanner.py - FINAL PRODUCTION VERSION (modified to add scoring, SR, send cadence)
+# scanner.py - FINAL PRODUCTION VERSION (modified for dedupe fixes and Telegram format)
 # Last Updated: 2026-06-22
 import os
 import asyncio
@@ -37,6 +37,7 @@ DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "tru
 
 # ============ MTF Alignment TFs — NUMERIC format matching Bybit API ============
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
+ROOT_ORDER = ["60", "240", "D"]  # ordering for per-TF listing (1h, 4h, 1d)
 
 
 class Scanner:
@@ -69,6 +70,23 @@ class Scanner:
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE
         )
+
+    # ---------------- Helper: aligned candle start ----------------
+    def _aligned_candle_start(self, root: str, kline_start: Optional[int] = None) -> Optional[int]:
+        """
+        Return a deterministic candle_start integer for deduping:
+          - Prefer provided kline_start when valid
+          - Otherwise align current time to the root TF boundary
+        """
+        try:
+            if kline_start and isinstance(kline_start, (int, float)):
+                return int(kline_start)
+            sec = self._tf_to_seconds(root)
+            if sec and sec > 0:
+                return int(time.time()) // sec * sec
+        except Exception:
+            pass
+        return None
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -279,7 +297,8 @@ class Scanner:
 
     def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         """
-        Normalize kline responses. Extended to capture open/high/low when available.
+        FIX #21: Properly normalize kline responses handling dicts, lists, and tuples
+        Extended to capture open/high/low when available (required for SR detection).
         """
         out: List[Dict[str, Any]] = []
         if not raw_klines:
@@ -293,9 +312,10 @@ class Scanner:
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
 
-        # Ensure we have a list/tuple before iterating
+        # Ensure we have a list/tuple before iterating (FIX #21)
         if not isinstance(raw_klines, (list, tuple)):
             if isinstance(raw_klines, dict):
+                # If we got a single dict response, wrap it
                 seq = [raw_klines]
             else:
                 seq = [raw_klines] if raw_klines else []
@@ -355,9 +375,18 @@ class Scanner:
                         or item.get("start")
                         or item.get("time")
                     )
-                    open_p = (item.get("open") or item.get("o"))
-                    high = (item.get("high") or item.get("h"))
-                    low = (item.get("low") or item.get("l"))
+                    open_p = (
+                        item.get("open")
+                        or item.get("o")
+                    )
+                    high = (
+                        item.get("high")
+                        or item.get("h")
+                    )
+                    low = (
+                        item.get("low")
+                        or item.get("l")
+                    )
                     close = (
                         item.get("close")
                         or item.get("close_price")
@@ -566,7 +595,7 @@ class Scanner:
                     continue
 
                 async def poll_symbol(sym: str):
-                    # Semaphore per TF, not per symbol to respect concurrent limits
+                    # FIX #11: Semaphore per TF, not per symbol to respect concurrent limits
                     tfs_to_poll = list(set(ROOT_TFS + ["5", "15"]))
                     for tf in tfs_to_poll:
                         try:
@@ -613,7 +642,7 @@ class Scanner:
                     batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
                     tasks = [asyncio.create_task(poll_symbol(s)) for s in batch]
 
-                    # Removed timeout - let tasks complete naturally, return exceptions
+                    # FIX #23: Removed timeout - let tasks complete naturally, return exceptions
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 elapsed = time.time() - start
@@ -652,7 +681,7 @@ class Scanner:
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
-        Consistent MACD calculation - always replace last close with current price
+        FIX #24: Consistent MACD calculation - always replace last close with current price
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -665,6 +694,7 @@ class Scanner:
             except Exception:
                 continue
 
+        # Determine current price (consistent logic - FIX #24)
         current_price = None
         if include_price is not None:
             current_price = float(include_price)
@@ -676,6 +706,7 @@ class Scanner:
             except Exception:
                 pass
 
+        # Consistently replace last close with current price (FIX #24)
         if current_price is not None:
             if closes:
                 closes[-1] = current_price
@@ -775,7 +806,7 @@ class Scanner:
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """Compute percentage change in 24h volume (decimal), capped at 1.0"""
+        """Compute percentage change in 24h volume"""
         try:
             if symbol not in self._24h_volumes:
                 return None
@@ -829,16 +860,17 @@ class Scanner:
             except Exception:
                 continue
 
-        # Last candle pivot (classic)
+        # Last candle pivot (classic) - only if we have at least 2 candles
         try:
-            last_h = highs[-1]
-            last_l = lows[-1]
-            last_c = closes[-1]
-            if last_h is not None and last_l is not None and last_c is not None:
-                P = (last_h + last_l + last_c) / 3.0
-                R1 = 2 * P - last_l
-                S1 = 2 * P - last_h
-                levels.extend([P, R1, S1])
+            if len(seq) >= 2:
+                last_h = highs[-1]
+                last_l = lows[-1]
+                last_c = closes[-1]
+                if last_h is not None and last_l is not None and last_c is not None:
+                    P = (last_h + last_l + last_c) / 3.0
+                    R1 = 2 * P - last_l
+                    S1 = 2 * P - last_h
+                    levels.extend([P, R1, S1])
         except Exception:
             pass
 
@@ -879,26 +911,39 @@ class Scanner:
 
         return {"support": support, "resistance": resistance, "support_dist_pct": support_dist, "resistance_dist_pct": resistance_dist, "levels": levels}
 
-    async def send_signal_block(self, sig: Dict[str, Any], eval_entry: Dict[str, Any]):
+    async def send_signal_block(self, sig: Dict[str, Any], ev: Dict[str, Any]):
         """
-        Send a single Telegram block with the enhanced details (MACD, 24h vol, SR levels, filters/weights, scoring)
+        Send single Telegram block in older-screenshot format:
+        📌 Bybit Perp | {rt} Signal
+        Symbol: ...
+        Price: $...
+        MACD H: +0.000004
+        24h Vol Δ: +2.3% / N/A
+        MTF State: 5❌ 15❌ 60❌ 240✅ D🔄
+        Status: ⏳ Monitoring (Not accepted yet)
+        Score: 5.50
         """
         try:
-            sym = sig.get("symbol")
-            rt = sig.get("root")
-            price = sig.get("price")
-            macd_hist_val = float(eval_entry.get("macd_hist_val") or 0.0)
-            score = float(eval_entry.get("score") or 0.0)
-            vol_change = eval_entry.get("vol_change")
-            sr = eval_entry.get("sr", {})
-
-            if price >= 1000:
-                price_str = f"${price:,.2f}"
-            elif price >= 1:
-                price_str = f"${price:.4f}"
+            sym = sig.get("symbol") or ev.get("symbol")
+            rt = sig.get("root") or ev.get("root")
+            price = sig.get("price") if sig.get("price") is not None else ev.get("price")
+            # safe price formatting
+            try:
+                p = float(price) if price is not None else None
+            except Exception:
+                p = None
+            if p is None:
+                price_str = "N/A"
             else:
-                price_str = f"${price:.8f}"
+                if p >= 1000:
+                    price_str = f"${p:,.2f}"
+                elif p >= 1:
+                    price_str = f"${p:.4f}"
+                else:
+                    price_str = f"${p:.8f}"
 
+            macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
+            vol_change = ev.get("vol_change")
             vol_str = "N/A"
             if vol_change is not None:
                 try:
@@ -906,44 +951,31 @@ class Scanner:
                 except Exception:
                     vol_str = str(vol_change)
 
-            support = sr.get("support")
-            resistance = sr.get("resistance")
-            sdist = sr.get("support_dist_pct")
-            rdist = sr.get("resistance_dist_pct")
+            mtf_tfs = ev.get("mtf", {})
+            mtf_state_str = self._build_mtf_state_str(mtf_tfs) if mtf_tfs else "N/A"
+            mtf_status = ev.get("mtf_status", "unknown")
+            if mtf_status == "aligned":
+                status_str = "✅ Aligned (Accept)"
+            elif mtf_status == "daily_rising":
+                status_str = "📈 Daily Rising (Accept)"
+            elif mtf_status == "monitoring":
+                status_str = "⏳ Monitoring (Not accepted yet)"
+            else:
+                status_str = "❓ Unknown"
 
-            sup_str = "N/A"
-            if support is not None:
-                try:
-                    sup_str = f"{support:.6f} ({sdist*100:+.2f}%)" if sdist is not None else f"{support:.6f}"
-                except Exception:
-                    sup_str = f"{support}"
-            res_str = "N/A"
-            if resistance is not None:
-                try:
-                    res_str = f"{resistance:.6f} ({rdist*100:+.2f}%)" if rdist is not None else f"{resistance:.6f}"
-                except Exception:
-                    res_str = f"{resistance}"
+            score = float(ev.get("score") or 0.0)
 
-            filters_on = []
-            if SIGNAL_FILTER_MACD_ENABLED:
-                filters_on.append(f"MACD(w={SIGNAL_WEIGHT_MACD})")
-            if SIGNAL_FILTER_VOLUME_ENABLED:
-                filters_on.append(f"VOL(w={SIGNAL_WEIGHT_VOLUME})")
-            if SIGNAL_FILTER_SR_ENABLED:
-                filters_on.append(f"SR(w={SIGNAL_WEIGHT_SR})")
-            filters_str = ", ".join(filters_on) if filters_on else "none"
-
-            block = "\n".join([
-                f"📌 Root Signal | {rt}",
+            block_lines = [
+                f"📌 Bybit Perp | {rt} Signal",
                 f"Symbol: {sym}",
                 f"Price: {price_str}",
                 f"MACD H: {macd_hist_val:+.6f}",
                 f"24h Vol Δ: {vol_str}",
-                f"Support: {sup_str}",
-                f"Resistance: {res_str}",
-                f"Score: {score:.3f} | Filters: {filters_str}",
-            ])
-            await send_message(block)
+                f"MTF State: {mtf_state_str}",
+                f"Status: {status_str}",
+                f"Score: {score:.2f}"
+            ]
+            await send_message("\n".join(block_lines))
         except Exception:
             logger.exception("Failed to send single signal block for %s", sig.get("symbol"))
 
@@ -1184,6 +1216,7 @@ class Scanner:
             else:
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                # Note: we still send individual simulated trade messages as before for transparency
                 await send_message(
                     f"📊 Simulated Trade — {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
@@ -1195,173 +1228,124 @@ class Scanner:
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
         """
-        Telegram summary layout with MTF alignment visualization.
+        Revised Telegram summary to match requested layout:
+
+        1) Single block with recommended trade opens (up to available slots)
+        2) Single block root TF summary + full signals listing (all root TF signals)
+        3) One block per signal, grouped in order: 1h (60), 4h (240), 1d (D).
+        Each signal block formatted like the screenshot: Price, MACD H, 24h Vol Δ (only value), MTF State, Status, Score
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
-        eval_map: Dict[tuple, Dict[str, Any]] = {}
-        if evaluated:
-            for e in evaluated:
-                eval_map[(e["symbol"], e["root"])] = e
+        evaluated = evaluated or []
+        # build dict for quick lookup
+        eval_dict = {(e["symbol"], e["root"]): e for e in evaluated}
 
-        tf_counts: Dict[str, int] = {}
-        for sig in root_signals:
-            rt = sig.get("root", "?")
-            tf_counts[rt] = tf_counts.get(rt, 0) + 1
-
-        window_map = {"60": 30, "240": 12, "D": 5}
-        header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
-        for rt in ROOT_TFS:
-            cnt = tf_counts.get(rt, 0)
-            win = window_map.get(rt)
-            if cnt:
-                if win:
-                    header_lines.append(f"  {rt}: {cnt} (window: {win})")
-                else:
-                    header_lines.append(f"  {rt}: {cnt}")
-
-        header_lines.append("")
-        header_lines.append("Signals (all root TF signals):")
-        if not root_signals:
-            header_lines.append("  None")
-        else:
-            for sig in root_signals:
-                sym = sig.get("symbol")
-                rt = sig.get("root")
-                price = sig.get("price", 0)
-                try:
-                    if price >= 1000:
-                        price_str = f"${price:,.2f}"
-                    elif price >= 1:
-                        price_str = f"${price:.4f}"
-                    else:
-                        price_str = f"${price:.8f}"
-                except Exception:
-                    price_str = str(price)
-                header_lines.append(f"  - {sym} | {rt} | {price_str}")
-
-        first_block = "\n".join(header_lines)
-        try:
-            await send_message(first_block)
-        except Exception:
-            logger.exception("Failed to send first summary block")
-
-        signal_tfs = [rt for rt in ROOT_TFS if rt in tf_counts]
-        for rt in signal_tfs:
-            tf_sigs = [s for s in root_signals if s.get("root") == rt]
-            tf_sigs_sorted = sorted(
-                tf_sigs,
-                key=lambda s: eval_map.get((s["symbol"], s["root"]), {}).get("score", 0.0),
-                reverse=True,
-            )
-            for sig in tf_sigs_sorted:
-                try:
-                    sym        = sig["symbol"]
-                    price      = sig["price"]
-                    vol_change = sig.get("vol_change")
-                    ev         = eval_map.get((sym, rt), {})
-
-                    macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
-                    score         = float(ev.get("score")         or 0.0)
-                    mtf_status    = ev.get("mtf_status", "unknown")
-                    mtf_tfs       = ev.get("mtf", {})
-
-                    negative_tfs  = ev.get("negative_tfs", [])
-                    one_d_slope   = ev.get("one_d_slope")
-
-                    if price >= 1000:
-                        price_str = f"${price:,.2f}"
-                    elif price >= 1:
-                        price_str = f"${price:.4f}"
-                    else:
-                        price_str = f"${price:.8f}"
-
-                    vol_str = "N/A"
-                    if vol_change is not None:
-                        try:
-                            vol_str = f"{vol_change * 100:+.1f}%"
-                        except Exception:
-                            vol_str = str(vol_change)
-
-                    mtf_state_str = self._build_mtf_state_str(mtf_tfs) if mtf_tfs else "N/A"
-
-                    if mtf_status == "aligned":
-                        state_str = "✅ Aligned (Accept)"
-                    elif mtf_status == "daily_rising":
-                        slope_note = f" (D slope: {one_d_slope:+.4f})" if one_d_slope is not None else ""
-                        state_str = f"📈 Daily Rising (Accept){slope_note}"
-                    elif mtf_status == "monitoring":
-                        state_str = f"⏳ Monitoring (Not accepted yet)"
-                    else:
-                        state_str = "❓ Unknown"
-
-                    # SR info if present
-                    sr = ev.get("sr", {}) if ev else {}
-                    support = sr.get("support")
-                    resistance = sr.get("resistance")
-                    sdist = sr.get("support_dist_pct")
-                    rdist = sr.get("resistance_dist_pct")
-                    sup_str = "N/A"
-                    if support is not None:
-                        try:
-                            sup_str = f"{support:.6f} ({sdist*100:+.2f}%)" if sdist is not None else f"{support:.6f}"
-                        except Exception:
-                            sup_str = str(support)
-                    res_str = "N/A"
-                    if resistance is not None:
-                        try:
-                            res_str = f"{resistance:.6f} ({rdist*100:+.2f}%)" if rdist is not None else f"{resistance:.6f}"
-                        except Exception:
-                            res_str = str(resistance)
-
-                    block = "\n".join([
-                        f"📌 Bybit Perp | {rt} Signal",
-                        f"Symbol: {sym}",
-                        f"Price: {price_str}",
-                        f"MACD H: {macd_hist_val:+.6f}",
-                        f"24h Vol Δ: {vol_str}",
-                        f"Support: {sup_str}",
-                        f"Resistance: {res_str}",
-                        f"MTF State: {mtf_state_str}",
-                        f"Status: {state_str}",
-                    ])
-                    await send_message(block)
-                except Exception:
-                    logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
-
+        # Build overall signals list for the root_signals param
+        # root_signals is a list of dicts with keys symbol, root, price, hist, vol_change, candle_start
+        # First block: trade recommendations (based on available slots)
         try:
             current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-            remaining = max(0, MAX_OPEN_TRADES - current_open)
-            accepted = []
-            if evaluated:
-                for e in evaluated:
-                    if e.get("accept"):
-                        accepted.append(e)
+            slots = max(0, MAX_OPEN_TRADES - current_open)
+            # collect accepted signals
+            accepted = [e for e in evaluated if e.get("accept")]
             accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
-            recommended = accepted_sorted[:remaining] if remaining > 0 else []
+            recommended = accepted_sorted[:slots] if slots > 0 else []
 
-            rec_lines = [f"📣 Recommended Signals for Trading — {now_str}"]
-            rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
-            rec_lines.append(f"Slots available: {remaining}")
-            if not recommended:
-                rec_lines.append("No recommended signals to open at this time.")
-            else:
+            if recommended:
+                rec_lines = [f"📣 Recommended Signals for Trading — {now_str}"]
+                rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
+                rec_lines.append(f"Slots available: {slots}")
                 for r in recommended:
                     sym = r["symbol"]
                     rt = r["root"]
-                    price = r["price"]
-                    score = r.get("score", 0.0)
-                    if price >= 1000:
-                        price_str = f"${price:,.2f}"
-                    elif price >= 1:
-                        price_str = f"${price:.4f}"
+                    price = r.get("price")
+                    try:
+                        p = float(price) if price is not None else None
+                    except Exception:
+                        p = None
+                    if p is None:
+                        price_str = "N/A"
                     else:
-                        price_str = f"${price:.8f}"
-                    rec_lines.append(f"  - {sym} | {rt} | {price_str} | score={score:.2f}")
-
-            await send_message("\n".join(rec_lines))
+                        if p >= 1000:
+                            price_str = f"${p:,.2f}"
+                        elif p >= 1:
+                            price_str = f"${p:.4f}"
+                        else:
+                            price_str = f"${p:.8f}"
+                    score = float(r.get("score", 0.0))
+                    rec_lines.append(f" - {sym} | {rt} | {price_str} | score={score:.2f}")
+                await send_message("\n".join(rec_lines))
         except Exception:
             logger.exception("Failed to send recommended signals block")
+
+        # Second block: Root TF summary + full listing in one block
+        try:
+            tf_counts: Dict[str, int] = {}
+            for sig in root_signals:
+                rt = sig.get("root", "?")
+                tf_counts[rt] = tf_counts.get(rt, 0) + 1
+
+            window_map = {"60": 30, "240": 12, "D": 5}
+            header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
+            for rt in ROOT_TFS:
+                cnt = tf_counts.get(rt, 0)
+                win = window_map.get(rt)
+                if cnt:
+                    if win:
+                        header_lines.append(f" {rt}: {cnt} (window: {win})")
+                    else:
+                        header_lines.append(f" {rt}: {cnt}")
+
+            header_lines.append("")
+            header_lines.append("Signals (all root TF signals):")
+            if not root_signals:
+                header_lines.append(" - None")
+            else:
+                # print each in one line: - SYMBOL | ROOT | $PRICE
+                for sig in root_signals:
+                    sym = sig.get("symbol")
+                    rt = sig.get("root")
+                    price = sig.get("price", 0)
+                    try:
+                        p = float(price) if price is not None else None
+                    except Exception:
+                        p = None
+                    if p is None:
+                        price_str = "N/A"
+                    else:
+                        if p >= 1000:
+                            price_str = f"${p:,.2f}"
+                        elif p >= 1:
+                            price_str = f"${p:.8f}"
+                        else:
+                            price_str = f"${p:.8f}"
+                    header_lines.append(f" - {sym} | {rt} | {price_str}")
+            await send_message("\n".join(header_lines))
+        except Exception:
+            logger.exception("Failed to send root TF summary block")
+
+        # Then send one block per signal grouped by TF order 60 -> 240 -> D
+        try:
+            # group signals by TF
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for sig in root_signals:
+                grouped.setdefault(sig.get("root"), []).append(sig)
+
+            for rt in ROOT_ORDER:
+                lst = grouped.get(rt, [])
+                if not lst:
+                    continue
+                # for each signal in this tf, send single block
+                for s in lst:
+                    key = (s.get("symbol"), s.get("root"))
+                    ev = eval_dict.get(key, {})
+                    # ensure ev has macd_hist_val and score; if not, create minimal
+                    if not ev:
+                        ev = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}}
+                    await self.send_signal_block(s, ev)
+        except Exception:
+            logger.exception("Failed to send per-signal blocks in grouped order")
 
     def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
         """
@@ -1369,6 +1353,11 @@ class Scanner:
         using NUMERIC format matching Bybit API.
 
         Returns dict with status, per-TF states, negative_tfs list, and 1d slope.
+
+        Scenarios:
+          A — all TFs positive → "aligned"
+          C — only D (daily) negative but histogram rising (upward slope) → "daily_rising"
+          B — 1+ TFs negative (not meeting C) → "monitoring"
         """
         tf_states: Dict[str, Dict[str, Any]] = {}
         negative_tfs: List[str] = []
@@ -1567,13 +1556,15 @@ class Scanner:
                                     candle_start = ks[-1].get("start_at") if ks else None
                                 except Exception:
                                     candle_start = None
+                                # Ensure a deterministic candle_start for dedupe
+                                aligned_start = self._aligned_candle_start(root, candle_start)
                                 root_signals.append({
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
                                     "hist": hist,
                                     "vol_change": vol_change,
-                                    "candle_start": candle_start
+                                    "candle_start": aligned_start
                                 })
                                 logger.info("SIGNAL DETECTED: %s %s @ %s", sym, root, price)
                     except Exception:
@@ -1618,8 +1609,7 @@ class Scanner:
                 #    * when 60 opens -> send 1h summary
                 #    * when 240 opens -> send 1h + 4h
                 #    * when D opens -> send 1h + 4h + D
-                # - Else: send only single-signal blocks for newly discovered signals
-
+                # - Else: send only single-signal blocks for newly discovered signals (deduped)
                 send_full_tfs = set()
                 if "60" in new_root_candle_tfs:
                     send_full_tfs.add("60")
@@ -1633,18 +1623,25 @@ class Scanner:
                     tf_filtered_signals = [s for s in root_signals if s.get("root") in send_full_tfs]
                     # evaluate map for these signals
                     eval_for_send = []
+                    eval_dict = {(e["symbol"], e["root"]): e for e in evaluated}
                     for s in tf_filtered_signals:
-                        for e in evaluated:
-                            if e["symbol"] == s["symbol"] and e["root"] == s["root"]:
-                                eval_for_send.append(e)
-                                break
+                        e = eval_dict.get((s["symbol"], s["root"]))
+                        if e:
+                            eval_for_send.append(e)
+                        else:
+                            # fallback minimal
+                            eval_for_send.append({"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}})
+
                     logger.info("Sending full summary for TFs=%s signals=%d", send_full_tfs, len(tf_filtered_signals))
                     try:
+                        # send in the requested order: first recommended block, then root summary+listing, then per-signal blocks grouped
                         await self.send_summary(tf_filtered_signals, eval_for_send)
                         # mark these signals as sent (so we don't resend per-signal blocks)
                         ts_now = time.time()
                         for s in tf_filtered_signals:
                             key = (s["symbol"], s["root"], s.get("candle_start"))
+                            aligned = self._aligned_candle_start(s["root"], s.get("candle_start"))
+                            key = (s["symbol"], s["root"], aligned)
                             self._sent_signals[key] = ts_now
                     except Exception:
                         logger.exception("Failed to send full summary for TFs=%s", send_full_tfs)
@@ -1652,19 +1649,19 @@ class Scanner:
                     # non-candle-open cycle: send per-signal single blocks for newly detected signals
                     if root_signals:
                         ts_now = time.time()
+                        # build evaluated map for lookups
+                        eval_map = {(e["symbol"], e["root"]): e for e in evaluated}
                         for s in root_signals:
-                            key = (s["symbol"], s["root"], s.get("candle_start"))
+                            aligned = self._aligned_candle_start(s["root"], s.get("candle_start"))
+                            key = (s["symbol"], s["root"], aligned)
                             prev = self._sent_signals.get(key)
                             if prev and (time.time() - prev) < SENT_SIGNAL_TTL:
+                                # already sent recently
                                 continue
                             # find evaluated entry if available
-                            matching = None
-                            for e in evaluated:
-                                if e["symbol"] == s["symbol"] and e["root"] == s["root"]:
-                                    matching = e
-                                    break
+                            matching = eval_map.get((s["symbol"], s["root"]))
                             if not matching:
-                                matching = {"macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "sr": {}}
+                                matching = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}}
                             await self.send_signal_block(s, matching)
                             self._sent_signals[key] = ts_now
 
@@ -1690,17 +1687,20 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # Align to next 5m boundary
+                # FIX #17: Align to actual Bybit 5m candle boundaries (0, 5, 10, 15... minutes UTC)
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
+                # Find next 5-minute boundary
                 next_5m_minute = ((current_minute // 5) + 1) * 5
 
                 if next_5m_minute >= 60:
+                    # Move to next hour
                     to_sleep = (60 - current_minute) * 60 - current_second
                 else:
+                    # Sleep to next 5m boundary
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(0, to_sleep)

@@ -113,7 +113,7 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
-    # ----- get_klines with ALWAYS-ON detailed logging -----
+    # ----- get_klines with ALWAYS-ON detailed logging (v5 ONLY) -----
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
         """
         Get klines with detailed always-on logging to console.
@@ -140,7 +140,7 @@ class BybitClient:
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
-        # Use v5 API only
+        # V5 ONLY - removed v2 fallback
         endpoints = [
             ("/v5/market/kline", "v5"),
         ]
@@ -197,6 +197,7 @@ class BybitClient:
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
+        """Get latest price using v5 API only"""
         try:
             params = {"symbol": symbol}
             data = await self._get("/v5/market/tickers", params=params)
@@ -223,7 +224,7 @@ class BybitClient:
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch 24h ticker stats for a symbol using v5 API.
+        Fetch 24h ticker stats for a symbol using v5 API only.
         Returns a dict with at minimum:
           - volume24h      : float  (base-asset volume over last 24 h)
           - turnover24h    : float  (quote-asset turnover over last 24 h)
@@ -332,7 +333,7 @@ class BybitClient:
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
         """
-        Fetch all perpetual instruments using v5 API with pagination.
+        Fetch all perpetual instruments using v5 API only with pagination.
         """
         try:
             all_instruments = []

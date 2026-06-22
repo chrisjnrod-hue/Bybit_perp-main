@@ -382,6 +382,54 @@ class BybitClient:
         logger.warning("No symbols retrieved from Bybit; returning empty list.")
         return []
 
+    async def get_balance(self, coin: str = "USDT") -> Optional[float]:
+        """
+        Get wallet balance for a coin using v5 API.
+        Returns available balance as float, or None on failure.
+        """
+        try:
+            params = {"coin": coin}
+            data = await self._get("/v5/account/wallet-balance", params=params)
+            if isinstance(data, dict) and "result" in data:
+                res = data["result"]
+                if isinstance(res, dict) and "list" in res and isinstance(res["list"], list):
+                    for item in res["list"]:
+                        if isinstance(item, dict):
+                            coins = item.get("coin", [])
+                            if isinstance(coins, list):
+                                for c in coins:
+                                    if isinstance(c, dict) and c.get("coin") == coin:
+                                        try:
+                                            return float(c.get("walletBalance") or c.get("available_balance") or 0)
+                                        except Exception:
+                                            pass
+        except Exception:
+            logger.exception("get_balance error for %s", coin)
+        return None
+
+    async def create_order(self, symbol: str, side: str, qty: float, price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """
+        Create an order using v5 API.
+        Returns order response dict or None on failure.
+        """
+        try:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Market" if price is None else "Limit",
+                "qty": str(qty),
+            }
+            if price is not None:
+                params["price"] = str(price)
+            
+            data = await self._get("/v5/order/create", params=params)
+            if isinstance(data, dict) and data.get("ret_code") == 0:
+                return data.get("result")
+        except Exception:
+            logger.exception("create_order error for %s %s %s", symbol, side, qty)
+        return None
+
     # ---------------- WebSocket ----------------
     def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
         s = str(tf).strip().lower()

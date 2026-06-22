@@ -88,7 +88,7 @@ class BybitClient:
                     text = await resp.text()
                     if status == 429 or (500 <= status < 600):
                         wait = self._backoff_base * (2 ** attempt)
-                        logger.warning("HTTP %s from %s â€” backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
+                        logger.warning("HTTP %s from %s – backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
                         await asyncio.sleep(wait)
                         continue
                     try:
@@ -117,7 +117,7 @@ class BybitClient:
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
         """
         Get klines with detailed always-on logging to console.
-        Every request and response is logged so you can see exactly what's happening.
+        Uses v5 API only. Every request and response is logged.
         """
         tried = []
         variants = []
@@ -140,9 +140,9 @@ class BybitClient:
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
+        # Use v5 API only
         endpoints = [
             ("/v5/market/kline", "v5"),
-            ("/v2/public/kline/list", "v2")
         ]
 
         for ep, tag in endpoints:
@@ -217,23 +217,13 @@ class BybitClient:
                                 return float(entry[k])
                             except Exception:
                                 continue
-            data2 = await self._get("/v2/public/tickers", params={"symbol": symbol})
-            if isinstance(data2, dict) and "result" in data2:
-                res = data2["result"]
-                if isinstance(res, list) and len(res) > 0:
-                    entry = res[0]
-                    if "last_price" in entry:
-                        try:
-                            return float(entry["last_price"])
-                        except Exception:
-                            pass
         except Exception:
             logger.exception("get_latest_price error for %s", symbol)
         return None
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch 24h ticker stats for a symbol.
+        Fetch 24h ticker stats for a symbol using v5 API.
         Returns a dict with at minimum:
           - volume24h      : float  (base-asset volume over last 24 h)
           - turnover24h    : float  (quote-asset turnover over last 24 h)
@@ -341,6 +331,9 @@ class BybitClient:
             return {}
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
+        """
+        Fetch all perpetual instruments using v5 API with pagination.
+        """
         try:
             all_instruments = []
             cursor = None
@@ -379,20 +372,12 @@ class BybitClient:
                     break
 
             if all_instruments:
-                logger.info("Found %d total instruments via paginated v5", len(all_instruments))
+                logger.info("Found %d total instruments via v5", len(all_instruments))
                 return all_instruments
 
         except Exception:
             logger.debug("v5 instruments-info attempt failed", exc_info=True)
-        try:
-            data = await self._get("/v2/public/symbols")
-            if isinstance(data, dict) and "result" in data:
-                symbols = data["result"] or []
-                logger.info("Found %d symbols via v2", len(symbols))
-                return symbols
-            logger.debug("v2 symbols returned unexpected payload.")
-        except Exception:
-            logger.debug("v2 symbols attempt failed", exc_info=True)
+
         logger.warning("No symbols retrieved from Bybit; returning empty list.")
         return []
 

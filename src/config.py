@@ -60,7 +60,12 @@ MTF_TFS = safe_csv_list("MTF_TFS", ["5", "15", "60", "240", "D"])
 
 # Intervals and seed sizes
 # NOTE: If ROOT_SCAN_INTERVAL is 0 (default here) the scanner will run on 5m-candle opens.
-ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 120)  # seconds; 0 => run at each 5m candle open
+_raw_root_scan = os.getenv("ROOT_SCAN_INTERVAL", "")
+if isinstance(_raw_root_scan, str) and _raw_root_scan.strip().lower() in ("false", "off", "0", "none", ""):
+    ROOT_SCAN_INTERVAL = 0
+else:
+    ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 120)  # seconds; 0 => run at each 5m candle open
+
 KLINE_SEED_LIMIT = safe_int_env("KLINE_SEED_LIMIT", 50)
 
 # Concurrency / rate limiting (optimized for faster scans)
@@ -88,25 +93,6 @@ FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
-# ---- Signal Scoring Filters (never reject, only score/prioritize) ----
-# Weights control how much each factor contributes to overall signal score
-MACD_SCORE_ENABLED = safe_bool_env("MACD_SCORE_ENABLED", True)
-MACD_SCORE_WEIGHT = safe_float_env("MACD_SCORE_WEIGHT", 1.0)
-
-VOLUME_SCORE_ENABLED = safe_bool_env("VOLUME_SCORE_ENABLED", True)
-VOLUME_SCORE_WEIGHT = safe_float_env("VOLUME_SCORE_WEIGHT", 1.0)
-
-SR_SCORE_ENABLED = safe_bool_env("SR_SCORE_ENABLED", True)
-SR_SCORE_WEIGHT = safe_float_env("SR_SCORE_WEIGHT", 1.0)
-
-# ---- Support/Resistance Configuration ----
-# SR_METHOD: "hybrid" = Woodie Pivots + Swing detection (recommended)
-#            "woodie" = Classic Woodie pivot points only
-#            "swing" = Swing highs/lows only
-#            "fibonacci" = Fibonacci pivot points
-SR_METHOD = os.getenv("SR_METHOD", "hybrid")
-SWING_LOOKBACK = safe_int_env("SWING_LOOKBACK", 20)  # candles to look back for swing highs/lows
-
 # ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----
 # VOLUME_FILTER_ENABLED=true  → block trade opens when 24h vol change % is negative
 # VOLUME_FILTER_ENABLED=false → ignore volume, open trades freely (default: true)
@@ -132,3 +118,21 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ---------------------------------------
+# New signal filter toggles & weights
+# ---------------------------------------
+SIGNAL_FILTER_MACD_ENABLED = safe_bool_env("SIGNAL_FILTER_MACD_ENABLED", True)
+SIGNAL_FILTER_VOLUME_ENABLED = safe_bool_env("SIGNAL_FILTER_VOLUME_ENABLED", True)
+SIGNAL_FILTER_SR_ENABLED = safe_bool_env("SIGNAL_FILTER_SR_ENABLED", True)
+
+SIGNAL_WEIGHT_MACD = safe_float_env("SIGNAL_WEIGHT_MACD", 1.0)
+SIGNAL_WEIGHT_VOLUME = safe_float_env("SIGNAL_WEIGHT_VOLUME", 1.0)
+SIGNAL_WEIGHT_SR = safe_float_env("SIGNAL_WEIGHT_SR", 0.5)
+
+# SR (support/resistance) detection tuning
+SIGNAL_SR_SUPPORT_WINDOW_PCT = safe_float_env("SIGNAL_SR_SUPPORT_WINDOW_PCT", 0.02)  # 2% proximity considered "near"
+SIGNAL_SR_LOOKBACK = safe_int_env("SIGNAL_SR_LOOKBACK", 100)  # lookback candles for SR detection
+
+# Sent signal cache TTL (seconds) to avoid duplicate telegram posts for same candle
+SENT_SIGNAL_TTL = safe_int_env("SENT_SIGNAL_TTL", 60 * 60 * 4)  # 4 hours by default

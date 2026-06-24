@@ -106,6 +106,9 @@ SIGNAL_WEIGHT_SR = safe_float_env("SIGNAL_WEIGHT_SR", 0.5)
 SIGNAL_SR_SUPPORT_WINDOW_PCT = safe_float_env("SIGNAL_SR_SUPPORT_WINDOW_PCT", 0.02)
 SIGNAL_SR_LOOKBACK = safe_int_env("SIGNAL_SR_LOOKBACK", 100)
 
+# MTF slope lookback (required by scanner)
+MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
+
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""

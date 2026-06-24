@@ -1,5 +1,5 @@
-# scanner.py - FINAL PRODUCTION VERSION (modified for dedupe fixes and Telegram format)
-# Last Updated: 2026-06-22
+# scanner.py - FINAL PRODUCTION VERSION (with StrongBuy rating and summary changes)
+# Last Updated: 2026-06-24
 import os
 import asyncio
 import time
@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional, Callable, Tuple
 from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
+import statistics
 
 from .logger import get_logger
 from .bybit_client import BybitClient
@@ -16,13 +17,18 @@ from .macd import macd_histogram, slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
+    MTF_SLOPE_LOOKBACK, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL,
-    # new signal config
+    # signal filters (keep MACD, volume, SR)
     SIGNAL_FILTER_MACD_ENABLED, SIGNAL_FILTER_VOLUME_ENABLED, SIGNAL_FILTER_SR_ENABLED,
     SIGNAL_WEIGHT_MACD, SIGNAL_WEIGHT_VOLUME, SIGNAL_WEIGHT_SR,
-    SIGNAL_SR_SUPPORT_WINDOW_PCT, SIGNAL_SR_LOOKBACK, SENT_SIGNAL_TTL
+    SIGNAL_SR_SUPPORT_WINDOW_PCT, SIGNAL_SR_LOOKBACK, SENT_SIGNAL_TTL,
+    # StrongBuy config and indicator params
+    STRONGBUY_MIN_SCORE, STRONGBUY_MODERATE_SCORE, STRONGBUY_REQUIRED_FOR_OPEN,
+    RSI_PERIOD, EMA_SHORT_PERIOD, EMA_LONG_PERIOD,
+    MACD_NORM_SCALE, EMA_NORM_SCALE, VOL_NORM_SCALE,
+    INDICATOR_WEIGHT_MACD, INDICATOR_WEIGHT_RSI, INDICATOR_WEIGHT_EMA, INDICATOR_WEIGHT_VOL
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -297,8 +303,7 @@ class Scanner:
 
     def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         """
-        FIX #21: Properly normalize kline responses handling dicts, lists, and tuples
-        Extended to capture open/high/low when available (required for SR detection).
+        Normalize kline responses. Extended to capture open/high/low when available.
         """
         out: List[Dict[str, Any]] = []
         if not raw_klines:
@@ -312,10 +317,9 @@ class Scanner:
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
 
-        # Ensure we have a list/tuple before iterating (FIX #21)
+        # Ensure we have a list/tuple before iterating
         if not isinstance(raw_klines, (list, tuple)):
             if isinstance(raw_klines, dict):
-                # If we got a single dict response, wrap it
                 seq = [raw_klines]
             else:
                 seq = [raw_klines] if raw_klines else []
@@ -595,7 +599,7 @@ class Scanner:
                     continue
 
                 async def poll_symbol(sym: str):
-                    # FIX #11: Semaphore per TF, not per symbol to respect concurrent limits
+                    # Semaphore per TF, not per symbol to respect concurrent limits
                     tfs_to_poll = list(set(ROOT_TFS + ["5", "15"]))
                     for tf in tfs_to_poll:
                         try:
@@ -642,7 +646,7 @@ class Scanner:
                     batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
                     tasks = [asyncio.create_task(poll_symbol(s)) for s in batch]
 
-                    # FIX #23: Removed timeout - let tasks complete naturally, return exceptions
+                    # Removed timeout - let tasks complete naturally, return exceptions
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 elapsed = time.time() - start
@@ -681,7 +685,7 @@ class Scanner:
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
-        FIX #24: Consistent MACD calculation - always replace last close with current price
+        Consistent MACD calculation - always replace last close with current price
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -694,7 +698,6 @@ class Scanner:
             except Exception:
                 continue
 
-        # Determine current price (consistent logic - FIX #24)
         current_price = None
         if include_price is not None:
             current_price = float(include_price)
@@ -706,7 +709,6 @@ class Scanner:
             except Exception:
                 pass
 
-        # Consistently replace last close with current price (FIX #24)
         if current_price is not None:
             if closes:
                 closes[-1] = current_price
@@ -788,7 +790,8 @@ class Scanner:
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
                 if data and isinstance(data, dict):
-                    vol = data.get("volume") or data.get("vol") or data.get("turnover")
+                    # data expected to include volume24h or volume fields
+                    vol = data.get("volume") or data.get("vol") or data.get("turnover") or data.get("volume24h") or data.get("turnover24h")
                     if vol is not None:
                         try:
                             vol = float(vol)
@@ -911,17 +914,255 @@ class Scanner:
 
         return {"support": support, "resistance": resistance, "support_dist_pct": support_dist, "resistance_dist_pct": resistance_dist, "levels": levels}
 
+    # ----------------- Technical indicators/helpers for StrongBuy -----------------
+
+    def _safe_tail_floats(self, seq: List[Any], n: int) -> List[float]:
+        out = []
+        for x in seq[-n:]:
+            try:
+                out.append(float(x))
+            except Exception:
+                continue
+        return out
+
+    def compute_ema(self, series: List[float], period: int) -> List[float]:
+        """
+        Simple EMA calculation (returns full list of ema values aligned with series).
+        """
+        if not series or period <= 0:
+            return []
+        ema: List[float] = []
+        alpha = 2.0 / (period + 1.0)
+        for i, v in enumerate(series):
+            try:
+                p = float(v)
+            except Exception:
+                ema.append(None)
+                continue
+            if i == 0:
+                ema.append(p)
+            else:
+                prev = ema[-1]
+                if prev is None:
+                    ema.append(p)
+                else:
+                    ema.append((p - prev) * alpha + prev)
+        return [e for e in ema if e is not None] if ema else []
+
+    def compute_rsi(self, series: List[float], period: int) -> Optional[float]:
+        """
+        Compute final RSI value over the series (period N).
+        Pure-Python implementation; returns last RSI or None.
+        """
+        if not series or period <= 0:
+            return None
+        try:
+            closes = [float(x) for x in series if x is not None]
+        except Exception:
+            closes = []
+        if len(closes) < period + 1:
+            return None
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            if diff >= 0:
+                gains.append(diff)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(-diff)
+        # use Wilder's smoothing: avg_gain = EMA of gains with alpha=1/period?
+        # Simpler: use rolling average of last 'period' gains
+        try:
+            last_gains = gains[-period:]
+            last_losses = losses[-period:]
+            avg_gain = sum(last_gains) / period
+            avg_loss = sum(last_losses) / period
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            return float(rsi)
+        except Exception:
+            return None
+
+    def _normalize_macd(self, macd_val: float) -> float:
+        """
+        Normalize MACD histogram value into [-1..1] using scale parameter
+        """
+        try:
+            scale = float(MACD_NORM_SCALE) or 1.0
+            # use tanh-like scaling
+            v = float(macd_val) / (scale + 1e-12)
+            return math.tanh(v)
+        except Exception:
+            return 0.0
+
+    def _normalize_rsi(self, rsi_val: Optional[float]) -> float:
+        """
+        Map RSI (0..100) to [-1..1], center at 50
+        """
+        try:
+            if rsi_val is None:
+                return 0.0
+            v = (float(rsi_val) - 50.0) / 50.0
+            return max(-1.0, min(1.0, v))
+        except Exception:
+            return 0.0
+
+    def _normalize_ema_distance(self, price: float, ema_short: Optional[float], ema_long: Optional[float]) -> float:
+        """
+        Combine EMA short vs long direction and percent distance, normalized to [-1..1]
+        """
+        try:
+            if ema_short is None or ema_long is None or price is None:
+                return 0.0
+            # direction: short > long -> bullish
+            direction = 1.0 if ema_short > ema_long else -1.0 if ema_short < ema_long else 0.0
+            dist = 0.0
+            if ema_short and price:
+                dist = (price - ema_short) / ema_short
+            scale = float(EMA_NORM_SCALE) or 0.01
+            norm = math.tanh((dist / (scale + 1e-12)) * direction)
+            return max(-1.0, min(1.0, norm))
+        except Exception:
+            return 0.0
+
+    def _normalize_volume_change(self, vol_change: Optional[float]) -> float:
+        """
+        Normalize 24h volume change (decimal) into [-1..1] using VOL_NORM_SCALE
+        """
+        try:
+            if vol_change is None:
+                return 0.0
+            scale = float(VOL_NORM_SCALE) or 0.05
+            v = vol_change / (scale + 1e-12)
+            return max(-1.0, min(1.0, math.tanh(v)))
+        except Exception:
+            return 0.0
+
+    def compute_technical_rating(self, symbol: str, tf: str, price: Optional[float], hist: List[float], vol_change: Optional[float]) -> Dict[str, Any]:
+        """
+        Compute composite technical rating using:
+          - MACD histogram magnitude (normalized)
+          - RSI (normalized)
+          - EMA short/long crossover & proximity (normalized)
+          - 24h volume change (normalized)
+
+        Returns dict with:
+          - rating_score: normalized composite in [-1..1]
+          - rating_label: "weak" | "moderate" | "strongbuy"
+          - is_strongbuy: bool
+          - breakdown: per-indicator normalized contributions
+        """
+        try:
+            # Prepare series for indicator calculation: use kline_store closes for the tf
+            closes = [c.get("close") for c in self.kline_store.get(symbol, {}).get(tf, []) if c.get("close") is not None]
+            # Append current price as last if provided and differs slightly
+            if price is not None:
+                try:
+                    if not closes or (closes and float(closes[-1]) != float(price)):
+                        closes = list(closes) + [float(price)]
+                except Exception:
+                    pass
+
+            # MACD: use provided hist last value if present, else compute from closes
+            macd_norm = 0.0
+            macd_val = None
+            try:
+                if hist and len(hist) > 0:
+                    macd_val = hist[-1]
+                else:
+                    _, _, hist2 = self.compute_macd_for(symbol, tf, include_price=price)
+                    if hist2 and len(hist2) > 0:
+                        macd_val = hist2[-1]
+                if macd_val is not None:
+                    macd_norm = float(self._normalize_macd(macd_val))
+            except Exception:
+                macd_norm = 0.0
+
+            # RSI
+            rsi_val = None
+            try:
+                rsi_val = self.compute_rsi(closes, int(RSI_PERIOD) if RSI_PERIOD else 14)
+            except Exception:
+                rsi_val = None
+            rsi_norm = self._normalize_rsi(rsi_val)
+
+            # EMA trend
+            ema_short = None
+            ema_long = None
+            try:
+                if closes and len(closes) >= 2:
+                    ema_s = self.compute_ema(closes, int(EMA_SHORT_PERIOD) if EMA_SHORT_PERIOD else 20)
+                    ema_l = self.compute_ema(closes, int(EMA_LONG_PERIOD) if EMA_LONG_PERIOD else 50)
+                    if ema_s:
+                        ema_short = ema_s[-1]
+                    if ema_l:
+                        ema_long = ema_l[-1]
+            except Exception:
+                ema_short = ema_short
+                ema_long = ema_long
+            ema_norm = self._normalize_ema_distance(price or (closes[-1] if closes else None), ema_short, ema_long)
+
+            # Volume
+            vol_norm = self._normalize_volume_change(vol_change)
+
+            # Combine weights (normalize weights to sum 1)
+            try:
+                weights = {
+                    "macd": max(0.0, float(INDICATOR_WEIGHT_MACD)),
+                    "rsi": max(0.0, float(INDICATOR_WEIGHT_RSI)),
+                    "ema": max(0.0, float(INDICATOR_WEIGHT_EMA)),
+                    "vol": max(0.0, float(INDICATOR_WEIGHT_VOL)),
+                }
+            except Exception:
+                weights = {"macd": 0.3, "rsi": 0.25, "ema": 0.25, "vol": 0.2}
+            total_w = sum(weights.values()) or 1.0
+            for k in weights:
+                weights[k] = weights[k] / total_w
+
+            composite = (weights["macd"] * macd_norm +
+                         weights["rsi"] * rsi_norm +
+                         weights["ema"] * ema_norm +
+                         weights["vol"] * vol_norm)
+
+            # Map composite [-1..1] to rating labels
+            # We'll use positive scale for buys; negative values correspond to sellish (not used for opens)
+            score = float(max(-1.0, min(1.0, composite)))
+            label = "weak"
+            is_strong = False
+            try:
+                strong_threshold = float(STRONGBUY_MIN_SCORE)
+                moderate_threshold = float(STRONGBUY_MODERATE_SCORE)
+            except Exception:
+                strong_threshold = 0.75
+                moderate_threshold = 0.60
+            # thresholds apply on [0..1] positive side
+            if score >= strong_threshold:
+                label = "strongbuy"
+                is_strong = True
+            elif score >= moderate_threshold:
+                label = "moderate"
+                is_strong = False
+            else:
+                label = "weak"
+                is_strong = False
+
+            return {
+                "rating_score": score,
+                "rating_label": label,
+                "is_strongbuy": bool(is_strong),
+                "breakdown": {"macd": macd_norm, "rsi": rsi_norm, "ema": ema_norm, "vol": vol_norm, "weights": weights}
+            }
+        except Exception:
+            logger.exception("Technical rating computation failed for %s %s", symbol, tf)
+            return {"rating_score": 0.0, "rating_label": "weak", "is_strongbuy": False, "breakdown": {}}
+
     async def send_signal_block(self, sig: Dict[str, Any], ev: Dict[str, Any]):
         """
-        Send single Telegram block in older-screenshot format:
-        📌 Bybit Perp | {rt} Signal
-        Symbol: ...
-        Price: $...
-        MACD H: +0.000004
-        24h Vol Δ: +2.3% / N/A
-        MTF State: 5❌ 15❌ 60❌ 240✅ D🔄
-        Status: ⏳ Monitoring (Not accepted yet)
-        Score: 5.50
+        Send single Telegram block in older-screenshot format with added rating and 24h vol percentage.
         """
         try:
             sym = sig.get("symbol") or ev.get("symbol")
@@ -964,7 +1205,11 @@ class Scanner:
                 status_str = "❓ Unknown"
 
             score = float(ev.get("score") or 0.0)
+            rating_label = ev.get("rating_label", "weak")
+            rating_score = float(ev.get("rating_score", 0.0))
 
+            # Make rating display compact: Weak / Moderate / StrongBuy
+            rating_display = rating_label.capitalize() if isinstance(rating_label, str) else "N/A"
             block_lines = [
                 f"📌 Bybit Perp | {rt} Signal",
                 f"Symbol: {sym}",
@@ -973,7 +1218,7 @@ class Scanner:
                 f"24h Vol Δ: {vol_str}",
                 f"MTF State: {mtf_state_str}",
                 f"Status: {status_str}",
-                f"Score: {score:.2f}"
+                f"Score: {score:.2f} | Rating: {rating_display} ({rating_score:+.2f})"
             ]
             await send_message("\n".join(block_lines))
         except Exception:
@@ -1044,8 +1289,8 @@ class Scanner:
         """
         Evaluate MTF alignment for each root signal and act on each scenario.
 
-        Scenario A  (aligned)       → open trade if TRADE_ENABLED
-        Scenario C  (daily_rising)  → open trade
+        Scenario A  (aligned)       → open trade if STRONGBUY gate satisfied
+        Scenario C  (daily_rising)  → open trade (subject to STRONGBUY gate)
         Scenario B  (monitoring)    → add to watch-list until last flip
         """
         evaluated: List[Dict[str, Any]] = []
@@ -1089,7 +1334,6 @@ class Scanner:
             macd_score = 0.0
             try:
                 if SIGNAL_FILTER_MACD_ENABLED:
-                    # contribution proportional to magnitude, capped
                     macd_score = min(abs(macd_hist_val) / (abs(macd_hist_val) + 1.0), 2.0) * SIGNAL_WEIGHT_MACD
                     score += macd_score
             except Exception:
@@ -1114,6 +1358,12 @@ class Scanner:
                 except Exception:
                     sr_info = {}
 
+            # Compute technical rating (StrongBuy replication)
+            rating = self.compute_technical_rating(sym, root, price, hist, vol_change)
+            rating_score = rating.get("rating_score", 0.0)
+            rating_label = rating.get("rating_label", "weak")
+            is_strongbuy = bool(rating.get("is_strongbuy", False))
+
             entry: Dict[str, Any] = {
                 "symbol":       sym,
                 "root":         root,
@@ -1130,13 +1380,16 @@ class Scanner:
                 "reason":       "pending",
                 "score_breakdown": {"macd": macd_score, "vol": vol_score, "sr": sr_score},
                 "sr": sr_info,
+                "rating_score": rating_score,
+                "rating_label": rating_label,
+                "is_strongbuy": is_strongbuy,
             }
 
             if mtf_status in ("aligned", "daily_rising"):
                 entry["accept"] = True
                 entry["reason"] = mtf_status
                 to_open.append(entry)
-                logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
+                logger.info("MTF %s → ACCEPT: %s %s score=%.2f rating=%s", mtf_status, sym, root, score, rating_label)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -1160,18 +1413,7 @@ class Scanner:
         )
 
         candidates = to_open
-        if ROOT_FILTER:
-            grouped: Dict[str, List[Dict[str, Any]]] = {}
-            for c in candidates:
-                grouped.setdefault(c["root"], []).append(c)
-            selected: List[Dict[str, Any]] = []
-            for rt in ROOT_TFS:
-                lst = grouped.get(rt, [])
-                if not lst:
-                    continue
-                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
-                selected.extend(top)
-            candidates = sorted(selected, key=lambda r: r["score"], reverse=True)
+        # Note: ROOT_FILTER and MTF_FILTER usage removed per request; scoring filters (MACD/Volume/SR) remain.
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info(
@@ -1183,6 +1425,12 @@ class Scanner:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached — halting further opens.")
                 break
+
+            # Enforce strongbuy gate if configured
+            if STRONGBUY_REQUIRED_FOR_OPEN and not c.get("is_strongbuy", False):
+                logger.info("Skipping open for %s %s — STRONGBUY_REQUIRED_FOR_OPEN is True but rating=%s", c.get("symbol"), c.get("root"), c.get("rating_label"))
+                continue
+
             sym   = c["symbol"]
             price = c["price"]
             try:
@@ -1209,18 +1457,18 @@ class Scanner:
                     await send_message(
                         f"✅ Trade Opened — {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
-                        f"Score: {c['score']:.2f} | Reason: {reason_tag}"
+                        f"Score: {c['score']:.2f} | Rating: {c.get('rating_label')} | Reason: {reason_tag}"
                     )
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
             else:
-                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
-                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
-                # Note: we still send individual simulated trade messages as before for transparency
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "rating": c.get("rating_label")})
+                logger.info("Simulated open %s qty=%s score=%.2f rating=%s", sym, qty, c["score"], c.get("rating_label"))
+                # Still send simulated trade message for transparency
                 await send_message(
                     f"📊 Simulated Trade — {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
-                    f"Score: {c['score']:.2f} | Reason: {reason_tag}"
+                    f"Score: {c['score']:.2f} | Rating: {c.get('rating_label')} | Reason: {reason_tag}"
                 )
             self._mtf_monitoring.pop(sym, None)
 
@@ -1228,12 +1476,12 @@ class Scanner:
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
         """
-        Revised Telegram summary to match requested layout:
+        Telegram summary layout:
 
         1) Single block with recommended trade opens (up to available slots)
-        2) Single block root TF summary + full signals listing (all root TF signals)
+        2) Single block root TF summary + full signals listing (all root TF signals; includes 60,240,D)
         3) One block per signal, grouped in order: 1h (60), 4h (240), 1d (D).
-        Each signal block formatted like the screenshot: Price, MACD H, 24h Vol Δ (only value), MTF State, Status, Score
+        Each signal block includes rating label and 24h vol %.
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -1241,13 +1489,10 @@ class Scanner:
         # build dict for quick lookup
         eval_dict = {(e["symbol"], e["root"]): e for e in evaluated}
 
-        # Build overall signals list for the root_signals param
-        # root_signals is a list of dicts with keys symbol, root, price, hist, vol_change, candle_start
         # First block: trade recommendations (based on available slots)
         try:
             current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
             slots = max(0, MAX_OPEN_TRADES - current_open)
-            # collect accepted signals
             accepted = [e for e in evaluated if e.get("accept")]
             accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
             recommended = accepted_sorted[:slots] if slots > 0 else []
@@ -1274,21 +1519,26 @@ class Scanner:
                         else:
                             price_str = f"${p:.8f}"
                     score = float(r.get("score", 0.0))
-                    rec_lines.append(f" - {sym} | {rt} | {price_str} | score={score:.2f}")
+                    rating = r.get("rating_label", "weak")
+                    rec_lines.append(f" - {sym} | {rt} | {price_str} | score={score:.2f} | rating={rating}")
                 await send_message("\n".join(rec_lines))
         except Exception:
             logger.exception("Failed to send recommended signals block")
 
-        # Second block: Root TF summary + full listing in one block
+        # Second block: Root TF summary + full listing in one block (include counts and list for 60/240/D)
         try:
             tf_counts: Dict[str, int] = {}
+            # collect symbols per TF to list them in the summary block
+            symbols_by_tf: Dict[str, List[str]] = {}
             for sig in root_signals:
                 rt = sig.get("root", "?")
                 tf_counts[rt] = tf_counts.get(rt, 0) + 1
+                symbols_by_tf.setdefault(rt, []).append(sig.get("symbol"))
 
             window_map = {"60": 30, "240": 12, "D": 5}
             header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
-            for rt in ROOT_TFS:
+            # Ensure all three ROOT_ORDER appear
+            for rt in ROOT_ORDER:
                 cnt = tf_counts.get(rt, 0)
                 win = window_map.get(rt)
                 if cnt:
@@ -1296,6 +1546,8 @@ class Scanner:
                         header_lines.append(f" {rt}: {cnt} (window: {win})")
                     else:
                         header_lines.append(f" {rt}: {cnt}")
+                else:
+                    header_lines.append(f" {rt}: 0")
 
             header_lines.append("")
             header_lines.append("Signals (all root TF signals):")
@@ -1342,7 +1594,7 @@ class Scanner:
                     ev = eval_dict.get(key, {})
                     # ensure ev has macd_hist_val and score; if not, create minimal
                     if not ev:
-                        ev = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}}
+                        ev = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}, "rating_label": "weak", "rating_score": 0.0}
                     await self.send_signal_block(s, ev)
         except Exception:
             logger.exception("Failed to send per-signal blocks in grouped order")
@@ -1351,19 +1603,12 @@ class Scanner:
         """
         Evaluate MTF alignment across MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
         using NUMERIC format matching Bybit API.
-
-        Returns dict with status, per-TF states, negative_tfs list, and 1d slope.
-
-        Scenarios:
-          A — all TFs positive → "aligned"
-          C — only D (daily) negative but histogram rising (upward slope) → "daily_rising"
-          B — 1+ TFs negative (not meeting C) → "monitoring"
         """
         tf_states: Dict[str, Dict[str, Any]] = {}
         negative_tfs: List[str] = []
         one_d_hist: List[float] = []
 
-        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
+        logger.debug("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
 
         for tf in MTF_ALIGN_TFS:
             _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
@@ -1373,18 +1618,6 @@ class Scanner:
             is_positive = cur is not None and cur > 0
             is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
 
-            numeric_count = sum(1 for v in hist if v is not None)
-            logger.warning(
-                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
-                tf,
-                len(hist),
-                numeric_count,
-                f"{prev:.8f}" if prev is not None else "None",
-                f"{cur:.8f}" if cur is not None else "None",
-                is_positive,
-                is_flip
-            )
-
             tf_states[tf] = {
                 "cur": cur, "prev": prev,
                 "is_positive": is_positive, "is_flip": is_flip, "slope": None,
@@ -1393,33 +1626,15 @@ class Scanner:
                 one_d_hist = hist
             if not is_positive:
                 negative_tfs.append(tf)
-                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
 
-        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
-
-        # Scenario A: all TFs positive
+        # Decision
         if not negative_tfs:
-            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
             return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
-
-        # Scenario C: only D is negative but rising
         if negative_tfs == ["D"]:
             one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
-            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
             if one_d_slope is not None and one_d_slope > 0:
                 tf_states["D"]["slope"] = one_d_slope
-                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
-                return {
-                    "status": "daily_rising",
-                    "tfs": tf_states,
-                    "negative_tfs": ["D"],
-                    "one_d_slope": one_d_slope,
-                }
-            else:
-                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
-
-        # Scenario B: 1+ TFs negative and Scenario C not met
-        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
+                return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
         return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
@@ -1481,14 +1696,11 @@ class Scanner:
                         sec = self._tf_to_seconds(rt)
                         if sec <= 0:
                             continue
-                        # aligned start timestamp for the current candle
                         current_candle_start = int(now_ts // sec * sec)
                         last_known = self._last_root_candle_start.get(rt)
                         if last_known is None:
-                            # initialize but do not treat as new
                             self._last_root_candle_start[rt] = current_candle_start
                         elif current_candle_start != last_known:
-                            # new candle has started for this TF
                             new_root_candle_tfs.add(rt)
                             self._last_root_candle_start[rt] = current_candle_start
                     except Exception:
@@ -1630,7 +1842,7 @@ class Scanner:
                             eval_for_send.append(e)
                         else:
                             # fallback minimal
-                            eval_for_send.append({"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}})
+                            eval_for_send.append({"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}, "rating_label": "weak", "rating_score": 0.0})
 
                     logger.info("Sending full summary for TFs=%s signals=%d", send_full_tfs, len(tf_filtered_signals))
                     try:
@@ -1639,7 +1851,6 @@ class Scanner:
                         # mark these signals as sent (so we don't resend per-signal blocks)
                         ts_now = time.time()
                         for s in tf_filtered_signals:
-                            key = (s["symbol"], s["root"], s.get("candle_start"))
                             aligned = self._aligned_candle_start(s["root"], s.get("candle_start"))
                             key = (s["symbol"], s["root"], aligned)
                             self._sent_signals[key] = ts_now
@@ -1661,7 +1872,7 @@ class Scanner:
                             # find evaluated entry if available
                             matching = eval_map.get((s["symbol"], s["root"]))
                             if not matching:
-                                matching = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}}
+                                matching = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}, "rating_label": "weak", "rating_score": 0.0}
                             await self.send_signal_block(s, matching)
                             self._sent_signals[key] = ts_now
 
@@ -1687,20 +1898,17 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # FIX #17: Align to actual Bybit 5m candle boundaries (0, 5, 10, 15... minutes UTC)
+                # Align to next 5m boundary
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
-                # Find next 5-minute boundary
                 next_5m_minute = ((current_minute // 5) + 1) * 5
 
                 if next_5m_minute >= 60:
-                    # Move to next hour
                     to_sleep = (60 - current_minute) * 60 - current_second
                 else:
-                    # Sleep to next 5m boundary
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(0, to_sleep)

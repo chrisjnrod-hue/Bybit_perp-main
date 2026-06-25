@@ -94,7 +94,7 @@ VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 VOLUME_FILTER_ENABLED = safe_bool_env("VOLUME_FILTER_ENABLED", True)
 VOLUME_MIN_CHANGE_PCT = safe_float_env("VOLUME_MIN_CHANGE_PCT", 0.0)
 
-# Filters toggles (keep MACD, volume, SR)
+# Filters toggles (MACD, volume, SR)
 SIGNAL_FILTER_MACD_ENABLED = safe_bool_env("SIGNAL_FILTER_MACD_ENABLED", True)
 SIGNAL_FILTER_VOLUME_ENABLED = safe_bool_env("SIGNAL_FILTER_VOLUME_ENABLED", True)
 SIGNAL_FILTER_SR_ENABLED = safe_bool_env("SIGNAL_FILTER_SR_ENABLED", True)
@@ -113,7 +113,7 @@ MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
 
-# Admin HTTP API: secret token required to access /inspect
+# Admin HTTP API secret token
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "") or ""
 
 # Logging
@@ -144,3 +144,7 @@ INDICATOR_WEIGHT_VOL = safe_float_env("INDICATOR_WEIGHT_VOL", 0.20)
 
 # Sent signal cache TTL (seconds) to avoid duplicate telegram posts for same candle
 SENT_SIGNAL_TTL = safe_int_env("SENT_SIGNAL_TTL", 60 * 60 * 4)
+
+# Force-evaluate all symbols at root TF candle opens and on first deploy: WARNING - this iterates ALL symbols
+# Set to False if you want to avoid the heavy pass.
+ENABLE_FORCE_ROOT_EVAL = safe_bool_env("ENABLE_FORCE_ROOT_EVAL", True)

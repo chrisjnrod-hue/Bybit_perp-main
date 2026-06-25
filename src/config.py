@@ -113,6 +113,9 @@ MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
 
+# Admin HTTP API: secret token required to access /inspect
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "") or ""
+
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

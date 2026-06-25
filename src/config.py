@@ -145,6 +145,5 @@ INDICATOR_WEIGHT_VOL = safe_float_env("INDICATOR_WEIGHT_VOL", 0.20)
 # Sent signal cache TTL (seconds) to avoid duplicate telegram posts for same candle
 SENT_SIGNAL_TTL = safe_int_env("SENT_SIGNAL_TTL", 60 * 60 * 4)
 
-# Force-evaluate all symbols at root TF candle opens and on first deploy: WARNING - this iterates ALL symbols
-# Set to False if you want to avoid the heavy pass.
+# Force-evaluate all symbols at root TF candle opens and on first deploy (default True)
 ENABLE_FORCE_ROOT_EVAL = safe_bool_env("ENABLE_FORCE_ROOT_EVAL", True)

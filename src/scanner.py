@@ -1,5 +1,5 @@
-# scanner.py - FINAL PRODUCTION VERSION (with StrongBuy rating and summary changes)
-# Last Updated: 2026-06-24
+# scanner.py - FINAL PRODUCTION VERSION (with StrongBuy rating, summary changes, and admin inspect endpoint)
+# Last Updated: 2026-06-24 (modified to add admin inspect endpoint)
 import os
 import asyncio
 import time
@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
 import statistics
+from aiohttp import web
 
 from .logger import get_logger
 from .bybit_client import BybitClient
@@ -28,7 +29,9 @@ from .config import (
     STRONGBUY_MIN_SCORE, STRONGBUY_MODERATE_SCORE, STRONGBUY_REQUIRED_FOR_OPEN,
     RSI_PERIOD, EMA_SHORT_PERIOD, EMA_LONG_PERIOD,
     MACD_NORM_SCALE, EMA_NORM_SCALE, VOL_NORM_SCALE,
-    INDICATOR_WEIGHT_MACD, INDICATOR_WEIGHT_RSI, INDICATOR_WEIGHT_EMA, INDICATOR_WEIGHT_VOL
+    INDICATOR_WEIGHT_MACD, INDICATOR_WEIGHT_RSI, INDICATOR_WEIGHT_EMA, INDICATOR_WEIGHT_VOL,
+    # admin token
+    ADMIN_TOKEN
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -972,8 +975,6 @@ class Scanner:
             else:
                 gains.append(0.0)
                 losses.append(-diff)
-        # use Wilder's smoothing: avg_gain = EMA of gains with alpha=1/period?
-        # Simpler: use rolling average of last 'period' gains
         try:
             last_gains = gains[-period:]
             last_losses = losses[-period:]
@@ -993,7 +994,6 @@ class Scanner:
         """
         try:
             scale = float(MACD_NORM_SCALE) or 1.0
-            # use tanh-like scaling
             v = float(macd_val) / (scale + 1e-12)
             return math.tanh(v)
         except Exception:
@@ -1018,7 +1018,6 @@ class Scanner:
         try:
             if ema_short is None or ema_long is None or price is None:
                 return 0.0
-            # direction: short > long -> bullish
             direction = 1.0 if ema_short > ema_long else -1.0 if ema_short < ema_long else 0.0
             dist = 0.0
             if ema_short and price:
@@ -1049,17 +1048,9 @@ class Scanner:
           - RSI (normalized)
           - EMA short/long crossover & proximity (normalized)
           - 24h volume change (normalized)
-
-        Returns dict with:
-          - rating_score: normalized composite in [-1..1]
-          - rating_label: "weak" | "moderate" | "strongbuy"
-          - is_strongbuy: bool
-          - breakdown: per-indicator normalized contributions
         """
         try:
-            # Prepare series for indicator calculation: use kline_store closes for the tf
             closes = [c.get("close") for c in self.kline_store.get(symbol, {}).get(tf, []) if c.get("close") is not None]
-            # Append current price as last if provided and differs slightly
             if price is not None:
                 try:
                     if not closes or (closes and float(closes[-1]) != float(price)):
@@ -1067,7 +1058,6 @@ class Scanner:
                 except Exception:
                     pass
 
-            # MACD: use provided hist last value if present, else compute from closes
             macd_norm = 0.0
             macd_val = None
             try:
@@ -1082,7 +1072,6 @@ class Scanner:
             except Exception:
                 macd_norm = 0.0
 
-            # RSI
             rsi_val = None
             try:
                 rsi_val = self.compute_rsi(closes, int(RSI_PERIOD) if RSI_PERIOD else 14)
@@ -1090,7 +1079,6 @@ class Scanner:
                 rsi_val = None
             rsi_norm = self._normalize_rsi(rsi_val)
 
-            # EMA trend
             ema_short = None
             ema_long = None
             try:
@@ -1106,10 +1094,8 @@ class Scanner:
                 ema_long = ema_long
             ema_norm = self._normalize_ema_distance(price or (closes[-1] if closes else None), ema_short, ema_long)
 
-            # Volume
             vol_norm = self._normalize_volume_change(vol_change)
 
-            # Combine weights (normalize weights to sum 1)
             try:
                 weights = {
                     "macd": max(0.0, float(INDICATOR_WEIGHT_MACD)),
@@ -1128,8 +1114,6 @@ class Scanner:
                          weights["ema"] * ema_norm +
                          weights["vol"] * vol_norm)
 
-            # Map composite [-1..1] to rating labels
-            # We'll use positive scale for buys; negative values correspond to sellish (not used for opens)
             score = float(max(-1.0, min(1.0, composite)))
             label = "weak"
             is_strong = False
@@ -1139,7 +1123,6 @@ class Scanner:
             except Exception:
                 strong_threshold = 0.75
                 moderate_threshold = 0.60
-            # thresholds apply on [0..1] positive side
             if score >= strong_threshold:
                 label = "strongbuy"
                 is_strong = True
@@ -1168,7 +1151,6 @@ class Scanner:
             sym = sig.get("symbol") or ev.get("symbol")
             rt = sig.get("root") or ev.get("root")
             price = sig.get("price") if sig.get("price") is not None else ev.get("price")
-            # safe price formatting
             try:
                 p = float(price) if price is not None else None
             except Exception:
@@ -1208,7 +1190,6 @@ class Scanner:
             rating_label = ev.get("rating_label", "weak")
             rating_score = float(ev.get("rating_score", 0.0))
 
-            # Make rating display compact: Weak / Moderate / StrongBuy
             rating_display = rating_label.capitalize() if isinstance(rating_label, str) else "N/A"
             block_lines = [
                 f"📌 Bybit Perp | {rt} Signal",
@@ -1413,7 +1394,6 @@ class Scanner:
         )
 
         candidates = to_open
-        # Note: ROOT_FILTER and MTF_FILTER usage removed per request; scoring filters (MACD/Volume/SR) remain.
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info(
@@ -1528,7 +1508,6 @@ class Scanner:
         # Second block: Root TF summary + full listing in one block (include counts and list for 60/240/D)
         try:
             tf_counts: Dict[str, int] = {}
-            # collect symbols per TF to list them in the summary block
             symbols_by_tf: Dict[str, List[str]] = {}
             for sig in root_signals:
                 rt = sig.get("root", "?")
@@ -1537,7 +1516,6 @@ class Scanner:
 
             window_map = {"60": 30, "240": 12, "D": 5}
             header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
-            # Ensure all three ROOT_ORDER appear
             for rt in ROOT_ORDER:
                 cnt = tf_counts.get(rt, 0)
                 win = window_map.get(rt)
@@ -1554,7 +1532,6 @@ class Scanner:
             if not root_signals:
                 header_lines.append(" - None")
             else:
-                # print each in one line: - SYMBOL | ROOT | $PRICE
                 for sig in root_signals:
                     sym = sig.get("symbol")
                     rt = sig.get("root")
@@ -1579,7 +1556,6 @@ class Scanner:
 
         # Then send one block per signal grouped by TF order 60 -> 240 -> D
         try:
-            # group signals by TF
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for sig in root_signals:
                 grouped.setdefault(sig.get("root"), []).append(sig)
@@ -1588,11 +1564,9 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                # for each signal in this tf, send single block
                 for s in lst:
                     key = (s.get("symbol"), s.get("root"))
                     ev = eval_dict.get(key, {})
-                    # ensure ev has macd_hist_val and score; if not, create minimal
                     if not ev:
                         ev = {"symbol": s.get("symbol"), "root": s.get("root"), "price": s.get("price"), "macd_hist_val": (s.get("hist") or [])[-1] if s.get("hist") else 0.0, "score": 0.0, "vol_change": s.get("vol_change"), "mtf": {}, "rating_label": "weak", "rating_score": 0.0}
                     await self.send_signal_block(s, ev)
@@ -1627,7 +1601,6 @@ class Scanner:
             if not is_positive:
                 negative_tfs.append(tf)
 
-        # Decision
         if not negative_tfs:
             return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
         if negative_tfs == ["D"]:
@@ -1654,6 +1627,104 @@ class Scanner:
             else:
                 parts.append(f"{tf}❌")
         return " ".join(parts)
+
+    # ----------------- Admin HTTP API -----------------
+    async def _admin_inspect_handler(self, request: web.Request):
+        """
+        GET /inspect?symbol=BTCUSDT&tf=60
+        Header: X-ADMIN-TOKEN: <token>
+        Returns JSON with indicator values and rating breakdown.
+        """
+        token = request.headers.get("X-ADMIN-TOKEN") or request.query.get("token") or ""
+        if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        symbol = (request.query.get("symbol") or request.match_info.get("symbol") or "").upper()
+        tf = request.query.get("tf") or "60"
+        if not symbol:
+            return web.json_response({"error": "missing symbol param"}, status=400)
+
+        try:
+            existing = self.kline_store.get(symbol, {}).get(tf)
+            if not existing or len(existing) < 10:
+                await self.seed_klines_for_symbol(symbol)
+        except Exception:
+            logger.exception("Admin inspect: seeding klines failed for %s", symbol)
+
+        try:
+            price = None
+            try:
+                price = await self.client.get_latest_price(symbol)
+            except Exception:
+                pass
+            try:
+                kl = self.kline_store.get(symbol, {}).get(tf, [])
+                if price is None and kl:
+                    price = kl[-1].get("close")
+            except Exception:
+                pass
+
+            _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
+            last_hist = hist[-1] if hist and len(hist) else None
+            prev_hist = hist[-2] if hist and len(hist) >= 2 else None
+
+            await self._update_24h_volume(symbol)
+            vol_change = self.compute_24h_volume_change(symbol)
+
+            sr = self.compute_sr_levels(symbol, tf)
+
+            rating = self.compute_technical_rating(symbol, tf, price, hist or [], vol_change)
+
+            mtf = {}
+            try:
+                mtf = self._compute_mtf_alignment(symbol, price or 0.0)
+            except Exception:
+                mtf = {}
+
+            payload = {
+                "symbol": symbol,
+                "tf": tf,
+                "price": price,
+                "macd": {"prev": prev_hist, "last": last_hist, "hist_series_len": len(hist) if hist else 0},
+                "vol_change": vol_change,
+                "sr": sr,
+                "rating": rating,
+                "mtf": mtf,
+                "kline_store_count": len(self.kline_store.get(symbol, {}).get(tf, [])),
+            }
+            return web.json_response(payload, status=200)
+        except Exception:
+            logger.exception("Admin inspect handler failed for %s %s", symbol, tf)
+            return web.json_response({"error": "internal error"}, status=500)
+
+    async def _start_admin_server(self):
+        """
+        Start aiohttp admin server and bind it to the port expected by Render.
+        Uses PORT env var if present, otherwise 8000.
+        """
+        try:
+            port_env = os.getenv("PORT") or os.getenv("ADMIN_PORT") or "8000"
+            port = int(port_env)
+        except Exception:
+            port = 8000
+
+        app = web.Application()
+        app.router.add_get("/inspect", self._admin_inspect_handler)
+
+        self._admin_runner = web.AppRunner(app)
+        await self._admin_runner.setup()
+        self._admin_site = web.TCPSite(self._admin_runner, "0.0.0.0", port)
+        await self._admin_site.start()
+        logger.info("Admin HTTP server started on 0.0.0.0:%d (route /inspect)", port)
+
+    async def _stop_admin_server(self):
+        try:
+            if getattr(self, "_admin_runner", None):
+                await self._admin_runner.cleanup()
+                self._admin_runner = None
+                logger.info("Admin HTTP server stopped")
+        except Exception:
+            logger.exception("Error stopping admin HTTP server")
 
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
@@ -1916,6 +1987,12 @@ class Scanner:
                 await asyncio.sleep(to_sleep)
 
     async def run(self):
+        # Start admin server first so you can query immediately after deploy
+        try:
+            await self._start_admin_server()
+        except Exception:
+            logger.exception("Failed to start admin server (continuing without it)")
+
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task
@@ -1926,6 +2003,10 @@ class Scanner:
                 await self.client.close()
             except Exception:
                 logger.exception("Error closing client")
+            try:
+                await self._stop_admin_server()
+            except Exception:
+                logger.exception("Error stopping admin server")
 
     def stop(self):
         logger.info("Stopping scanner...")

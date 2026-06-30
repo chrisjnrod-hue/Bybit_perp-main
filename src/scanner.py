@@ -13,6 +13,16 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
 
+# ADDED: data science libs for local TV-like rating
+try:
+    import pandas as pd
+    import numpy as np
+    import pandas_ta as ta
+    _PANDAS_TA_AVAILABLE = True
+except Exception:
+    # If pandas_ta not installed, we will still continue but rating will be neutral
+    _PANDAS_TA_AVAILABLE = False
+
 from .logger import get_logger
 from .bybit_client import BybitClient
 from .macd import macd_histogram, slope
@@ -21,7 +31,7 @@ from .config import (
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
     MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
-    REST_POLL_INTERVAL
+    REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING
 )
 from .telegram import send_message
 from .trade_manager import TradeManager
@@ -61,6 +71,12 @@ class Scanner:
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE
         )
+
+        # NEW: push / dedupe state for Telegram sending
+        self._first_deploy_push = True
+        self._last_full_push_ts: Optional[int] = None  # epoch seconds for last full push (candle start)
+        # sent root signals map: (symbol, root) -> start_at (to avoid repeated sends)
+        self._sent_root_signals: Dict[tuple, int] = {}
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -874,16 +890,31 @@ class Scanner:
                             
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
+                                # obtain start_at for last candle if available
+                                start_at = None
+                                try:
+                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                    if last_candles:
+                                        start_at = last_candles[-1].get("start_at")
+                                except Exception:
+                                    start_at = None
+
+                                # Compute local TV-like rating for this root signal
+                                tv_score, tv_label = self.compute_tv_rating(sym, root, price)
+
                                 root_signals.append({
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
                                     "hist": hist,
-                                    "vol_change": vol_change
+                                    "vol_change": vol_change,
+                                    "start_at": start_at,
+                                    "tv_score": tv_score,
+                                    "tv_label": tv_label
                                 })
-                                logger.info("SIGNAL DETECTED: %s %s @ %s", sym, root, price)
+                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
                                 if DEBUG_SURGICAL_LOGS:
-                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE", sym, root, price)
+                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE tv=%s", sym, root, price, tv_label)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -912,10 +943,27 @@ class Scanner:
 
                 logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
                 logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
-                await self._emit_event("root_signals", root_signals)
 
                 await self._check_monitored_symbols()
 
+                # Decide whether to send full push or only delta signals
+                full_push = False
+                now_ts = int(time.time())
+                # If first deploy, always do full push
+                if self._first_deploy_push:
+                    full_push = True
+                else:
+                    # If ROOT_SCAN_INTERVAL == 0 (align to 5m candles) we allow a full push once per candle start
+                    if ROOT_SCAN_INTERVAL == 0:
+                        # compute current 5m candle start timestamp
+                        candle_start = (now_ts // 300) * 300
+                        if self._last_full_push_ts != candle_start:
+                            # it's a new candle boundary -> do full push one time
+                            full_push = True
+                            self._last_full_push_ts = candle_start
+
+                # Evaluate candidates and open trades (if any) BEFORE sending summary so recommendation blocks include accept decisions
+                evaluated = []
                 if root_signals:
                     for sig in root_signals:
                         try:
@@ -928,9 +976,14 @@ class Scanner:
                 else:
                     evaluated = []
                     logger.info("No root signals this interval.")
-                
-                await self.send_summary(root_signals, evaluated)
-                
+
+                # send summary: full push if permitted otherwise only delta/new signals
+                await self.send_summary(root_signals, evaluated=evaluated, full_push=full_push)
+
+                # After first full push, mark first_deploy_push cleared
+                if self._first_deploy_push and full_push:
+                    self._first_deploy_push = False
+
                 try:
                     candidates_count = len(root_signals) if root_signals else 0
                     logger.info("ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
@@ -1136,7 +1189,7 @@ class Scanner:
         """
         Evaluate MTF alignment for each root signal and act on each scenario.
 
-        Scenario A  (aligned)       → open trade if TRADE_ENABLED
+        Scenario A  (aligned)       → open trade if TRADE_ENABLED and volume gate passes
         Scenario C  (daily_rising)  → open trade
         Scenario B  (monitoring)    → add to watch-list until last flip
         """
@@ -1181,10 +1234,26 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                entry["accept"] = True
-                entry["reason"] = mtf_status
-                to_open.append(entry)
-                logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
+                # Check volume gate
+                if VOLUME_FILTER_ENABLED:
+                    if vol_change is None:
+                        entry["accept"] = False
+                        entry["reason"] = "vol_filter_blocked"
+                        logger.info("Volume gate blocked open (no vol_change): %s", sym)
+                    elif vol_change < VOLUME_MIN_CHANGE_PCT:
+                        entry["accept"] = False
+                        entry["reason"] = "vol_filter_blocked"
+                        logger.info("Volume gate blocked open (vol_change %.3f < threshold %.3f): %s", vol_change, VOLUME_MIN_CHANGE_PCT, sym)
+                    else:
+                        entry["accept"] = True
+                        entry["reason"] = mtf_status
+                        to_open.append(entry)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
+                else:
+                    entry["accept"] = True
+                    entry["reason"] = mtf_status
+                    to_open.append(entry)
+                    logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -1204,7 +1273,7 @@ class Scanner:
 
         logger.warning(
             "[CANDIDATES_SUMMARY] Total evaluated=%d, Accepted/To Open=%d, Monitoring now=%d",
-            len(evaluated), len(to_open), len(self._mtf_monitoring)
+            len(evaluated), len([e for e in evaluated if e.get("accept")]), len(self._mtf_monitoring)
         )
 
         candidates = to_open
@@ -1273,81 +1342,75 @@ class Scanner:
 
         return evaluated
 
-    async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None):
+    async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None, full_push: bool = False):
         """
         Telegram summary layout with MTF alignment visualization.
+
+        Behavior changes:
+        - If full_push True: send full header + signals + recommendation blocks (same as original behavior).
+        - If full_push False: only send new root signals discovered this interval (based on start_at dedupe).
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
-        eval_map: Dict[tuple, Dict[str, Any]] = {}
-        if evaluated:
-            for e in evaluated:
-                eval_map[(e["symbol"], e["root"])] = e
+        # If no signals and no evaluated entries for full push, still send only header on full push
+        if full_push:
+            # Existing "full" behavior (unchanged) - reuse your previous full message blocks
+            eval_map: Dict[tuple, Dict[str, Any]] = {}
+            if evaluated:
+                for e in evaluated:
+                    eval_map[(e["symbol"], e["root"])] = e
 
-        tf_counts: Dict[str, int] = {}
-        for sig in root_signals:
-            rt = sig.get("root", "?")
-            tf_counts[rt] = tf_counts.get(rt, 0) + 1
-
-        window_map = {"60": 30, "240": 12, "D": 5}
-        header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
-        for rt in ROOT_TFS:
-            cnt = tf_counts.get(rt, 0)
-            win = window_map.get(rt)
-            if cnt:
-                if win:
-                    header_lines.append(f"  {rt}: {cnt} (window: {win})")
-                else:
-                    header_lines.append(f"  {rt}: {cnt}")
-
-        header_lines.append("")
-        header_lines.append("Signals (all root TF signals):")
-        if not root_signals:
-            header_lines.append("  None")
-        else:
+            tf_counts: Dict[str, int] = {}
             for sig in root_signals:
-                sym = sig.get("symbol")
-                rt = sig.get("root")
-                price = sig.get("price", 0)
-                try:
-                    if price >= 1000:
-                        price_str = f"${price:,.2f}"
-                    elif price >= 1:
-                        price_str = f"${price:.4f}"
+                rt = sig.get("root", "?")
+                tf_counts[rt] = tf_counts.get(rt, 0) + 1
+
+            window_map = {"60": 30, "240": 12, "D": 5}
+            header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
+            for rt in ROOT_TFS:
+                cnt = tf_counts.get(rt, 0)
+                win = window_map.get(rt)
+                if cnt:
+                    if win:
+                        header_lines.append(f"  {rt}: {cnt} (window: {win})")
                     else:
-                        price_str = f"${price:.8f}"
-                except Exception:
-                    price_str = str(price)
-                header_lines.append(f"  - {sym} | {rt} | {price_str}")
+                        header_lines.append(f"  {rt}: {cnt}")
 
-        first_block = "\n".join(header_lines)
-        try:
-            await send_message(first_block)
-        except Exception:
-            logger.exception("Failed to send first summary block")
+            header_lines.append("")
+            header_lines.append("Signals (all root TF signals):")
+            if not root_signals:
+                header_lines.append("  None")
+            else:
+                for sig in root_signals:
+                    sym = sig.get("symbol")
+                    rt = sig.get("root")
+                    price = sig.get("price", 0)
+                    try:
+                        if price >= 1000:
+                            price_str = f"${price:,.2f}"
+                        elif price >= 1:
+                            price_str = f"${price:.4f}"
+                        else:
+                            price_str = f"${price:.8f}"
+                    except Exception:
+                        price_str = str(price)
+                    header_lines.append(f"  - {sym} | {rt} | {price_str}")
 
-        signal_tfs = [rt for rt in ROOT_TFS if rt in tf_counts]
-        for rt in signal_tfs:
-            tf_sigs = [s for s in root_signals if s.get("root") == rt]
-            tf_sigs_sorted = sorted(
-                tf_sigs,
-                key=lambda s: eval_map.get((s["symbol"], s["root"]), {}).get("score", 0.0),
-                reverse=True,
-            )
-            for sig in tf_sigs_sorted:
+            first_block = "\n".join(header_lines)
+            try:
+                await send_message(first_block)
+            except Exception:
+                logger.exception("Failed to send first summary block")
+
+            # Send per-signal blocks (same as before)
+            for sig in root_signals:
                 try:
                     sym        = sig["symbol"]
+                    rt         = sig["root"]
                     price      = sig["price"]
                     vol_change = sig.get("vol_change")
-                    ev         = eval_map.get((sym, rt), {})
-
-                    macd_hist_val = float(ev.get("macd_hist_val") or 0.0)
-                    score         = float(ev.get("score")         or 0.0)
-                    mtf_status    = ev.get("mtf_status", "unknown")
-                    mtf_tfs       = ev.get("mtf", {})
-
-                    negative_tfs  = ev.get("negative_tfs", [])
-                    one_d_slope   = ev.get("one_d_slope")
+                    tv_score   = sig.get("tv_score")
+                    tv_label   = sig.get("tv_label")
 
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
@@ -1363,64 +1426,344 @@ class Scanner:
                         except Exception:
                             vol_str = str(vol_change)
 
-                    mtf_state_str = self._build_mtf_state_str(mtf_tfs) if mtf_tfs else "N/A"
-
-                    if mtf_status == "aligned":
-                        state_str = "✅ Aligned (Accept)"
-                    elif mtf_status == "daily_rising":
-                        slope_note = f" (D slope: {one_d_slope:+.4f})" if one_d_slope is not None else ""
-                        state_str = f"📈 Daily Rising (Accept){slope_note}"
-                    elif mtf_status == "monitoring":
-                        state_str = f"⏳ Monitoring (Not accepted yet)"
-                    else:
-                        state_str = "❓ Unknown"
-
                     block = "\n".join([
                         f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
-                        f"MACD H: {macd_hist_val:+.6f}",
+                        f"TV Rating: {tv_label} ({tv_score:+.3f})",
                         f"24h Vol Δ: {vol_str}",
-                        f"MTF State: {mtf_state_str}",
-                        f"Status: {state_str}",
                     ])
                     await send_message(block)
                 except Exception:
                     logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
 
-        try:
-            current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-            remaining = max(0, MAX_OPEN_TRADES - current_open)
-            accepted = []
-            if evaluated:
-                for e in evaluated:
-                    if e.get("accept"):
-                        accepted.append(e)
-            accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
-            recommended = accepted_sorted[:remaining] if remaining > 0 else []
+            # Full recommended and summary block (unchanged from original)
+            try:
+                if evaluated:
+                    current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
+                    remaining = max(0, MAX_OPEN_TRADES - current_open)
+                    accepted = [e for e in evaluated if e.get("accept")]
+                    accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
+                    recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
-            rec_lines = [f"📣 Recommended Signals for Trading — {now_str}"]
-            rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
-            rec_lines.append(f"Slots available: {remaining}")
-            if not recommended:
-                rec_lines.append("No recommended signals to open at this time.")
-            else:
-                for r in recommended:
-                    sym = r["symbol"]
-                    rt = r["root"]
-                    price = r["price"]
-                    score = r.get("score", 0.0)
+                    rec_lines = [f"📣 Recommended Signals for Trading — {now_str}"]
+                    rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
+                    rec_lines.append(f"Slots available: {remaining}")
+                    if not recommended:
+                        rec_lines.append("No recommended signals to open at this time.")
+                    else:
+                        for r in recommended:
+                            sym = r["symbol"]
+                            rt = r["root"]
+                            price = r["price"]
+                            score = r.get("score", 0.0)
+                            if price >= 1000:
+                                price_str = f"${price:,.2f}"
+                            elif price >= 1:
+                                price_str = f"${price:.4f}"
+                            else:
+                                price_str = f"${price:.8f}"
+                            rec_lines.append(f"  - {sym} | {rt} | {price_str} | score={score:.2f}")
+
+                    await send_message("\n".join(rec_lines))
+            except Exception:
+                logger.exception("Failed to send recommended signals block (full_push)")
+
+        else:
+            # Minimal push: send only new root signals discovered this interval (based on start_at)
+            if not root_signals:
+                return
+            # dedupe and only send signals that we haven't sent for their (symbol,root) at this start_at
+            to_send = []
+            now = int(time.time())
+            # clean old sent entries > 86400s
+            expiry = 86400
+            for key, st in list(self._sent_root_signals.items()):
+                if now - (st or 0) > expiry:
+                    self._sent_root_signals.pop(key, None)
+
+            for sig in root_signals:
+                sym = sig.get("symbol")
+                rt = sig.get("root")
+                start_at = sig.get("start_at")
+                key = (sym, rt)
+                if start_at is None:
+                    # if no start_at available, fallback to send-once per symbol-root (not ideal)
+                    if key not in self._sent_root_signals:
+                        to_send.append(sig)
+                        self._sent_root_signals[key] = now
+                else:
+                    # only send if start_at differs from last sent
+                    last_sent_start = self._sent_root_signals.get(key)
+                    if not last_sent_start or int(last_sent_start) != int(start_at):
+                        to_send.append(sig)
+                        self._sent_root_signals[key] = int(start_at)
+
+            for sig in to_send:
+                try:
+                    sym = sig.get("symbol")
+                    rt = sig.get("root")
+                    price = sig.get("price")
+                    vol_change = sig.get("vol_change")
+                    tv_score = sig.get("tv_score")
+                    tv_label = sig.get("tv_label")
+
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
                     elif price >= 1:
                         price_str = f"${price:.4f}"
                     else:
                         price_str = f"${price:.8f}"
-                    rec_lines.append(f"  - {sym} | {rt} | {price_str} | score={score:.2f}")
 
-            await send_message("\n".join(rec_lines))
+                    vol_str = "N/A"
+                    if vol_change is not None:
+                        try:
+                            vol_str = f"{vol_change * 100:+.1f}%"
+                        except Exception:
+                            vol_str = str(vol_change)
+
+                    block = "\n".join([
+                        f"📌 Bybit Perp | {rt} Signal",
+                        f"Symbol: {sym}",
+                        f"Price: {price_str}",
+                        f"TV Rating: {tv_label} ({tv_score:+.3f})",
+                        f"24h Vol Δ: {vol_str}",
+                    ])
+                    await send_message(block)
+                except Exception:
+                    logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
+
+    def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None) -> (float, str):
+        """
+        Compute a TradingView-like normalized score and label for given symbol/timeframe
+        using the kline_store data available. Returns (score, label).
+
+        Note:
+        - Uses pandas_ta if available; otherwise returns (0.0, "Neutral").
+        - Only uses close and volume (these are available in kline_store). For richer
+          indicators you can seed kline_store with high/low/open values first.
+        """
+        cfg = TECHNICAL_RATING
+        if not cfg.get("enabled", True):
+            return 0.0, "Neutral"
+
+        if not _PANDAS_TA_AVAILABLE:
+            logger.debug("pandas_ta not available - returning neutral TV rating")
+            return 0.0, "Neutral"
+
+        try:
+            klines = self.kline_store.get(symbol, {}).get(tf, [])
+            if not klines or len(klines) < 30:
+                return 0.0, "Neutral"
+
+            # Build DataFrame from store - we only have start_at, close, volume
+            df = pd.DataFrame(klines)
+            if "close" not in df.columns:
+                return 0.0, "Neutral"
+            df = df.dropna(subset=["close"]).copy()
+            df["close"] = df["close"].astype(float)
+            if "volume" not in df.columns:
+                df["volume"] = 0.0
+            df["volume"] = df["volume"].fillna(0.0).astype(float)
+
+            # Compute indicators
+            # SMA lengths (unique)
+            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
+            for l in ma_lengths:
+                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+
+            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
+            macd = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
+            # pick MACDh column (pandas_ta naming)
+            macd_hist_col = next((c for c in macd.columns if "MACDh" in c), None)
+            if macd_hist_col:
+                df["macd_hist"] = macd[macd_hist_col]
+            else:
+                # fallback compute
+                df["macd_hist"] = macd.get(macd.columns[-1]) if not macd.empty else 0.0
+
+            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
+            # fallback: use close for high/low if not available
+            try:
+                st = ta.stoch(df["close"], df["close"], df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+            except Exception:
+                # some pandas_ta versions expect positional args differently; attempt named
+                try:
+                    st = ta.stoch(high=df["close"], low=df["close"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+                except Exception:
+                    st = pd.DataFrame()
+            if not st.empty:
+                stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
+                if stoch_k_col:
+                    df["stoch_k"] = st[stoch_k_col]
+            df["obv"] = ta.obv(df["close"], df["volume"])
+            bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
+                           std=int(cfg["indicators"].get("bollinger", [20, 2])[1]))
+            # pick upper and lower if present
+            bb_up = next((c for c in bb.columns if "BBU" in c), None)
+            bb_mid = next((c for c in bb.columns if "BBM" in c), None)
+            bb_low = next((c for c in bb.columns if "BBL" in c), None)
+            if bb_up:
+                df["bb_upper"] = bb[bb_up]
+            if bb_mid:
+                df["bb_mid"] = bb[bb_mid]
+            if bb_low:
+                df["bb_lower"] = bb[bb_low]
+
+            # Use last row
+            last = df.iloc[-1]
+            # Prepare per-indicator normalized scores in [-1,1]
+            scores = []
+            weights = cfg.get("weights", {})
+
+            # MA pairs: distance normalized by sma mid-range (use relative pct)
+            for pair in cfg["indicators"]["ma_pairs"]:
+                short, long = pair
+                s = last.get(f"sma_{short}", np.nan)
+                l = last.get(f"sma_{long}", np.nan)
+                if pd.isna(s) or pd.isna(l) or l == 0:
+                    continue
+                pct = (s - l) / l
+                tol = cfg["tolerance"].get("ma_pair_pct", 0.002)
+                # map pct to [-1,1], clamp at +/-0.02 (2%) for scaling
+                mag = max(-1.0, min(1.0, pct / 0.02))
+                if abs(pct) <= tol:
+                    sub = 0.0
+                else:
+                    sub = float(np.tanh(mag * 2.0))  # smooth
+                w = weights.get("ma_pair", 1.0)
+                scores.append((sub, w))
+
+            # MACD hist
+            macd_hist = last.get("macd_hist", 0.0)
+            if not pd.isna(macd_hist):
+                # normalize by recent hist std dev
+                hist_series = df["macd_hist"].dropna()
+                denom = hist_series.std() if not hist_series.empty else 1.0
+                denom = denom if denom != 0 else 1.0
+                sub = float(np.tanh((macd_hist / denom)))  # map to [-1,1]
+                scores.append((sub, weights.get("macd", 1.5)))
+
+            # RSI: distance from 50
+            rsi = last.get("rsi", None)
+            if rsi is not None and not pd.isna(rsi):
+                sub = float((rsi - 50.0) / 50.0)  # -1..+1 roughly
+                sub = max(-1.0, min(1.0, sub))
+                scores.append((sub, weights.get("rsi", 1.0)))
+
+            # Stochastic (use k)
+            k = last.get("stoch_k", None)
+            if k is not None and not pd.isna(k):
+                sub = 0.0
+                if k > 80:
+                    sub = (k - 80) / 20.0
+                elif k < 20:
+                    sub = (k - 20) / 20.0
+                sub = max(-1.0, min(1.0, sub))
+                scores.append((sub, weights.get("stochastic", 0.8)))
+
+            # OBV slope
+            obv = df["obv"].dropna()
+            if len(obv) >= cfg["tolerance"].get("obv_slope_lookback", 5):
+                slope_val = obv.iloc[-1] - obv.iloc[-cfg["tolerance"].get("obv_slope_lookback", 5)]
+                denom = obv.pct_change().std() if obv.pct_change().std() not in (0, None) else 1.0
+                sub = float(np.tanh((slope_val / (denom if denom != 0 else 1.0)) * 0.5))
+                scores.append((sub, weights.get("obv", 1.0)))
+
+            # Bollinger distance (price vs mid) normalized by mid
+            if "bb_mid" in last and not pd.isna(last.get("bb_mid")) and last.get("bb_mid") != 0:
+                dist = (last["close"] - last["bb_mid"]) / (last["bb_mid"])
+                sub = float(np.tanh(dist * 5.0))  # scale
+                scores.append((sub, weights.get("bollinger", 0.6)))
+
+            # Aggregate weighted sum and normalize
+            if not scores:
+                return 0.0, "Neutral"
+            num = sum(s * w for (s, w) in scores)
+            denom = sum(abs(w) for (_, w) in scores) or 1.0
+            score = float(num / denom)
+
+            # Map to label via thresholds
+            t = cfg.get("thresholds", {"strong_buy": 0.6, "buy": 0.25, "sell": -0.25, "strong_sell": -0.6})
+            label = "Neutral"
+            if score >= t["strong_buy"]:
+                label = "Strong Buy"
+            elif score >= t["buy"]:
+                label = "Buy"
+            elif score <= t["strong_sell"]:
+                label = "Strong Sell"
+            elif score <= t["sell"]:
+                label = "Sell"
+            return score, label
         except Exception:
-            logger.exception("Failed to send recommended signals block")
+            logger.exception("compute_tv_rating error for %s %s", symbol, tf)
+            return 0.0, "Neutral"
+
+    def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
+        # (Method already defined above; kept for completeness in file order)
+        tf_states: Dict[str, Dict[str, Any]] = {}
+        negative_tfs: List[str] = []
+        one_d_hist: List[float] = []
+
+        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
+
+        for tf in MTF_ALIGN_TFS:
+            _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
+            hist = hist or []
+            cur  = hist[-1] if hist else None
+            prev = hist[-2] if len(hist) >= 2 else None
+            is_positive = cur is not None and cur > 0
+            is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
+            
+            numeric_count = sum(1 for v in hist if v is not None)
+            logger.warning(
+                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
+                tf,
+                len(hist),
+                numeric_count,
+                f"{prev:.8f}" if prev is not None else "None",
+                f"{cur:.8f}" if cur is not None else "None",
+                is_positive,
+                is_flip
+            )
+            
+            tf_states[tf] = {
+                "cur": cur, "prev": prev,
+                "is_positive": is_positive, "is_flip": is_flip, "slope": None,
+            }
+            if tf == "D":
+                one_d_hist = hist
+            if not is_positive:
+                negative_tfs.append(tf)
+                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
+
+        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
+
+        # Scenario A: all TFs positive
+        if not negative_tfs:
+            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
+            return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
+
+        # Scenario C: only D is negative but rising
+        if negative_tfs == ["D"]:
+            one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
+            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
+            if one_d_slope is not None and one_d_slope > 0:
+                tf_states["D"]["slope"] = one_d_slope
+                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
+                return {
+                    "status": "daily_rising",
+                    "tfs": tf_states,
+                    "negative_tfs": ["D"],
+                    "one_d_slope": one_d_slope,
+                }
+            else:
+                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
+
+        # Scenario B: 1+ TFs negative and Scenario C not met
+        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
+        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

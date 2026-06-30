@@ -1,26 +1,27 @@
 # scanner.py - FINAL PRODUCTION VERSION
-# Last Updated: June 20, 2026
-# All 30 issues audited, 3 critical fixes applied
-# Status: ✅ PRODUCTION READY
+# Last Updated: 2026-06-30
+# Status: PRODUCTION (updated with local TradingView-like rating & improved Telegram push behavior)
 
 import os
 import asyncio
 import time
 import json
 from collections import defaultdict
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
 
-# ADDED: data science libs for local TV-like rating
+# Attempt to import pandas/pandas_ta; if unavailable, rating will return neutral
 try:
     import pandas as pd
     import numpy as np
     import pandas_ta as ta
     _PANDAS_TA_AVAILABLE = True
 except Exception:
-    # If pandas_ta not installed, we will still continue but rating will be neutral
+    pd = None  # type: ignore
+    np = None  # type: ignore
+    ta = None  # type: ignore
     _PANDAS_TA_AVAILABLE = False
 
 from .logger import get_logger
@@ -45,7 +46,6 @@ DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
 # ============ MTF Alignment TFs — NUMERIC format matching Bybit API ============
-# Changed from ["5m", "15m", "1h", "4h", "1d"] to numeric format
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 
 
@@ -67,16 +67,17 @@ class Scanner:
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
-        logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
-            bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE
-        )
 
         # NEW: push / dedupe state for Telegram sending
         self._first_deploy_push = True
         self._last_full_push_ts: Optional[int] = None  # epoch seconds for last full push (candle start)
         # sent root signals map: (symbol, root) -> start_at (to avoid repeated sends)
         self._sent_root_signals: Dict[tuple, int] = {}
+
+        logger.info(
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s PANDAS_TA=%s)",
+            bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE, _PANDAS_TA_AVAILABLE
+        )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
@@ -287,7 +288,8 @@ class Scanner:
 
     def _normalize_klines(self, raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
         """
-        FIX #21: Properly normalize kline responses handling dicts, lists, and tuples
+        Normalize kline responses handling dicts, lists, and tuples.
+        Ensures each normalized candle includes open, high, low, close, volume, start_at, is_closed when possible.
         """
         out: List[Dict[str, Any]] = []
         if not raw_klines:
@@ -301,10 +303,9 @@ class Scanner:
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
 
-        # Ensure we have a list/tuple before iterating (FIX #21)
+        # Ensure we have a list/tuple before iterating
         if not isinstance(raw_klines, (list, tuple)):
             if isinstance(raw_klines, dict):
-                # If we got a single dict response, wrap it
                 seq = [raw_klines]
             else:
                 seq = [raw_klines] if raw_klines else []
@@ -314,7 +315,11 @@ class Scanner:
         for item in seq:
             try:
                 if isinstance(item, (list, tuple)):
+                    # common kline layout: [ts, open, high, low, close, volume, ...]
                     start = None
+                    open_p = None
+                    high = None
+                    low = None
                     close = None
                     vol = None
                     if len(item) >= 1:
@@ -322,6 +327,21 @@ class Scanner:
                             start = int(item[0])
                         except Exception:
                             start = None
+                    if len(item) >= 2:
+                        try:
+                            open_p = float(item[1])
+                        except Exception:
+                            open_p = None
+                    if len(item) >= 3:
+                        try:
+                            high = float(item[2])
+                        except Exception:
+                            high = None
+                    if len(item) >= 4:
+                        try:
+                            low = float(item[3])
+                        except Exception:
+                            low = None
                     if len(item) >= 5:
                         try:
                             close = float(item[4])
@@ -332,47 +352,74 @@ class Scanner:
                             vol = float(item[5])
                         except Exception:
                             vol = None
-                    
+
                     if close is not None:
-                        out.append({"start_at": start, "close": close, "volume": vol})
+                        out.append({
+                            "start_at": start, "open": open_p, "high": high, "low": low,
+                            "close": close, "volume": vol
+                        })
                     continue
 
                 if isinstance(item, dict):
                     start = (
-                        item.get("start_at") 
-                        or item.get("open_time") 
-                        or item.get("t") 
-                        or item.get("timestamp") 
+                        item.get("start_at")
+                        or item.get("open_time")
+                        or item.get("t")
+                        or item.get("timestamp")
                         or item.get("start")
                         or item.get("time")
                     )
+                    open_p = (
+                        item.get("open")
+                        or item.get("openPrice")
+                        or item.get("o")
+                    )
+                    high = (
+                        item.get("high")
+                        or item.get("h")
+                    )
+                    low = (
+                        item.get("low")
+                        or item.get("l")
+                    )
                     close = (
-                        item.get("close") 
-                        or item.get("close_price") 
-                        or item.get("c") 
-                        or item.get("last_price") 
+                        item.get("close")
+                        or item.get("close_price")
+                        or item.get("c")
+                        or item.get("last_price")
                         or item.get("Close")
                     )
                     vol = (
-                        item.get("volume") 
-                        or item.get("vol") 
-                        or item.get("turnover") 
+                        item.get("volume")
+                        or item.get("vol")
+                        or item.get("turnover")
                         or item.get("v")
                         or item.get("quoteAsset")
                     )
                     is_closed = item.get("isClosed")
                     if is_closed is None:
-                        is_closed = item.get("is_closed")
-                    if is_closed is None:
-                        is_closed = item.get("complete")
-                    if is_closed is None:
-                        is_closed = item.get("confirmed")
-                    
+                        is_closed = item.get("is_closed") or item.get("complete") or item.get("confirmed")
+
                     try:
                         if start is not None:
                             start = int(start)
                     except Exception:
                         start = None
+                    try:
+                        if open_p is not None:
+                            open_p = float(open_p)
+                    except Exception:
+                        open_p = None
+                    try:
+                        if high is not None:
+                            high = float(high)
+                    except Exception:
+                        high = None
+                    try:
+                        if low is not None:
+                            low = float(low)
+                    except Exception:
+                        low = None
                     try:
                         if close is not None:
                             close = float(close)
@@ -383,11 +430,13 @@ class Scanner:
                             vol = float(vol)
                     except Exception:
                         vol = None
-                    
-                    if close is not None:
-                        out.append({"start_at": start, "close": close, "volume": vol, "is_closed": is_closed})
-                    continue
 
+                    if close is not None:
+                        out.append({
+                            "start_at": start, "open": open_p, "high": high, "low": low,
+                            "close": close, "volume": vol, "is_closed": is_closed
+                        })
+                    continue
             except Exception:
                 logger.exception("Failed to normalize kline item: %s", item)
                 continue
@@ -470,7 +519,14 @@ class Scanner:
                         if close is None:
                             continue
                         if isinstance(close, (int, float)) and math.isfinite(float(close)):
-                            valid.append({"start_at": start, "close": float(close), "volume": c.get("volume")})
+                            valid.append({
+                                "start_at": start,
+                                "open": c.get("open"),
+                                "high": c.get("high"),
+                                "low": c.get("low"),
+                                "close": float(close),
+                                "volume": c.get("volume")
+                            })
                     except Exception:
                         continue
 
@@ -555,6 +611,9 @@ class Scanner:
                                         if c.get("close") is not None:
                                             last_new = {
                                                 "start_at": c.get("start_at"), 
+                                                "open": c.get("open"),
+                                                "high": c.get("high"),
+                                                "low": c.get("low"),
                                                 "close": float(c.get("close")), 
                                                 "volume": c.get("volume")
                                             }
@@ -582,8 +641,6 @@ class Scanner:
                         break
                     batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
                     tasks = [asyncio.create_task(poll_symbol(s)) for s in batch]
-                    
-                    # FIX #23: Removed timeout - let tasks complete naturally, return exceptions
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 elapsed = time.time() - start
@@ -622,7 +679,7 @@ class Scanner:
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
-        FIX #24: Consistent MACD calculation - always replace last close with current price
+        Consistent MACD calculation - always replace last close with current price
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -635,7 +692,7 @@ class Scanner:
             except Exception:
                 continue
         
-        # Determine current price (consistent logic - FIX #24)
+        # Determine current price
         current_price = None
         if include_price is not None:
             current_price = float(include_price)
@@ -647,7 +704,6 @@ class Scanner:
             except Exception:
                 pass
         
-        # Consistently replace last close with current price (FIX #24)
         if current_price is not None:
             if closes:
                 closes[-1] = current_price
@@ -659,14 +715,6 @@ class Scanner:
             valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
             logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
                        symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
-        
-        if DEBUG_SURGICAL_LOGS and len(closes) > 0:
-            try:
-                last_10_hist = hist[-10:] if hist and len(hist) >= 10 else (hist if hist else [])
-                logger.info("[MACD_DEBUG] %s %s: closes=%d, hist_last_10=%s", 
-                           symbol, tf, len(closes), last_10_hist)
-            except Exception as e:
-                logger.info("[MACD_DEBUG] %s %s: error formatting histogram: %s", symbol, tf, str(e)[:50])
         
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
@@ -773,6 +821,292 @@ class Scanner:
         except Exception:
             logger.debug("Could not compute 24h volume change for %s", symbol)
             return None
+
+    def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None) -> Tuple[float, str]:
+        """
+        Compute a TradingView-like normalized score and label for given symbol/timeframe
+        using the kline_store data available. Returns (score, label).
+
+        Notes:
+        - Uses pandas_ta when available; otherwise returns neutral.
+        - Requires open/high/low/close/volume in kline_store for better indicator accuracy.
+        """
+        cfg = TECHNICAL_RATING
+        if not cfg.get("enabled", True):
+            return 0.0, "Neutral"
+
+        if not _PANDAS_TA_AVAILABLE:
+            if DIAGNOSTIC_MODE:
+                logger.debug("compute_tv_rating: pandas_ta not available - returning neutral")
+            return 0.0, "Neutral"
+
+        try:
+            klines = self.kline_store.get(symbol, {}).get(tf, [])
+            # require at least MACD slow period (26) + 5 bars
+            ma_max = max([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]) if cfg["indicators"].get("ma_pairs") else 50
+            min_candles = max(26, ma_max + 5)
+            if not klines or len(klines) < min_candles:
+                if DIAGNOSTIC_MODE:
+                    logger.debug("compute_tv_rating: insufficient candles for %s %s: have=%d need=%d",
+                                 symbol, tf, len(klines) if klines else 0, min_candles)
+                return 0.0, "Neutral"
+
+            df = pd.DataFrame(klines)
+            # Ensure required columns
+            for col in ("open", "high", "low", "close", "volume"):
+                if col not in df.columns:
+                    df[col] = np.nan
+            df = df.dropna(subset=["close"]).copy()
+            # convert types where possible
+            try:
+                df["open"] = df["open"].astype(float)
+            except Exception:
+                pass
+            try:
+                df["high"] = df["high"].astype(float)
+            except Exception:
+                pass
+            try:
+                df["low"] = df["low"].astype(float)
+            except Exception:
+                pass
+            df["close"] = df["close"].astype(float)
+            df["volume"] = df["volume"].fillna(0.0).astype(float)
+
+            # Compute indicators
+            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
+            for l in ma_lengths:
+                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+
+            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
+            macd = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
+            macd_hist_col = next((c for c in macd.columns if "MACDh" in c), None)
+            if macd_hist_col:
+                df["macd_hist"] = macd[macd_hist_col]
+            else:
+                if not macd.empty:
+                    df["macd_hist"] = macd.iloc[:, -1]
+                else:
+                    df["macd_hist"] = 0.0
+
+            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
+            try:
+                st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+                if not st.empty:
+                    stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
+                    if stoch_k_col:
+                        df["stoch_k"] = st[stoch_k_col]
+            except Exception:
+                try:
+                    st = ta.stoch(df["close"], df["close"], df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+                    if not st.empty:
+                        stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
+                        if stoch_k_col:
+                            df["stoch_k"] = st[stoch_k_col]
+                except Exception:
+                    pass
+
+            try:
+                adx_series = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
+                if "ADX_14" in adx_series:
+                    df["adx"] = adx_series["ADX_14"]
+                else:
+                    # attempt to find any ADX-like column
+                    adx_col = next((c for c in adx_series.columns if "ADX" in c), None)
+                    if adx_col:
+                        df["adx"] = adx_series[adx_col]
+                    else:
+                        df["adx"] = np.nan
+            except Exception:
+                df["adx"] = np.nan
+
+            df["obv"] = ta.obv(df["close"], df["volume"])
+            bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
+                           std=int(cfg["indicators"].get("bollinger", [20, 2])[1]))
+            if not bb.empty:
+                for c in bb.columns:
+                    df[c] = bb[c]
+
+            last = df.iloc[-1]
+            scores: List[Tuple[float, float]] = []
+            weights = cfg.get("weights", {})
+
+            # MA pairs
+            for pair in cfg["indicators"]["ma_pairs"]:
+                short, long = pair
+                s = last.get(f"sma_{short}", np.nan)
+                l = last.get(f"sma_{long}", np.nan)
+                if pd.isna(s) or pd.isna(l) or l == 0:
+                    continue
+                pct = (s - l) / l
+                tol = cfg["tolerance"].get("ma_pair_pct", 0.002)
+                if abs(pct) <= tol:
+                    sub = 0.0
+                else:
+                    mag = max(-1.0, min(1.0, pct / 0.02))
+                    sub = float(np.tanh(mag * 2.0))
+                scores.append((sub, weights.get("ma_pair", 1.0)))
+
+            # MACD hist
+            macd_hist = last.get("macd_hist", 0.0)
+            if not pd.isna(macd_hist):
+                hist_series = df["macd_hist"].dropna()
+                denom = hist_series.std() if not hist_series.empty else 1.0
+                denom = denom if denom != 0 else 1.0
+                sub = float(np.tanh((macd_hist / denom)))
+                scores.append((sub, weights.get("macd", 1.5)))
+
+            # RSI
+            rsi = last.get("rsi", None)
+            if rsi is not None and not pd.isna(rsi):
+                sub = float((rsi - 50.0) / 50.0)
+                sub = max(-1.0, min(1.0, sub))
+                scores.append((sub, weights.get("rsi", 1.0)))
+
+            # Stochastic K
+            k = last.get("stoch_k", None)
+            if k is not None and not pd.isna(k):
+                sub = 0.0
+                if k > 80:
+                    sub = (k - 80) / 20.0
+                elif k < 20:
+                    sub = (k - 20) / 20.0
+                sub = max(-1.0, min(1.0, sub))
+                scores.append((sub, weights.get("stochastic", 0.8)))
+
+            # OBV slope
+            obv = df["obv"].dropna()
+            if len(obv) >= cfg["tolerance"].get("obv_slope_lookback", 5):
+                lb = cfg["tolerance"].get("obv_slope_lookback", 5)
+                slope_val = obv.iloc[-1] - obv.iloc[-lb]
+                denom = obv.pct_change().std() if obv.pct_change().std() not in (0, None) else 1.0
+                sub = float(np.tanh((slope_val / (denom if denom != 0 else 1.0)) * 0.5))
+                scores.append((sub, weights.get("obv", 1.0)))
+
+            # Bollinger mid distance
+            bb_mid_col = next((c for c in df.columns if "BBM" in c or "bb_middle" in c), None)
+            if bb_mid_col and not pd.isna(last.get(bb_mid_col)):
+                mid = last.get(bb_mid_col)
+                if mid != 0:
+                    dist = (last["close"] - mid) / mid
+                    sub = float(np.tanh(dist * 5.0))
+                    scores.append((sub, weights.get("bollinger", 0.6)))
+
+            # If DIAGNOSTIC_MODE enabled, log sub-scores
+            if DIAGNOSTIC_MODE:
+                try:
+                    dbg = [{"sub": float(s), "w": float(w)} for (s, w) in scores]
+                    logger.info("[TV_DBG] %s %s indicator sub-scores: %s", symbol, tf, dbg)
+                except Exception:
+                    pass
+
+            if not scores:
+                return 0.0, "Neutral"
+            num = sum(s * w for (s, w) in scores)
+            denom = sum(abs(w) for (_, w) in scores) or 1.0
+            score = float(num / denom)
+
+            # ADX amplification
+            adx = last.get("adx", None)
+            if not pd.isna(adx):
+                adx_cfg = cfg.get("adx", {})
+                thr = adx_cfg.get("threshold", 25)
+                mult = adx_cfg.get("multiplier", 1.25)
+                if adx >= thr:
+                    score *= mult
+            score = max(-2.0, min(2.0, score))
+
+            # Map to label
+            t = cfg.get("thresholds", {"strong_buy": 0.6, "buy": 0.25, "sell": -0.25, "strong_sell": -0.6})
+            label = "Neutral"
+            if score >= t["strong_buy"]:
+                label = "Strong Buy"
+            elif score >= t["buy"]:
+                label = "Buy"
+            elif score <= t["strong_sell"]:
+                label = "Strong Sell"
+            elif score <= t["sell"]:
+                label = "Sell"
+            return score, label
+        except Exception:
+            logger.exception("compute_tv_rating error for %s %s", symbol, tf)
+            return 0.0, "Neutral"
+
+    def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
+        """
+        Evaluate MTF alignment across MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
+        using NUMERIC format matching Bybit API.
+
+        Returns dict with status, per-TF states, negative_tfs list, and 1d slope.
+
+        Scenarios:
+          A — all TFs positive → "aligned"
+          C — only D (daily) negative but histogram rising (upward slope) → "daily_rising"
+          B — 1+ TFs negative (not meeting C) → "monitoring"
+        """
+        tf_states: Dict[str, Dict[str, Any]] = {}
+        negative_tfs: List[str] = []
+        one_d_hist: List[float] = []
+
+        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
+
+        for tf in MTF_ALIGN_TFS:
+            _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
+            hist = hist or []
+            cur  = hist[-1] if hist else None
+            prev = hist[-2] if len(hist) >= 2 else None
+            is_positive = cur is not None and cur > 0
+            is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
+            
+            numeric_count = sum(1 for v in hist if v is not None)
+            logger.warning(
+                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
+                tf,
+                len(hist),
+                numeric_count,
+                f"{prev:.8f}" if prev is not None else "None",
+                f"{cur:.8f}" if cur is not None else "None",
+                is_positive,
+                is_flip
+            )
+            
+            tf_states[tf] = {
+                "cur": cur, "prev": prev,
+                "is_positive": is_positive, "is_flip": is_flip, "slope": None,
+            }
+            if tf == "D":
+                one_d_hist = hist
+            if not is_positive:
+                negative_tfs.append(tf)
+                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
+
+        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
+
+        # Scenario A: all TFs positive
+        if not negative_tfs:
+            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
+            return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
+
+        # Scenario C: only D is negative but rising
+        if negative_tfs == ["D"]:
+            one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
+            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
+            if one_d_slope is not None and one_d_slope > 0:
+                tf_states["D"]["slope"] = one_d_slope
+                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
+                return {
+                    "status": "daily_rising",
+                    "tfs": tf_states,
+                    "negative_tfs": ["D"],
+                    "one_d_slope": one_d_slope,
+                }
+            else:
+                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
+
+        # Scenario B: 1+ TFs negative and Scenario C not met
+        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
+        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
@@ -1001,7 +1335,7 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # FIX #17: Align to actual Bybit 5m candle boundaries (0, 5, 10, 15... minutes UTC)
+                # Align to actual Bybit 5m candle boundaries (0, 5, 10, 15... minutes UTC)
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
@@ -1020,109 +1354,6 @@ class Scanner:
                 to_sleep = max(0, to_sleep)
                 logger.debug("[DIAGNOSTIC] Aligning to next 5m candle: sleeping %.1f seconds", to_sleep)
                 await asyncio.sleep(to_sleep)
-
-    # ------------------------------------------------------------------
-    # MTF Alignment helpers
-    # ------------------------------------------------------------------
-
-    def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
-        """
-        Evaluate MTF alignment across MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
-        using NUMERIC format matching Bybit API.
-
-        Returns dict with status, per-TF states, negative_tfs list, and 1d slope.
-
-        Scenarios:
-          A — all TFs positive → "aligned"
-          C — only D (daily) negative but histogram rising (upward slope) → "daily_rising"
-          B — 1+ TFs negative (not meeting C) → "monitoring"
-        """
-        tf_states: Dict[str, Dict[str, Any]] = {}
-        negative_tfs: List[str] = []
-        one_d_hist: List[float] = []
-
-        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
-
-        for tf in MTF_ALIGN_TFS:
-            _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
-            hist = hist or []
-            cur  = hist[-1] if hist else None
-            prev = hist[-2] if len(hist) >= 2 else None
-            is_positive = cur is not None and cur > 0
-            is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
-            
-            numeric_count = sum(1 for v in hist if v is not None)
-            logger.warning(
-                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
-                tf,
-                len(hist),
-                numeric_count,
-                f"{prev:.8f}" if prev is not None else "None",
-                f"{cur:.8f}" if cur is not None else "None",
-                is_positive,
-                is_flip
-            )
-            
-            tf_states[tf] = {
-                "cur": cur, "prev": prev,
-                "is_positive": is_positive, "is_flip": is_flip, "slope": None,
-            }
-            if tf == "D":
-                one_d_hist = hist
-            if not is_positive:
-                negative_tfs.append(tf)
-                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
-
-        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
-
-        # Scenario A: all TFs positive
-        if not negative_tfs:
-            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
-            return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
-
-        # Scenario C: only D is negative but rising
-        if negative_tfs == ["D"]:
-            one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
-            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
-            if one_d_slope is not None and one_d_slope > 0:
-                tf_states["D"]["slope"] = one_d_slope
-                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
-                return {
-                    "status": "daily_rising",
-                    "tfs": tf_states,
-                    "negative_tfs": ["D"],
-                    "one_d_slope": one_d_slope,
-                }
-            else:
-                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
-
-        # Scenario B: 1+ TFs negative and Scenario C not met
-        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
-        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
-
-    def _build_mtf_state_str(self, tf_states: Dict[str, Any]) -> str:
-        """
-        Build compact MTF state string for Telegram.
-        Example: '5✅ 15🔄 60✅ 240❌ D📈'
-
-        Legend:
-          ✅  — positive histogram
-          🔄  — just flipped positive (prev<0 → cur>0)
-          📈  — negative but rising slope (D Scenario C)
-          ❌  — negative
-        """
-        parts = []
-        for tf in MTF_ALIGN_TFS:
-            d = tf_states.get(tf, {})
-            if d.get("is_flip"):
-                parts.append(f"{tf}🔄")
-            elif d.get("is_positive"):
-                parts.append(f"{tf}✅")
-            elif tf == "D" and d.get("slope") is not None and d.get("slope", 0) > 0:
-                parts.append(f"{tf}📈")
-            else:
-                parts.append(f"{tf}❌")
-        return " ".join(parts)
 
     async def _check_monitored_symbols(self):
         """
@@ -1346,20 +1577,18 @@ class Scanner:
         """
         Telegram summary layout with MTF alignment visualization.
 
-        Behavior changes:
+        Behavior:
         - If full_push True: send full header + signals + recommendation blocks (same as original behavior).
         - If full_push False: only send new root signals discovered this interval (based on start_at dedupe).
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
-        # If no signals and no evaluated entries for full push, still send only header on full push
-        if full_push:
-            # Existing "full" behavior (unchanged) - reuse your previous full message blocks
-            eval_map: Dict[tuple, Dict[str, Any]] = {}
-            if evaluated:
-                for e in evaluated:
-                    eval_map[(e["symbol"], e["root"])] = e
+        eval_map: Dict[tuple, Dict[str, Any]] = {}
+        if evaluated:
+            for e in evaluated:
+                eval_map[(e["symbol"], e["root"])] = e
 
+        if full_push:
             tf_counts: Dict[str, int] = {}
             for sig in root_signals:
                 rt = sig.get("root", "?")
@@ -1402,7 +1631,7 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send first summary block")
 
-            # Send per-signal blocks (same as before)
+            # Send per-signal blocks (full)
             for sig in root_signals:
                 try:
                     sym        = sig["symbol"]
@@ -1411,6 +1640,11 @@ class Scanner:
                     vol_change = sig.get("vol_change")
                     tv_score   = sig.get("tv_score")
                     tv_label   = sig.get("tv_label")
+                    eval_entry = eval_map.get((sym, rt), {})
+
+                    mtf_status = eval_entry.get("mtf_status", "N/A")
+                    negative_tfs = eval_entry.get("negative_tfs", [])
+                    mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
 
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
@@ -1430,6 +1664,7 @@ class Scanner:
                         f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
+                        f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
                         f"24h Vol Δ: {vol_str}",
                     ])
@@ -1437,7 +1672,7 @@ class Scanner:
                 except Exception:
                     logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
 
-            # Full recommended and summary block (unchanged from original)
+            # Full recommended and summary block (unchanged behavior)
             try:
                 if evaluated:
                     current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
@@ -1468,15 +1703,12 @@ class Scanner:
                     await send_message("\n".join(rec_lines))
             except Exception:
                 logger.exception("Failed to send recommended signals block (full_push)")
-
         else:
             # Minimal push: send only new root signals discovered this interval (based on start_at)
             if not root_signals:
                 return
-            # dedupe and only send signals that we haven't sent for their (symbol,root) at this start_at
             to_send = []
             now = int(time.time())
-            # clean old sent entries > 86400s
             expiry = 86400
             for key, st in list(self._sent_root_signals.items()):
                 if now - (st or 0) > expiry:
@@ -1488,12 +1720,10 @@ class Scanner:
                 start_at = sig.get("start_at")
                 key = (sym, rt)
                 if start_at is None:
-                    # if no start_at available, fallback to send-once per symbol-root (not ideal)
                     if key not in self._sent_root_signals:
                         to_send.append(sig)
                         self._sent_root_signals[key] = now
                 else:
-                    # only send if start_at differs from last sent
                     last_sent_start = self._sent_root_signals.get(key)
                     if not last_sent_start or int(last_sent_start) != int(start_at):
                         to_send.append(sig)
@@ -1507,6 +1737,11 @@ class Scanner:
                     vol_change = sig.get("vol_change")
                     tv_score = sig.get("tv_score")
                     tv_label = sig.get("tv_label")
+                    eval_entry = eval_map.get((sym, rt), {})
+
+                    mtf_status = eval_entry.get("mtf_status", "N/A")
+                    negative_tfs = eval_entry.get("negative_tfs", [])
+                    mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
 
                     if price >= 1000:
                         price_str = f"${price:,.2f}"
@@ -1526,244 +1761,13 @@ class Scanner:
                         f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
+                        f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
                         f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
-
-    def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None) -> (float, str):
-        """
-        Compute a TradingView-like normalized score and label for given symbol/timeframe
-        using the kline_store data available. Returns (score, label).
-
-        Note:
-        - Uses pandas_ta if available; otherwise returns (0.0, "Neutral").
-        - Only uses close and volume (these are available in kline_store). For richer
-          indicators you can seed kline_store with high/low/open values first.
-        """
-        cfg = TECHNICAL_RATING
-        if not cfg.get("enabled", True):
-            return 0.0, "Neutral"
-
-        if not _PANDAS_TA_AVAILABLE:
-            logger.debug("pandas_ta not available - returning neutral TV rating")
-            return 0.0, "Neutral"
-
-        try:
-            klines = self.kline_store.get(symbol, {}).get(tf, [])
-            if not klines or len(klines) < 30:
-                return 0.0, "Neutral"
-
-            # Build DataFrame from store - we only have start_at, close, volume
-            df = pd.DataFrame(klines)
-            if "close" not in df.columns:
-                return 0.0, "Neutral"
-            df = df.dropna(subset=["close"]).copy()
-            df["close"] = df["close"].astype(float)
-            if "volume" not in df.columns:
-                df["volume"] = 0.0
-            df["volume"] = df["volume"].fillna(0.0).astype(float)
-
-            # Compute indicators
-            # SMA lengths (unique)
-            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
-            for l in ma_lengths:
-                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
-
-            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
-            macd = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
-            # pick MACDh column (pandas_ta naming)
-            macd_hist_col = next((c for c in macd.columns if "MACDh" in c), None)
-            if macd_hist_col:
-                df["macd_hist"] = macd[macd_hist_col]
-            else:
-                # fallback compute
-                df["macd_hist"] = macd.get(macd.columns[-1]) if not macd.empty else 0.0
-
-            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
-            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
-            # fallback: use close for high/low if not available
-            try:
-                st = ta.stoch(df["close"], df["close"], df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-            except Exception:
-                # some pandas_ta versions expect positional args differently; attempt named
-                try:
-                    st = ta.stoch(high=df["close"], low=df["close"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-                except Exception:
-                    st = pd.DataFrame()
-            if not st.empty:
-                stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
-                if stoch_k_col:
-                    df["stoch_k"] = st[stoch_k_col]
-            df["obv"] = ta.obv(df["close"], df["volume"])
-            bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
-                           std=int(cfg["indicators"].get("bollinger", [20, 2])[1]))
-            # pick upper and lower if present
-            bb_up = next((c for c in bb.columns if "BBU" in c), None)
-            bb_mid = next((c for c in bb.columns if "BBM" in c), None)
-            bb_low = next((c for c in bb.columns if "BBL" in c), None)
-            if bb_up:
-                df["bb_upper"] = bb[bb_up]
-            if bb_mid:
-                df["bb_mid"] = bb[bb_mid]
-            if bb_low:
-                df["bb_lower"] = bb[bb_low]
-
-            # Use last row
-            last = df.iloc[-1]
-            # Prepare per-indicator normalized scores in [-1,1]
-            scores = []
-            weights = cfg.get("weights", {})
-
-            # MA pairs: distance normalized by sma mid-range (use relative pct)
-            for pair in cfg["indicators"]["ma_pairs"]:
-                short, long = pair
-                s = last.get(f"sma_{short}", np.nan)
-                l = last.get(f"sma_{long}", np.nan)
-                if pd.isna(s) or pd.isna(l) or l == 0:
-                    continue
-                pct = (s - l) / l
-                tol = cfg["tolerance"].get("ma_pair_pct", 0.002)
-                # map pct to [-1,1], clamp at +/-0.02 (2%) for scaling
-                mag = max(-1.0, min(1.0, pct / 0.02))
-                if abs(pct) <= tol:
-                    sub = 0.0
-                else:
-                    sub = float(np.tanh(mag * 2.0))  # smooth
-                w = weights.get("ma_pair", 1.0)
-                scores.append((sub, w))
-
-            # MACD hist
-            macd_hist = last.get("macd_hist", 0.0)
-            if not pd.isna(macd_hist):
-                # normalize by recent hist std dev
-                hist_series = df["macd_hist"].dropna()
-                denom = hist_series.std() if not hist_series.empty else 1.0
-                denom = denom if denom != 0 else 1.0
-                sub = float(np.tanh((macd_hist / denom)))  # map to [-1,1]
-                scores.append((sub, weights.get("macd", 1.5)))
-
-            # RSI: distance from 50
-            rsi = last.get("rsi", None)
-            if rsi is not None and not pd.isna(rsi):
-                sub = float((rsi - 50.0) / 50.0)  # -1..+1 roughly
-                sub = max(-1.0, min(1.0, sub))
-                scores.append((sub, weights.get("rsi", 1.0)))
-
-            # Stochastic (use k)
-            k = last.get("stoch_k", None)
-            if k is not None and not pd.isna(k):
-                sub = 0.0
-                if k > 80:
-                    sub = (k - 80) / 20.0
-                elif k < 20:
-                    sub = (k - 20) / 20.0
-                sub = max(-1.0, min(1.0, sub))
-                scores.append((sub, weights.get("stochastic", 0.8)))
-
-            # OBV slope
-            obv = df["obv"].dropna()
-            if len(obv) >= cfg["tolerance"].get("obv_slope_lookback", 5):
-                slope_val = obv.iloc[-1] - obv.iloc[-cfg["tolerance"].get("obv_slope_lookback", 5)]
-                denom = obv.pct_change().std() if obv.pct_change().std() not in (0, None) else 1.0
-                sub = float(np.tanh((slope_val / (denom if denom != 0 else 1.0)) * 0.5))
-                scores.append((sub, weights.get("obv", 1.0)))
-
-            # Bollinger distance (price vs mid) normalized by mid
-            if "bb_mid" in last and not pd.isna(last.get("bb_mid")) and last.get("bb_mid") != 0:
-                dist = (last["close"] - last["bb_mid"]) / (last["bb_mid"])
-                sub = float(np.tanh(dist * 5.0))  # scale
-                scores.append((sub, weights.get("bollinger", 0.6)))
-
-            # Aggregate weighted sum and normalize
-            if not scores:
-                return 0.0, "Neutral"
-            num = sum(s * w for (s, w) in scores)
-            denom = sum(abs(w) for (_, w) in scores) or 1.0
-            score = float(num / denom)
-
-            # Map to label via thresholds
-            t = cfg.get("thresholds", {"strong_buy": 0.6, "buy": 0.25, "sell": -0.25, "strong_sell": -0.6})
-            label = "Neutral"
-            if score >= t["strong_buy"]:
-                label = "Strong Buy"
-            elif score >= t["buy"]:
-                label = "Buy"
-            elif score <= t["strong_sell"]:
-                label = "Strong Sell"
-            elif score <= t["sell"]:
-                label = "Sell"
-            return score, label
-        except Exception:
-            logger.exception("compute_tv_rating error for %s %s", symbol, tf)
-            return 0.0, "Neutral"
-
-    def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
-        # (Method already defined above; kept for completeness in file order)
-        tf_states: Dict[str, Dict[str, Any]] = {}
-        negative_tfs: List[str] = []
-        one_d_hist: List[float] = []
-
-        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
-
-        for tf in MTF_ALIGN_TFS:
-            _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
-            hist = hist or []
-            cur  = hist[-1] if hist else None
-            prev = hist[-2] if len(hist) >= 2 else None
-            is_positive = cur is not None and cur > 0
-            is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
-            
-            numeric_count = sum(1 for v in hist if v is not None)
-            logger.warning(
-                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
-                tf,
-                len(hist),
-                numeric_count,
-                f"{prev:.8f}" if prev is not None else "None",
-                f"{cur:.8f}" if cur is not None else "None",
-                is_positive,
-                is_flip
-            )
-            
-            tf_states[tf] = {
-                "cur": cur, "prev": prev,
-                "is_positive": is_positive, "is_flip": is_flip, "slope": None,
-            }
-            if tf == "D":
-                one_d_hist = hist
-            if not is_positive:
-                negative_tfs.append(tf)
-                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
-
-        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
-
-        # Scenario A: all TFs positive
-        if not negative_tfs:
-            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
-            return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
-
-        # Scenario C: only D is negative but rising
-        if negative_tfs == ["D"]:
-            one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
-            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
-            if one_d_slope is not None and one_d_slope > 0:
-                tf_states["D"]["slope"] = one_d_slope
-                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
-                return {
-                    "status": "daily_rising",
-                    "tfs": tf_states,
-                    "negative_tfs": ["D"],
-                    "one_d_slope": one_d_slope,
-                }
-            else:
-                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
-
-        # Scenario B: 1+ TFs negative and Scenario C not met
-        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
-        return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

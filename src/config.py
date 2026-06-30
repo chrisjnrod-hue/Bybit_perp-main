@@ -113,3 +113,55 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# -------------------------
+# TradingView-like Technical Rating config (local implementation)
+# -------------------------
+# This block provides default indicator parameters, weights and mapping thresholds
+# used by the local TradingView-like "Technical Rating" computation. Tune as needed.
+TECHNICAL_RATING = {
+    "enabled": True,
+    "ta_backend": "pandas_ta",  # "pandas_ta" recommended (pure Python)
+    "timeframes": ["60", "240", "D"],  # root TFs to include in aggregate rating
+    "timeframe_weights": {"60": 0.5, "240": 0.8, "D": 1.0},
+    "indicators": {
+        "ma_pairs": [[10, 50], [20, 100], [50, 200]],
+        "rsi_period": 14,
+        "macd": [12, 26, 9],
+        "stochastic": [14, 3, 3],
+        "adx_period": 14,
+        "bollinger": [20, 2],
+        "cci_period": 20,
+        "willr_period": 14,
+    },
+    # Relative weights applied to the per-indicator normalized sub-score (higher => more influence)
+    "weights": {
+        "ma_pair": 1.0,
+        "macd": 1.5,
+        "rsi": 1.0,
+        "stochastic": 0.8,
+        "obv": 1.0,
+        "bollinger": 0.6,
+        "cci": 0.6,
+        "willr": 0.4,
+    },
+    "tolerance": {
+        "ma_pair_pct": 0.002,  # 0.2% tolerance for MA equality
+        "obv_slope_lookback": 5,
+    },
+    "adx": {"threshold": 25, "multiplier": 1.25},
+    # Normalized score thresholds -> label mapping (score in approx -1..1)
+    "thresholds": {
+        "strong_buy": 0.6,
+        "buy": 0.25,
+        "sell": -0.25,
+        "strong_sell": -0.6
+    },
+    # Multi-timeframe aggregation: "weighted" or "majority"
+    "multi_timeframe_aggregation": "weighted",
+    # Benchmarking (disabled by default). Use tradingview-ta offline only for calibration.
+    "benchmarking": {
+        "fetch_tradingview_labels": False,
+        "tradingview_rate_limit_sleep": 2
+    }
+}

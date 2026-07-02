@@ -1,6 +1,6 @@
 # scanner.py - FINAL PRODUCTION VERSION
-# Last Updated: 2026-07-02
-# Status: PRODUCTION (fully corrected - TV ratings, volume tracking, telegram dedup)
+# Last Updated: 2026-06-30
+# Status: PRODUCTION (updated with local TradingView-like rating & improved Telegram push behavior)
 
 import os
 import asyncio
@@ -18,14 +18,7 @@ try:
     import numpy as np
     import pandas_ta as ta
     _PANDAS_TA_AVAILABLE = True
-except ImportError as e:
-    print(f"[STARTUP] pandas_ta import failed: {e} - TV ratings will be neutral")
-    pd = None  # type: ignore
-    np = None  # type: ignore
-    ta = None  # type: ignore
-    _PANDAS_TA_AVAILABLE = False
-except Exception as e:
-    print(f"[STARTUP] Unexpected error importing pandas_ta: {e}")
+except Exception:
     pd = None  # type: ignore
     np = None  # type: ignore
     ta = None  # type: ignore
@@ -78,8 +71,8 @@ class Scanner:
         # NEW: push / dedupe state for Telegram sending
         self._first_deploy_push = True
         self._last_full_push_ts: Optional[int] = None  # epoch seconds for last full push (candle start)
-        # sent root signals map: (symbol, root) -> epoch_seconds of last send (to avoid repeated sends)
-        self._last_root_signal_send: Dict[tuple, float] = {}
+        # sent root signals map: (symbol, root) -> start_at (to avoid repeated sends)
+        self._sent_root_signals: Dict[tuple, int] = {}
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s PANDAS_TA=%s)",
@@ -786,8 +779,12 @@ class Scanner:
         return float(quant)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume data with caching. Called before each scan to ensure current values."""
+        """Update and track 24h volume data with caching"""
         try:
+            now = time.time()
+            if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
+                return None
+            
             if hasattr(self.client, "get_24h_ticker"):
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
@@ -801,6 +798,7 @@ class Scanner:
                             else:
                                 self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                                 self._24h_volumes[symbol]["current"] = vol
+                            self._last_price_time[symbol] = now
                             return vol
                         except Exception:
                             pass
@@ -1162,8 +1160,10 @@ class Scanner:
                         
                         self._last_price_cache[sym] = price
                         
-                        # FIXED: Update volume for EVERY symbol before computing signals
-                        await self._update_24h_volume(sym)
+                        # Optimize volume caching - only update every 5 symbols to save API calls
+                        self._symbol_check_count = (self._symbol_check_count + 1) % 999
+                        if self._symbol_check_count % 5 == 0:
+                            await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
 
@@ -1579,7 +1579,7 @@ class Scanner:
 
         Behavior:
         - If full_push True: send full header + signals + recommendation blocks (same as original behavior).
-        - If full_push False: only send new root signals discovered this interval (based on time-based dedupe).
+        - If full_push False: only send new root signals discovered this interval (based on start_at dedupe).
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -1638,8 +1638,8 @@ class Scanner:
                     rt         = sig["root"]
                     price      = sig["price"]
                     vol_change = sig.get("vol_change")
-                    tv_score   = sig.get("tv_score", 0.0)
-                    tv_label   = sig.get("tv_label", "Neutral")
+                    tv_score   = sig.get("tv_score")
+                    tv_label   = sig.get("tv_label")
                     eval_entry = eval_map.get((sym, rt), {})
 
                     mtf_status = eval_entry.get("mtf_status", "N/A")
@@ -1704,33 +1704,30 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send recommended signals block (full_push)")
         else:
-            # Minimal push: send only new root signals discovered this interval (time-based dedupe)
+            # Minimal push: send only new root signals discovered this interval (based on start_at)
             if not root_signals:
                 return
-            
             to_send = []
-            now_ts = time.time()
-            signal_ttl = 3600  # 1 hour TTL for signal dedup
-            
-            # Clean up old entries
-            for key in list(self._last_root_signal_send.keys()):
-                if now_ts - self._last_root_signal_send[key] > signal_ttl:
-                    self._last_root_signal_send.pop(key, None)
-            
-            # Check each signal
+            now = int(time.time())
+            expiry = 86400
+            for key, st in list(self._sent_root_signals.items()):
+                if now - (st or 0) > expiry:
+                    self._sent_root_signals.pop(key, None)
+
             for sig in root_signals:
                 sym = sig.get("symbol")
                 rt = sig.get("root")
+                start_at = sig.get("start_at")
                 key = (sym, rt)
-                
-                # If never sent, or sent >1 hour ago, send it now
-                if key not in self._last_root_signal_send:
-                    to_send.append(sig)
-                    self._last_root_signal_send[key] = now_ts
-                    logger.info("[TELEGRAM_DELTA] NEW signal: %s %s", sym, rt)
+                if start_at is None:
+                    if key not in self._sent_root_signals:
+                        to_send.append(sig)
+                        self._sent_root_signals[key] = now
                 else:
-                    time_since_last = now_ts - self._last_root_signal_send[key]
-                    logger.debug("[TELEGRAM_DELTA] SUPPRESSED (sent %.0fs ago): %s %s", time_since_last, sym, rt)
+                    last_sent_start = self._sent_root_signals.get(key)
+                    if not last_sent_start or int(last_sent_start) != int(start_at):
+                        to_send.append(sig)
+                        self._sent_root_signals[key] = int(start_at)
 
             for sig in to_send:
                 try:
@@ -1738,8 +1735,8 @@ class Scanner:
                     rt = sig.get("root")
                     price = sig.get("price")
                     vol_change = sig.get("vol_change")
-                    tv_score = sig.get("tv_score", 0.0)
-                    tv_label = sig.get("tv_label", "Neutral")
+                    tv_score = sig.get("tv_score")
+                    tv_label = sig.get("tv_label")
                     eval_entry = eval_map.get((sym, rt), {})
 
                     mtf_status = eval_entry.get("mtf_status", "N/A")
@@ -1769,7 +1766,6 @@ class Scanner:
                         f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
-                    logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
 

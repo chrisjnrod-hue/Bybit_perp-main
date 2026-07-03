@@ -16,12 +16,13 @@ import inspect
 try:
     import pandas as pd
     import numpy as np
-    import pandas_ta as ta
+    import ta
     _PANDAS_TA_AVAILABLE = True
-except Exception:
-    pd = None  # type: ignore
-    np = None  # type: ignore
-    ta = None  # type: ignore
+except ImportError:
+    print("[STARTUP] ta/pandas import failed - TV ratings will be neutral")
+    pd = None
+    np = None
+    ta = None
     _PANDAS_TA_AVAILABLE = False
 
 from .logger import get_logger

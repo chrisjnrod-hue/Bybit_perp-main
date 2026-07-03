@@ -1,6 +1,6 @@
-# scanner.py - FINAL PRODUCTION VERSION
-# Last Updated: 2026-06-30
-# Status: PRODUCTION (updated with local TradingView-like rating & improved Telegram push behavior)
+# scanner.py - FINAL PRODUCTION VERSION (CORRECTED)
+# Last Updated: 2026-07-03
+# Status: PRODUCTION (TV ratings + volume fixes implemented)
 
 import os
 import asyncio
@@ -12,17 +12,23 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import math
 import inspect
 
-# Attempt to import pandas/pandas_ta; if unavailable, rating will return neutral
+# Attempt to import pandas/ta; if unavailable, rating will return neutral
 try:
     import pandas as pd
     import numpy as np
     import ta
     _PANDAS_TA_AVAILABLE = True
-except ImportError:
-    print("[STARTUP] ta/pandas import failed - TV ratings will be neutral")
-    pd = None
-    np = None
-    ta = None
+except ImportError as e:
+    print(f"[STARTUP] ta/pandas import failed: {e} - TV ratings will be neutral")
+    pd = None  # type: ignore
+    np = None  # type: ignore
+    ta = None  # type: ignore
+    _PANDAS_TA_AVAILABLE = False
+except Exception as e:
+    print(f"[STARTUP] Unexpected error importing ta: {e}")
+    pd = None  # type: ignore
+    np = None  # type: ignore
+    ta = None  # type: ignore
     _PANDAS_TA_AVAILABLE = False
 
 from .logger import get_logger
@@ -71,9 +77,8 @@ class Scanner:
 
         # NEW: push / dedupe state for Telegram sending
         self._first_deploy_push = True
-        self._last_full_push_ts: Optional[int] = None  # epoch seconds for last full push (candle start)
-        # sent root signals map: (symbol, root) -> start_at (to avoid repeated sends)
-        self._sent_root_signals: Dict[tuple, int] = {}
+        self._last_full_push_ts: Optional[int] = None
+        self._last_root_signal_send: Dict[tuple, float] = {}
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s PANDAS_TA=%s)",
@@ -233,7 +238,6 @@ class Scanner:
             else:
                 logger.info("USE_WS is False; websocket startup and subscriptions skipped (REST-only mode)")
 
-            # Subscribe to correct TF format (numeric, not "5m" format)
             if USE_WS and syms:
                 tasks = []
                 sem = asyncio.Semaphore(max(1, CONCURRENCY))
@@ -251,7 +255,6 @@ class Scanner:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
                 
-                # All WS subscriptions are fire-and-forget, gather all at once
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     logger.info("[DIAGNOSTIC] WS subscriptions complete for %d subscriptions", len(tasks))
@@ -277,7 +280,6 @@ class Scanner:
                     return int(s[:-1]) * 86400
                 except Exception:
                     return 24 * 3600
-            # Handle numeric format (e.g., "5" = 5 minutes, "60" = 60 minutes)
             return int(s) * 60
         except Exception:
             pass
@@ -304,7 +306,6 @@ class Scanner:
             elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
                 raw_klines = raw_klines["data"]
 
-        # Ensure we have a list/tuple before iterating
         if not isinstance(raw_klines, (list, tuple)):
             if isinstance(raw_klines, dict):
                 seq = [raw_klines]
@@ -316,7 +317,6 @@ class Scanner:
         for item in seq:
             try:
                 if isinstance(item, (list, tuple)):
-                    # common kline layout: [ts, open, high, low, close, volume, ...]
                     start = None
                     open_p = None
                     high = None
@@ -576,19 +576,14 @@ class Scanner:
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
-        """
-        REST poller as fallback when WS is unavailable.
-        Polls ROOT_TFS and short MTF TFs (5, 15) to ensure short-term data always available.
-        """
-        logger.info("REST poller started (interval=%s seconds) - PRIMARY FALLBACK FOR SHORT MTF DATA", REST_POLL_INTERVAL)
+        """REST poller as fallback when WS is unavailable."""
+        logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
         poll_count = 0
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
                 poll_count += 1
                 if poll_count % 5 == 0:
-                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d, USE_WS=%s, WS_CONNECTED=%s", 
-                               poll_count, len(self.symbols), USE_WS, 
-                               self.client.is_ws_connected() if hasattr(self.client, 'is_ws_connected') else "N/A")
+                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
                 
                 start = time.time()
                 if not self.symbols:
@@ -596,7 +591,6 @@ class Scanner:
                     continue
 
                 async def poll_symbol(sym: str):
-                    # FIX #11: Semaphore per TF, not per symbol to respect concurrent limits
                     tfs_to_poll = list(set(ROOT_TFS + ["5", "15"]))
                     for tf in tfs_to_poll:
                         try:
@@ -631,9 +625,6 @@ class Scanner:
                                                 self.kline_store.setdefault(sym, {})[tf] = [last_new]
                                         else:
                                             self.kline_store.setdefault(sym, {})[tf] = [last_new]
-                                        
-                                        if tf in ["5", "15"]:
-                                            logger.debug("[REST_POLLER_UPDATE] %s %s: updated kline (close=%.8f)", sym, tf, last_new["close"])
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -648,7 +639,7 @@ class Scanner:
                 to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
                 
                 if USE_WS and self.client.is_ws_connected():
-                    logger.info("WS reconnected; stopping REST poller (WS is primary)")
+                    logger.info("WS reconnected; stopping REST poller")
                     break
                 
                 await asyncio.sleep(to_sleep)
@@ -659,14 +650,12 @@ class Scanner:
         logger.info("REST poller stopped")
 
     async def _ensure_rest_poller(self):
-        """
-        Ensure REST poller is running as fallback when WS is unavailable.
-        """
+        """Ensure REST poller is running as fallback when WS is unavailable."""
         if USE_WS and self.client.is_ws_connected():
             if self._rest_poller_task and not self._rest_poller_task.done():
                 try:
                     self._rest_poller_task.cancel()
-                    await asyncio.sleep(0.1)  # Give it time to cancel
+                    await asyncio.sleep(0.1)
                 except Exception:
                     pass
                 self._rest_poller_task = None
@@ -679,9 +668,7 @@ class Scanner:
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
-        """
-        Consistent MACD calculation - always replace last close with current price
-        """
+        """Consistent MACD calculation"""
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
         for c in data:
@@ -693,7 +680,6 @@ class Scanner:
             except Exception:
                 continue
         
-        # Determine current price
         current_price = None
         if include_price is not None:
             current_price = float(include_price)
@@ -712,11 +698,6 @@ class Scanner:
                 closes.append(current_price)
         
         macd_line, signal_line, hist = macd_histogram(closes)
-        if DEBUG_SURGICAL_LOGS:
-            valid_hist_count = sum(1 for h in hist if h is not None) if hist else 0
-            logger.info("[SURGICAL_LOG_3] MACD_CALC %s %s: closes_count=%d, hist_length=%d, valid_hist=%d, last_hist=%s",
-                       symbol, tf, len(closes), len(hist) if hist else 0, valid_hist_count, hist[-1] if hist and len(hist) > 0 else None)
-        
         try:
             hist = [None if v is None else float(v) for v in (hist or [])]
         except Exception:
@@ -725,35 +706,15 @@ class Scanner:
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         if not hist or len(hist) < 2:
-            if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: insufficient_hist (len=%d)", symbol, tf, len(hist) if hist else 0)
             return False
         prev = hist[-2]
         cur = hist[-1]
         if prev is None or cur is None:
-            if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: None_values (prev=%s, cur=%s)", symbol, tf, prev, cur)
             return False
         try:
             zero_cross = prev <= 0 and cur > 0
-            hist_change = cur - prev
-            result = zero_cross
-            
-            if DEBUG_SURGICAL_LOGS:
-                logger.info("[FLIP_DEBUG] %s %s: prev=%.8f, cur=%.8f, change=%.8f, zero_cross=%s, FLIP=%s", 
-                           symbol, tf, prev, cur, hist_change, zero_cross, result)
-            
-            if DEBUG_SURGICAL_LOGS and (symbol or tf):
-                logger.info("[SURGICAL_LOG_4] FLIP_CHECK %s %s: prev=%.6f, cur=%.6f, flip=%s", 
-                           symbol, tf, prev, cur, result)
-            
-            if result and DEBUG_SURGICAL_LOGS:
-                logger.warning("[FLIP_DETECTED_INTERNAL] %s %s: STRONG FLIP! prev=%.8f -> cur=%.8f (change=%.8f)", 
-                              symbol, tf, prev, cur, hist_change)
-            
-            return result
+            return zero_cross
         except Exception:
-            logger.exception("Error comparing hist values %s %s", prev, cur)
             return False
 
     def _quantize_qty(self, qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
@@ -762,7 +723,6 @@ class Scanner:
         qty_d = Decimal(str(qty))
         if step is None or step <= 0:
             if min_qty and qty_d < Decimal(str(min_qty)):
-                logger.debug("Qty below min_qty, bumping to min_qty %s", min_qty)
                 return float(Decimal(str(min_qty)))
             return float(qty_d)
         step_d = Decimal(str(step))
@@ -771,7 +731,6 @@ class Scanner:
         if min_qty is not None:
             min_d = Decimal(str(min_qty))
             if quant < min_d:
-                logger.debug("Quantized qty %s below min_qty %s, using min_qty", float(quant), float(min_d))
                 quant = min_d
         try:
             quant = quant.normalize()
@@ -780,12 +739,8 @@ class Scanner:
         return float(quant)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume data with caching"""
+        """Update and track 24h volume data - CALLED FOR EVERY SYMBOL"""
         try:
-            now = time.time()
-            if symbol in self._last_price_time and (now - self._last_price_time[symbol]) < 60:
-                return None
-            
             if hasattr(self.client, "get_24h_ticker"):
                 async with self.request_sem:
                     data = await self.client.get_24h_ticker(symbol)
@@ -799,7 +754,7 @@ class Scanner:
                             else:
                                 self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                                 self._24h_volumes[symbol]["current"] = vol
-                            self._last_price_time[symbol] = now
+                            logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
                             return vol
                         except Exception:
                             pass
@@ -811,6 +766,7 @@ class Scanner:
         """Compute percentage change in 24h volume"""
         try:
             if symbol not in self._24h_volumes:
+                logger.debug("[VOL_CHANGE] %s: no volume data yet", symbol)
                 return None
             vol_data = self._24h_volumes[symbol]
             prev_vol = vol_data.get("previous", 0)
@@ -818,6 +774,7 @@ class Scanner:
             if prev_vol <= 0:
                 return None
             change = (curr_vol - prev_vol) / prev_vol
+            logger.debug("[VOL_CHANGE] %s: prev=%.0f, curr=%.0f, change=%.4f", symbol, prev_vol, curr_vol, change)
             return min(change, 1.0)
         except Exception:
             logger.debug("Could not compute 24h volume change for %s", symbol)
@@ -825,110 +782,109 @@ class Scanner:
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None) -> Tuple[float, str]:
         """
-        Compute a TradingView-like normalized score and label for given symbol/timeframe
-        using the kline_store data available. Returns (score, label).
-
-        Notes:
-        - Uses pandas_ta when available; otherwise returns neutral.
-        - Requires open/high/low/close/volume in kline_store for better indicator accuracy.
+        Compute a TradingView-like normalized score using ta library.
+        Returns (score, label).
         """
         cfg = TECHNICAL_RATING
         if not cfg.get("enabled", True):
             return 0.0, "Neutral"
 
         if not _PANDAS_TA_AVAILABLE:
-            if DIAGNOSTIC_MODE:
-                logger.debug("compute_tv_rating: pandas_ta not available - returning neutral")
+            logger.debug("compute_tv_rating: ta not available - returning neutral for %s %s", symbol, tf)
             return 0.0, "Neutral"
 
         try:
             klines = self.kline_store.get(symbol, {}).get(tf, [])
-            # require at least MACD slow period (26) + 5 bars
             ma_max = max([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]) if cfg["indicators"].get("ma_pairs") else 50
             min_candles = max(26, ma_max + 5)
+            
             if not klines or len(klines) < min_candles:
-                if DIAGNOSTIC_MODE:
-                    logger.debug("compute_tv_rating: insufficient candles for %s %s: have=%d need=%d",
-                                 symbol, tf, len(klines) if klines else 0, min_candles)
+                logger.debug("compute_tv_rating: insufficient candles for %s %s: have=%d need=%d",
+                             symbol, tf, len(klines) if klines else 0, min_candles)
                 return 0.0, "Neutral"
 
+            # Build DataFrame
             df = pd.DataFrame(klines)
-            # Ensure required columns
             for col in ("open", "high", "low", "close", "volume"):
                 if col not in df.columns:
                     df[col] = np.nan
+            
             df = df.dropna(subset=["close"]).copy()
-            # convert types where possible
             try:
-                df["open"] = df["open"].astype(float)
-            except Exception:
-                pass
-            try:
-                df["high"] = df["high"].astype(float)
-            except Exception:
-                pass
-            try:
-                df["low"] = df["low"].astype(float)
-            except Exception:
-                pass
-            df["close"] = df["close"].astype(float)
-            df["volume"] = df["volume"].fillna(0.0).astype(float)
+                df["open"] = pd.to_numeric(df["open"], errors="coerce")
+                df["high"] = pd.to_numeric(df["high"], errors="coerce")
+                df["low"] = pd.to_numeric(df["low"], errors="coerce")
+                df["close"] = pd.to_numeric(df["close"], errors="coerce")
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            except Exception as e:
+                logger.debug("Error converting dtypes for %s %s: %s", symbol, tf, str(e))
+                return 0.0, "Neutral"
 
-            # Compute indicators
-            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
-            for l in ma_lengths:
-                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+            # Compute indicators using ta library
+            try:
+                # SMA
+                ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
+                for l in ma_lengths:
+                    df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
 
-            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
-            macd = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
-            macd_hist_col = next((c for c in macd.columns if "MACDh" in c), None)
-            if macd_hist_col:
-                df["macd_hist"] = macd[macd_hist_col]
-            else:
-                if not macd.empty:
-                    df["macd_hist"] = macd.iloc[:, -1]
+                # MACD
+                macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
+                macd_result = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
+                if macd_result is not None and not macd_result.empty:
+                    macd_hist_col = next((c for c in macd_result.columns if "MACD_" in c and "h" in c.lower()), None)
+                    if macd_hist_col:
+                        df["macd_hist"] = macd_result[macd_hist_col]
+                    else:
+                        df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
                 else:
                     df["macd_hist"] = 0.0
 
-            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
-            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
-            try:
-                st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-                if not st.empty:
-                    stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
-                    if stoch_k_col:
-                        df["stoch_k"] = st[stoch_k_col]
-            except Exception:
+                # RSI
+                df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+
+                # Stochastic
+                stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
                 try:
-                    st = ta.stoch(df["close"], df["close"], df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-                    if not st.empty:
-                        stoch_k_col = next((c for c in st.columns if "STOCHk" in c), None)
+                    st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+                    if st is not None and not st.empty:
+                        stoch_k_col = next((c for c in st.columns if "STOCHk" in c or "k" in c.lower()), None)
                         if stoch_k_col:
                             df["stoch_k"] = st[stoch_k_col]
                 except Exception:
                     pass
 
-            try:
-                adx_series = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
-                if "ADX_14" in adx_series:
-                    df["adx"] = adx_series["ADX_14"]
-                else:
-                    # attempt to find any ADX-like column
-                    adx_col = next((c for c in adx_series.columns if "ADX" in c), None)
-                    if adx_col:
-                        df["adx"] = adx_series[adx_col]
+                # ADX
+                try:
+                    adx_result = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
+                    if adx_result is not None and not adx_result.empty:
+                        adx_col = next((c for c in adx_result.columns if "ADX" in c), None)
+                        if adx_col:
+                            df["adx"] = adx_result[adx_col]
+                        else:
+                            df["adx"] = np.nan
                     else:
                         df["adx"] = np.nan
-            except Exception:
-                df["adx"] = np.nan
+                except Exception:
+                    df["adx"] = np.nan
 
-            df["obv"] = ta.obv(df["close"], df["volume"])
-            bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
-                           std=int(cfg["indicators"].get("bollinger", [20, 2])[1]))
-            if not bb.empty:
-                for c in bb.columns:
-                    df[c] = bb[c]
+                # OBV
+                df["obv"] = ta.obv(df["close"], df["volume"])
 
+                # Bollinger Bands
+                try:
+                    bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
+                                   std=cfg["indicators"].get("bollinger", [20, 2])[1])
+                    if bb is not None and not bb.empty:
+                        for c in bb.columns:
+                            df[c] = bb[c]
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.exception("Error computing indicators for %s %s: %s", symbol, tf, str(e))
+                return 0.0, "Neutral"
+
+            # Scoring
             last = df.iloc[-1]
             scores: List[Tuple[float, float]] = []
             weights = cfg.get("weights", {})
@@ -936,8 +892,8 @@ class Scanner:
             # MA pairs
             for pair in cfg["indicators"]["ma_pairs"]:
                 short, long = pair
-                s = last.get(f"sma_{short}", np.nan)
-                l = last.get(f"sma_{long}", np.nan)
+                s = last.get(f"sma_{short}")
+                l = last.get(f"sma_{long}")
                 if pd.isna(s) or pd.isna(l) or l == 0:
                     continue
                 pct = (s - l) / l
@@ -950,23 +906,23 @@ class Scanner:
                 scores.append((sub, weights.get("ma_pair", 1.0)))
 
             # MACD hist
-            macd_hist = last.get("macd_hist", 0.0)
-            if not pd.isna(macd_hist):
+            macd_hist = last.get("macd_hist")
+            if not pd.isna(macd_hist) and macd_hist is not None:
                 hist_series = df["macd_hist"].dropna()
-                denom = hist_series.std() if not hist_series.empty else 1.0
+                denom = hist_series.std() if len(hist_series) > 0 else 1.0
                 denom = denom if denom != 0 else 1.0
                 sub = float(np.tanh((macd_hist / denom)))
                 scores.append((sub, weights.get("macd", 1.5)))
 
             # RSI
-            rsi = last.get("rsi", None)
+            rsi = last.get("rsi")
             if rsi is not None and not pd.isna(rsi):
                 sub = float((rsi - 50.0) / 50.0)
                 sub = max(-1.0, min(1.0, sub))
                 scores.append((sub, weights.get("rsi", 1.0)))
 
             # Stochastic K
-            k = last.get("stoch_k", None)
+            k = last.get("stoch_k")
             if k is not None and not pd.isna(k):
                 sub = 0.0
                 if k > 80:
@@ -981,41 +937,28 @@ class Scanner:
             if len(obv) >= cfg["tolerance"].get("obv_slope_lookback", 5):
                 lb = cfg["tolerance"].get("obv_slope_lookback", 5)
                 slope_val = obv.iloc[-1] - obv.iloc[-lb]
-                denom = obv.pct_change().std() if obv.pct_change().std() not in (0, None) else 1.0
+                pct_change_std = obv.pct_change().std()
+                denom = pct_change_std if pct_change_std not in (0, None) else 1.0
                 sub = float(np.tanh((slope_val / (denom if denom != 0 else 1.0)) * 0.5))
                 scores.append((sub, weights.get("obv", 1.0)))
 
-            # Bollinger mid distance
-            bb_mid_col = next((c for c in df.columns if "BBM" in c or "bb_middle" in c), None)
-            if bb_mid_col and not pd.isna(last.get(bb_mid_col)):
-                mid = last.get(bb_mid_col)
-                if mid != 0:
-                    dist = (last["close"] - mid) / mid
-                    sub = float(np.tanh(dist * 5.0))
-                    scores.append((sub, weights.get("bollinger", 0.6)))
-
-            # If DIAGNOSTIC_MODE enabled, log sub-scores
-            if DIAGNOSTIC_MODE:
-                try:
-                    dbg = [{"sub": float(s), "w": float(w)} for (s, w) in scores]
-                    logger.info("[TV_DBG] %s %s indicator sub-scores: %s", symbol, tf, dbg)
-                except Exception:
-                    pass
-
             if not scores:
+                logger.debug("No indicator scores computed for %s %s", symbol, tf)
                 return 0.0, "Neutral"
+
             num = sum(s * w for (s, w) in scores)
             denom = sum(abs(w) for (_, w) in scores) or 1.0
             score = float(num / denom)
 
             # ADX amplification
-            adx = last.get("adx", None)
-            if not pd.isna(adx):
+            adx = last.get("adx")
+            if not pd.isna(adx) and adx is not None:
                 adx_cfg = cfg.get("adx", {})
                 thr = adx_cfg.get("threshold", 25)
                 mult = adx_cfg.get("multiplier", 1.25)
                 if adx >= thr:
                     score *= mult
+
             score = max(-2.0, min(2.0, score))
 
             # Map to label
@@ -1029,28 +972,19 @@ class Scanner:
                 label = "Strong Sell"
             elif score <= t["sell"]:
                 label = "Sell"
+
+            logger.info("[TV_RATING] %s %s: score=%.4f label=%s", symbol, tf, score, label)
             return score, label
-        except Exception:
-            logger.exception("compute_tv_rating error for %s %s", symbol, tf)
+
+        except Exception as e:
+            logger.exception("compute_tv_rating error for %s %s: %s", symbol, tf, str(e))
             return 0.0, "Neutral"
 
     def _compute_mtf_alignment(self, symbol: str, price: float) -> Dict[str, Any]:
-        """
-        Evaluate MTF alignment across MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
-        using NUMERIC format matching Bybit API.
-
-        Returns dict with status, per-TF states, negative_tfs list, and 1d slope.
-
-        Scenarios:
-          A — all TFs positive → "aligned"
-          C — only D (daily) negative but histogram rising (upward slope) → "daily_rising"
-          B — 1+ TFs negative (not meeting C) → "monitoring"
-        """
+        """Evaluate MTF alignment across timeframes"""
         tf_states: Dict[str, Dict[str, Any]] = {}
         negative_tfs: List[str] = []
         one_d_hist: List[float] = []
-
-        logger.warning("[MTF_ALIGN_START] Computing MTF alignment for %s @ price=%s", symbol, price)
 
         for tf in MTF_ALIGN_TFS:
             _, _, hist = self.compute_macd_for(symbol, tf, include_price=price)
@@ -1060,18 +994,6 @@ class Scanner:
             is_positive = cur is not None and cur > 0
             is_flip     = (prev is not None and prev < 0 and cur is not None and cur > 0)
             
-            numeric_count = sum(1 for v in hist if v is not None)
-            logger.warning(
-                "[MTF_ALIGN_TRACE] TF=%s | hist_len=%d | numeric_count=%d | prev=%s | cur=%s | is_positive=%s | is_flip=%s",
-                tf,
-                len(hist),
-                numeric_count,
-                f"{prev:.8f}" if prev is not None else "None",
-                f"{cur:.8f}" if cur is not None else "None",
-                is_positive,
-                is_flip
-            )
-            
             tf_states[tf] = {
                 "cur": cur, "prev": prev,
                 "is_positive": is_positive, "is_flip": is_flip, "slope": None,
@@ -1080,33 +1002,24 @@ class Scanner:
                 one_d_hist = hist
             if not is_positive:
                 negative_tfs.append(tf)
-                logger.warning("[MTF_ALIGN_TRACE] → TF %s appended to negative_tfs (is_positive=%s)", tf, is_positive)
-
-        logger.warning("[MTF_ALIGN_DECISION] negative_tfs=%s (len=%d)", negative_tfs, len(negative_tfs))
 
         # Scenario A: all TFs positive
         if not negative_tfs:
-            logger.warning("[MTF_ALIGN_RESULT] %s → ALIGNED (Scenario A: all TFs positive)", symbol)
             return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
 
         # Scenario C: only D is negative but rising
         if negative_tfs == ["D"]:
             one_d_slope = slope(one_d_hist, lookback=MTF_SLOPE_LOOKBACK) if one_d_hist else None
-            logger.warning("[MTF_ALIGN_TRACE] Scenario C check: one_d_slope=%s", one_d_slope)
             if one_d_slope is not None and one_d_slope > 0:
                 tf_states["D"]["slope"] = one_d_slope
-                logger.warning("[MTF_ALIGN_RESULT] %s → DAILY_RISING (Scenario C: only D negative but slope=%.8f > 0)", symbol, one_d_slope)
                 return {
                     "status": "daily_rising",
                     "tfs": tf_states,
                     "negative_tfs": ["D"],
                     "one_d_slope": one_d_slope,
                 }
-            else:
-                logger.warning("[MTF_ALIGN_TRACE] Scenario C failed: one_d_slope not positive (slope=%s)", one_d_slope)
 
-        # Scenario B: 1+ TFs negative and Scenario C not met
-        logger.warning("[MTF_ALIGN_RESULT] %s → MONITORING (Scenario B: negative_tfs=%s)", symbol, negative_tfs)
+        # Scenario B: 1+ TFs negative
         return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
 
     async def root_scan_loop(self):
@@ -1115,11 +1028,6 @@ class Scanner:
         
         while not self._stop:
             loop_count += 1
-
-            logger.warning(
-                "[DIAGNOSTIC_SCAN_START] ============ ROOT SCAN START (cycle #%d) ============",
-                loop_count
-            )
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
             
@@ -1161,18 +1069,11 @@ class Scanner:
                         
                         self._last_price_cache[sym] = price
                         
-                        # Optimize volume caching - only update every 5 symbols to save API calls
-                        self._symbol_check_count = (self._symbol_check_count + 1) % 999
-                        if self._symbol_check_count % 5 == 0:
-                            await self._update_24h_volume(sym)
+                        # FIX: Update volume for EVERY symbol
+                        await self._update_24h_volume(sym)
                         
                         for root in ROOT_TFS:
-
-                            logger.info(
-                                "[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation",
-                                sym,
-                                root
-                            )
+                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
 
                             macd_line, sig, hist = self.compute_macd_for(
                                 sym,
@@ -1181,36 +1082,7 @@ class Scanner:
                                 use_ws_current=True
                             )
 
-                            logger.info(
-                                "[ROOT_SCAN_CALC] %s %s: MACD calc complete, hist_len=%d, last_val=%s",
-                                sym,
-                                root,
-                                len(hist) if hist else 0,
-                                hist[-1] if hist and len(hist) > 0 else None
-                            )
-
-                            flip = self.detect_flip_current_open(
-                                hist,
-                                0.0,
-                                symbol=sym,
-                                tf=root
-                            )
-
-                            try:
-                                prev_hist = hist[-2] if hist and len(hist) >= 2 else None
-                                cur_hist = hist[-1] if hist and len(hist) >= 1 else None
-
-                                logger.info(
-                                    "[DEBUG-FLIP] %s %s prev=%s cur=%s flip=%s",
-                                    sym,
-                                    root,
-                                    prev_hist,
-                                    cur_hist,
-                                    flip
-                                )
-
-                            except Exception:
-                                logger.exception("DEBUG FLIP LOG FAILED")
+                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
 
                             logger.info(
                                 "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
@@ -1219,13 +1091,8 @@ class Scanner:
                                 flip
                             )
                             
-                            if DEBUG_SURGICAL_LOGS:
-                                logger.info("[ROOT_SCAN_CHECK] %s %s: hist_valid=%s, flip=%s", 
-                                           sym, root, hist is not None and len(hist) > 0, flip)
-                            
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
-                                # obtain start_at for last candle if available
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
@@ -1234,7 +1101,7 @@ class Scanner:
                                 except Exception:
                                     start_at = None
 
-                                # Compute local TV-like rating for this root signal
+                                # Compute TV rating
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
 
                                 root_signals.append({
@@ -1248,8 +1115,6 @@ class Scanner:
                                     "tv_label": tv_label
                                 })
                                 logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
-                                if DEBUG_SURGICAL_LOGS:
-                                    logger.warning("[SIGNAL_DETECTED_CONFIRMED] %s %s price=%s flip=TRUE tv=%s", sym, root, price, tv_label)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -1264,40 +1129,22 @@ class Scanner:
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
-                logger.warning(
-                    "[DIAGNOSTIC_SCAN_END] ============ ROOT SCAN COMPLETE (cycle #%d) ============",
-                    loop_count
-                )
-
-                logger.warning(
-                    "[SCAN_RESULTS] Checked=%d symbols, Signals=%d, ROOT_TFS=%s",
-                    checked_count,
-                    len(root_signals),
-                    ROOT_TFS
-                )
-
                 logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
-                logger.info("Root scan checked %d symbols, found %d signals", checked_count, len(root_signals))
 
                 await self._check_monitored_symbols()
 
                 # Decide whether to send full push or only delta signals
                 full_push = False
                 now_ts = int(time.time())
-                # If first deploy, always do full push
                 if self._first_deploy_push:
                     full_push = True
                 else:
-                    # If ROOT_SCAN_INTERVAL == 0 (align to 5m candles) we allow a full push once per candle start
                     if ROOT_SCAN_INTERVAL == 0:
-                        # compute current 5m candle start timestamp
                         candle_start = (now_ts // 300) * 300
                         if self._last_full_push_ts != candle_start:
-                            # it's a new candle boundary -> do full push one time
                             full_push = True
                             self._last_full_push_ts = candle_start
 
-                # Evaluate candidates and open trades (if any) BEFORE sending summary so recommendation blocks include accept decisions
                 evaluated = []
                 if root_signals:
                     for sig in root_signals:
@@ -1309,22 +1156,12 @@ class Scanner:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
                     evaluated = await self.handle_root_signals(root_signals)
                 else:
-                    evaluated = []
                     logger.info("No root signals this interval.")
 
-                # send summary: full push if permitted otherwise only delta/new signals
                 await self.send_summary(root_signals, evaluated=evaluated, full_push=full_push)
 
-                # After first full push, mark first_deploy_push cleared
                 if self._first_deploy_push and full_push:
                     self._first_deploy_push = False
-
-                try:
-                    candidates_count = len(root_signals) if root_signals else 0
-                    logger.info("ROOT_SCAN_COMPLETE: checked=%d, signals=%d, candidates=%d", 
-                               checked_count, len(root_signals), candidates_count)
-                except Exception:
-                    pass
                 
             except Exception:
                 logger.exception("Error in root scan loop")
@@ -1336,20 +1173,16 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # Align to actual Bybit 5m candle boundaries (0, 5, 10, 15... minutes UTC)
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
                 
-                # Find next 5-minute boundary
                 next_5m_minute = ((current_minute // 5) + 1) * 5
                 
                 if next_5m_minute >= 60:
-                    # Move to next hour
                     to_sleep = (60 - current_minute) * 60 - current_second
                 else:
-                    # Sleep to next 5m boundary
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
                 
                 to_sleep = max(0, to_sleep)
@@ -1357,10 +1190,7 @@ class Scanner:
                 await asyncio.sleep(to_sleep)
 
     async def _check_monitored_symbols(self):
-        """
-        Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip.
-        When resolved, queue for trade opening via handle_root_signals.
-        """
+        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
         if not self._mtf_monitoring:
             return
 
@@ -1418,13 +1248,7 @@ class Scanner:
             await self.handle_root_signals(newly_aligned)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Evaluate MTF alignment for each root signal and act on each scenario.
-
-        Scenario A  (aligned)       → open trade if TRADE_ENABLED and volume gate passes
-        Scenario C  (daily_rising)  → open trade
-        Scenario B  (monitoring)    → add to watch-list until last flip
-        """
+        """Evaluate MTF alignment for each root signal and act on each scenario."""
         evaluated: List[Dict[str, Any]] = []
         to_open:   List[Dict[str, Any]] = []
 
@@ -1466,7 +1290,6 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # Check volume gate
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None:
                         entry["accept"] = False
@@ -1579,8 +1402,8 @@ class Scanner:
         Telegram summary layout with MTF alignment visualization.
 
         Behavior:
-        - If full_push True: send full header + signals + recommendation blocks (same as original behavior).
-        - If full_push False: only send new root signals discovered this interval (based on start_at dedupe).
+        - If full_push True: send full header + signals + recommendation blocks.
+        - If full_push False: only send new root signals (time-based dedup).
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -1639,8 +1462,8 @@ class Scanner:
                     rt         = sig["root"]
                     price      = sig["price"]
                     vol_change = sig.get("vol_change")
-                    tv_score   = sig.get("tv_score")
-                    tv_label   = sig.get("tv_label")
+                    tv_score   = sig.get("tv_score", 0.0)
+                    tv_label   = sig.get("tv_label", "Neutral")
                     eval_entry = eval_map.get((sym, rt), {})
 
                     mtf_status = eval_entry.get("mtf_status", "N/A")
@@ -1673,7 +1496,7 @@ class Scanner:
                 except Exception:
                     logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
 
-            # Full recommended and summary block (unchanged behavior)
+            # Full recommended and summary block
             try:
                 if evaluated:
                     current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
@@ -1703,32 +1526,31 @@ class Scanner:
 
                     await send_message("\n".join(rec_lines))
             except Exception:
-                logger.exception("Failed to send recommended signals block (full_push)")
+                logger.exception("Failed to send recommended signals block")
         else:
-            # Minimal push: send only new root signals discovered this interval (based on start_at)
+            # Minimal push: send only new signals (time-based dedup)
             if not root_signals:
                 return
+            
             to_send = []
-            now = int(time.time())
-            expiry = 86400
-            for key, st in list(self._sent_root_signals.items()):
-                if now - (st or 0) > expiry:
-                    self._sent_root_signals.pop(key, None)
-
+            now_ts = time.time()
+            signal_ttl = 3600  # 1 hour TTL
+            
+            # Clean up old entries
+            for key in list(self._last_root_signal_send.keys()):
+                if now_ts - self._last_root_signal_send[key] > signal_ttl:
+                    self._last_root_signal_send.pop(key, None)
+            
+            # Check each signal
             for sig in root_signals:
                 sym = sig.get("symbol")
                 rt = sig.get("root")
-                start_at = sig.get("start_at")
                 key = (sym, rt)
-                if start_at is None:
-                    if key not in self._sent_root_signals:
-                        to_send.append(sig)
-                        self._sent_root_signals[key] = now
-                else:
-                    last_sent_start = self._sent_root_signals.get(key)
-                    if not last_sent_start or int(last_sent_start) != int(start_at):
-                        to_send.append(sig)
-                        self._sent_root_signals[key] = int(start_at)
+                
+                if key not in self._last_root_signal_send:
+                    to_send.append(sig)
+                    self._last_root_signal_send[key] = now_ts
+                    logger.info("[TELEGRAM_DELTA] NEW signal: %s %s", sym, rt)
 
             for sig in to_send:
                 try:
@@ -1736,8 +1558,8 @@ class Scanner:
                     rt = sig.get("root")
                     price = sig.get("price")
                     vol_change = sig.get("vol_change")
-                    tv_score = sig.get("tv_score")
-                    tv_label = sig.get("tv_label")
+                    tv_score = sig.get("tv_score", 0.0)
+                    tv_label = sig.get("tv_label", "Neutral")
                     eval_entry = eval_map.get((sym, rt), {})
 
                     mtf_status = eval_entry.get("mtf_status", "N/A")
@@ -1767,6 +1589,7 @@ class Scanner:
                         f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
+                    logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
 

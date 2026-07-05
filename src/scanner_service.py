@@ -1,6 +1,5 @@
 # scanner_service.py
-# This module contains the Scanner class (async orchestration, I/O, and side-effects).
-# It depends on pure helpers from scanner_core.py to keep logic testable and small.
+# Full updated Scanner class with gating, volume fixes, prioritization, and fixed minimal push behavior.
 
 import os
 import asyncio
@@ -28,7 +27,6 @@ from .config import (
 )
 from .telegram import send_message
 
-# Import pure helpers from scanner_core
 from .scanner_core import (
     tf_to_seconds,
     normalize_klines,
@@ -45,6 +43,14 @@ logger = get_logger("scanner")
 SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
+
+# New envs (parsed here)
+TRADE_RATING_ALLOW = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy").split(",")
+TRADE_RATING_ALLOW = [x.strip() for x in TRADE_RATING_ALLOW if x.strip()]
+# If TRADE_RATING_ALLOW is empty list -> allow any rating
+TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
+MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
+PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
 
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 
@@ -68,16 +74,17 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
 
-        # NEW: push / dedupe state for Telegram sending
+        # push / dedupe state for Telegram sending
         self._first_deploy_push = True
         self._last_full_push_ts: Optional[int] = None
         self._last_root_signal_send: Dict[tuple, float] = {}
-        # New: track last minimal (delta) push timestamp to enforce "only at set scan interval"
+        # track last minimal (delta) push timestamp to enforce "only at set scan interval"
         self._last_minimal_push_ts: Optional[float] = None
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
-            bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_ALLOW=%s TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
+            bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
+            TRADE_RATING_ALLOW, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -515,19 +522,17 @@ class Scanner:
         return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume data - CALLED FOR EVERY SYMBOL"""
+        """Update and track 24h volume data - tries multiple client method names and keys for robustness."""
         try:
-            # Try multiple possible client method names via _call_client_method for robustness
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
                 logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
-            # Normalize nested shapes (many APIs return { 'result': {...} } or { 'data': {...} })
+            # Normalize nested shapes
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], (dict, list)):
-                    # prefer dict
                     if isinstance(data["data"], dict):
                         data = data["data"]
                 elif "result" in data and isinstance(data["result"], (dict, list)):
@@ -548,7 +553,6 @@ class Scanner:
                             except Exception:
                                 vol = None
 
-            # If data is a string/number just try to parse
             if vol is None and isinstance(data, (int, float, str)):
                 try:
                     vol = float(data)
@@ -562,6 +566,9 @@ class Scanner:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
                 logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                prev = self._24h_volumes[symbol].get("previous", 0)
+                curr = self._24h_volumes[symbol].get("current", 0)
+                logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
                 return vol
             else:
                 logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
@@ -712,19 +719,44 @@ class Scanner:
                             full_push = True
                             self._last_full_push_ts = candle_start
 
+                # compute minimal_allowed similarly to send_summary
+                minimal_allowed = False
+                if full_push:
+                    minimal_allowed = True
+                else:
+                    if self._first_deploy_push:
+                        minimal_allowed = True
+                    else:
+                        if ROOT_SCAN_INTERVAL:
+                            if self._last_minimal_push_ts is None:
+                                minimal_allowed = True
+                            else:
+                                elapsed_since_last = now_ts - (self._last_minimal_push_ts if self._last_minimal_push_ts else 0)
+                                minimal_allowed = elapsed_since_last >= max(1, ROOT_SCAN_INTERVAL - 1)
+                        else:
+                            candle_start = (now_ts // 300) * 300
+                            minimal_allowed = (self._last_minimal_push_ts != candle_start)
+
+                logger.info("[DIAGNOSTIC] push gating full_push=%s minimal_allowed=%s first_deploy=%s", full_push, minimal_allowed, self._first_deploy_push)
+
                 evaluated = []
                 if root_signals:
-                    for sig in root_signals:
-                        try:
-                            sym = sig["symbol"]
-                            if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
-                        except Exception:
-                            logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
-                    evaluated = await self.handle_root_signals(root_signals)
+                    # Only call handle_root_signals (which can open trades and send messages) when processing is allowed
+                    if minimal_allowed or full_push:
+                        for sig in root_signals:
+                            try:
+                                sym = sig["symbol"]
+                                if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
+                                    await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                            except Exception:
+                                logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
+                        evaluated = await self.handle_root_signals(root_signals)
+                    else:
+                        logger.info("[DIAGNOSTIC] Processing skipped due to gating; %d signals detected but not processed", len(root_signals))
                 else:
                     logger.info("No root signals this interval.")
 
+                # send_summary will itself apply dedupe/gating for minimal messages
                 await self.send_summary(root_signals, evaluated=evaluated, full_push=full_push)
 
                 if self._first_deploy_push and full_push:
@@ -812,18 +844,28 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         if newly_aligned:
+            # Only handle newly aligned when gating allows (we rely on root_scan_loop gating),
+            # but this function may be called from root_scan_loop when gating applied, so we call handle_root_signals.
             await self.handle_root_signals(newly_aligned)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Evaluate MTF alignment for each root signal and act on each scenario."""
+        """Evaluate MTF alignment for each root signal and act on each scenario.
+
+        Trading gates applied:
+          - TRADE_RATING_ALLOW: when non-empty, require computed tv_label in whitelist
+          - TRADE_NO_NEG_VOL: if True, require vol_change > 0 for trade opens
+          - MARKET_CAP_MIN: if >0, require symbol's market cap >= threshold
+        """
         evaluated: List[Dict[str, Any]] = []
-        to_open:   List[Dict[str, Any]] = []
+        to_open: List[Dict[str, Any]] = []
 
         for item in root_signals:
-            sym        = item["symbol"]
-            price      = item["price"]
-            root       = item["root"]
+            sym = item["symbol"]
+            price = item["price"]
+            root = item["root"]
             vol_change = item.get("vol_change")
+            tv_label = item.get("tv_label")
+            tv_score = item.get("tv_score", 0.0)
 
             hist = item.get("hist", [])
             if not hist:
@@ -831,32 +873,62 @@ class Scanner:
                 hist = hist or []
             macd_hist_val = hist[-1] if hist else 0.0
 
-            mtf_align    = self._compute_mtf_alignment(sym, price)
-            mtf_status   = mtf_align["status"]
+            mtf_align = self._compute_mtf_alignment(sym, price)
+            mtf_status = mtf_align["status"]
             negative_tfs = mtf_align.get("negative_tfs", [])
 
-            score  = sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive"))
+            score = sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive"))
             score += sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip"))
             if vol_change is not None and vol_change > 0:
                 score += min(vol_change, 1.0)
 
             entry: Dict[str, Any] = {
-                "symbol":       sym,
-                "root":         root,
-                "price":        price,
-                "hist":         hist,
+                "symbol": sym,
+                "root": root,
+                "price": price,
+                "hist": hist,
                 "macd_hist_val": macd_hist_val,
-                "mtf":          mtf_align["tfs"],
-                "mtf_status":   mtf_status,
+                "mtf": mtf_align["tfs"],
+                "mtf_status": mtf_status,
                 "negative_tfs": negative_tfs,
-                "one_d_slope":  mtf_align.get("one_d_slope"),
-                "vol_change":   vol_change,
-                "score":        score,
-                "accept":       False,
-                "reason":       "pending",
+                "one_d_slope": mtf_align.get("one_d_slope"),
+                "vol_change": vol_change,
+                "score": score,
+                "accept": False,
+                "reason": "pending",
+                "tv_label": tv_label,
+                "tv_score": tv_score,
             }
 
             if mtf_status in ("aligned", "daily_rising"):
+                # apply market cap filter (if configured)
+                if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
+                    try:
+                        symbol_info = await self.client.get_symbol_info(sym)
+                        marketcap = None
+                        if isinstance(symbol_info, dict):
+                            for key in ("market_cap", "marketCap", "market_cap_usd", "marketcap"):
+                                if key in symbol_info and symbol_info.get(key) is not None:
+                                    try:
+                                        marketcap = float(symbol_info.get(key))
+                                        break
+                                    except Exception:
+                                        try:
+                                            marketcap = float(str(symbol_info.get(key)).replace(',', ''))
+                                            break
+                                        except Exception:
+                                            marketcap = None
+                        if marketcap is not None and marketcap < MARKET_CAP_MIN:
+                            entry["accept"] = False
+                            entry["reason"] = "market_cap_filtered"
+                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
+                            evaluated.append(entry)
+                            continue
+                    except Exception:
+                        logger.exception("Market cap check failed for %s", sym)
+                        # fall through and let other gates decide
+
+                # volume gate: (existing config gate)
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None:
                         entry["accept"] = False
@@ -872,20 +944,26 @@ class Scanner:
                         to_open.append(entry)
                         logger.info("MTF %s → ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
                 else:
-                    entry["accept"] = True
-                    entry["reason"] = mtf_status
-                    to_open.append(entry)
-                    logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
+                    # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
+                    if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
+                        entry["accept"] = False
+                        entry["reason"] = "negvol_blocked"
+                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%.4f): %s", vol_change, sym)
+                    else:
+                        entry["accept"] = True
+                        entry["reason"] = mtf_status
+                        to_open.append(entry)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
                 if sym not in self._mtf_monitoring:
                     self._mtf_monitoring[sym] = {
-                        "root":        root,
-                        "price":       price,
-                        "started_at":  time.time(),
+                        "root": root,
+                        "price": price,
+                        "started_at": time.time(),
                         "negative_tfs": list(negative_tfs),
-                        "last_alert":  0.0,
+                        "last_alert": 0.0,
                     }
                     logger.info("MTF MONITORING: %s added — waiting on: %s", sym, negative_tfs)
 
@@ -893,53 +971,109 @@ class Scanner:
 
         await self._emit_event("candidates_evaluated", evaluated)
 
-        logger.warning(
-            "[CANDIDATES_SUMMARY] Total evaluated=%d, Accepted/To Open=%d, Monitoring now=%d",
-            len(evaluated), len([e for e in evaluated if e.get("accept")]), len(self._mtf_monitoring)
-        )
+        logger.warning("[CANDIDATES_SUMMARY] Total evaluated=%d, Accepted/To Open=%d, Monitoring now=%d",
+                       len(evaluated), len([e for e in evaluated if e.get("accept")]), len(self._mtf_monitoring))
 
         candidates = to_open
+
+        # If ROOT_FILTER is applied, pick top across roots first (preserve earlier behavior)
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
                 grouped.setdefault(c["root"], []).append(c)
+
             selected: List[Dict[str, Any]] = []
-            for rt in ROOT_TFS:
+            # Use PRIORITIZE_SLOT_ORDER to allocate slots across roots if provided; otherwise, use ROOT_TFS order
+            order_list = PRIORITIZE_SLOT_ORDER if PRIORITIZE_SLOT_ORDER else ROOT_TFS
+            remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
+
+            for rt in order_list:
+                if remaining_slots <= 0:
+                    break
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:ROOT_TOP_N]
+                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:remaining_slots]
                 selected.extend(top)
+                remaining_slots -= len(top)
+
+            # If still slots remain, fill from other roots by score
+            if remaining_slots > 0:
+                remaining_candidates = [c for c in candidates if c not in selected]
+                remaining_sorted = sorted(remaining_candidates, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                selected.extend(remaining_sorted)
+
             candidates = sorted(selected, key=lambda r: r["score"], reverse=True)
+        else:
+            # No root filter: apply global prioritization
+            if PRIORITIZE_SLOT_ORDER:
+                remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
+                selected: List[Dict[str, Any]] = []
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                for c in candidates:
+                    grouped.setdefault(c["root"], []).append(c)
+                for rt in PRIORITIZE_SLOT_ORDER:
+                    if remaining_slots <= 0:
+                        break
+                    lst = grouped.get(rt, [])
+                    if not lst:
+                        continue
+                    top = sorted(lst, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                    selected.extend(top)
+                    remaining_slots -= len(top)
+                if remaining_slots > 0:
+                    remaining_candidates = [c for c in candidates if c not in selected]
+                    remaining_sorted = sorted(remaining_candidates, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                    selected.extend(remaining_sorted)
+                candidates = sorted(selected, key=lambda r: r["score"], reverse=True)
+            else:
+                candidates = sorted(candidates, key=lambda r: r["score"], reverse=True)
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-        logger.info(
-            "Candidates to open: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
-            len(candidates), MAX_OPEN_TRADES, current_open,
-        )
+        logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
+                    len(candidates), MAX_OPEN_TRADES, current_open)
 
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached — halting further opens.")
                 break
-            sym   = c["symbol"]
+
+            # Enforce TV rating gate if configured
+            tv_label = c.get("tv_label")
+            if TRADE_RATING_ALLOW:
+                if tv_label not in TRADE_RATING_ALLOW:
+                    logger.info("Trade blocked by TRADE_RATING_ALLOW (tv_label=%s not in %s) for %s", tv_label, TRADE_RATING_ALLOW, c["symbol"])
+                    c["accept"] = False
+                    c["reason"] = "tv_rating_blocked"
+                    continue
+
+            sym = c["symbol"]
             price = c["price"]
+            vol_change = c.get("vol_change")
+
+            # Double-check TRADE_NO_NEG_VOL
+            if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
+                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%.4f)", sym, vol_change)
+                c["accept"] = False
+                c["reason"] = "negvol_blocked"
+                continue
+
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
             symbol_info = await self.client.get_symbol_info(sym)
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
-            qty     = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
                 logger.warning("Zero qty for %s after quantize — skipping.", sym)
+                c["accept"] = False
+                c["reason"] = "zero_qty"
                 continue
             if qty != qty_raw:
-                logger.debug(
-                    "Qty for %s adjusted %s → %s (step=%s min=%s)",
-                    sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"),
-                )
-            side       = "Buy"
+                logger.debug("Qty for %s adjusted %s → %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+
+            side = "Buy"
             reason_tag = c.get("reason", "signal")
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
@@ -950,8 +1084,11 @@ class Scanner:
                         f"Price: {price} | Qty: {qty:.6f}\n"
                         f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                     )
+                    logger.info("Real trade opened %s qty=%s score=%.2f", sym, qty, c["score"])
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
+                    c["accept"] = False
+                    c["reason"] = "order_failed"
             else:
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
@@ -960,6 +1097,8 @@ class Scanner:
                     f"Price: {price} | Qty: {qty:.6f}\n"
                     f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                 )
+
+            # Remove from monitoring if present
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated

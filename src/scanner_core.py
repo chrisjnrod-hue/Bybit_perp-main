@@ -383,9 +383,7 @@ def _safe_stoch(df_high, df_low, df_close, k: int, d: int):
         else:
             # bukosabino StochasticOscillator: stoch()
             stoch_obj = _ta_module.momentum.StochasticOscillator(high=df_high, low=df_low, close=df_close, window=int(k), smooth_window=int(d))
-            # Some versions provide stoch() and stoch_signal()
             try:
-                # return DataFrame-like with k and d if possible
                 import pandas as _pd
                 df_st = _pd.DataFrame({
                     "STOCHk": stoch_obj.stoch(),

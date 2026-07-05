@@ -517,23 +517,54 @@ class Scanner:
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
         """Update and track 24h volume data - CALLED FOR EVERY SYMBOL"""
         try:
-            if hasattr(self.client, "get_24h_ticker"):
-                async with self.request_sem:
-                    data = await self.client.get_24h_ticker(symbol)
-                if data and isinstance(data, dict):
-                    vol = data.get("volume") or data.get("vol") or data.get("turnover")
-                    if vol is not None:
+            # Try multiple possible client method names via _call_client_method for robustness
+            names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
+            data = await self._call_client_method(names, symbol)
+            if not data:
+                logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
+                return None
+
+            # Normalize nested shapes (many APIs return { 'result': {...} } or { 'data': {...} })
+            if isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], (dict, list)):
+                    # prefer dict
+                    if isinstance(data["data"], dict):
+                        data = data["data"]
+                elif "result" in data and isinstance(data["result"], (dict, list)):
+                    if isinstance(data["result"], dict):
+                        data = data["result"]
+
+            vol = None
+            if isinstance(data, dict):
+                for key in ("volume", "vol", "turnover", "volume24h", "quote_vol", "volume_24h"):
+                    if key in data and data.get(key) is not None:
                         try:
-                            vol = float(vol)
-                            if symbol not in self._24h_volumes:
-                                self._24h_volumes[symbol] = {"current": vol, "previous": vol}
-                            else:
-                                self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
-                                self._24h_volumes[symbol]["current"] = vol
-                            logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
-                            return vol
+                            vol = float(data.get(key))
+                            break
                         except Exception:
-                            pass
+                            try:
+                                vol = float(str(data.get(key)).replace(',', ''))
+                                break
+                            except Exception:
+                                vol = None
+
+            # If data is a string/number just try to parse
+            if vol is None and isinstance(data, (int, float, str)):
+                try:
+                    vol = float(data)
+                except Exception:
+                    vol = None
+
+            if vol is not None:
+                if symbol not in self._24h_volumes:
+                    self._24h_volumes[symbol] = {"current": vol, "previous": vol}
+                else:
+                    self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
+                    self._24h_volumes[symbol]["current"] = vol
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                return vol
+            else:
+                logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
         except Exception:
             logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
         return None
@@ -941,7 +972,7 @@ class Scanner:
         - If full_push True: send full header + signals + recommendation blocks.
         - If full_push False: only send new root signals (time-based dedup). After initial deployment,
           minimal (delta) pushes will be gated to occur at most once per configured ROOT_SCAN_INTERVAL
-          to avoid duplication. Each signal is sent as a single Telegram message/block (1 signal per block).
+          OR (when ROOT_SCAN_INTERVAL==0) once per 5-minute candle start.
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -1075,24 +1106,30 @@ class Scanner:
 
             now_ts = time.time()
 
-            # Enforce minimal push gating: after first deployment, only allow minimal pushes
-            # to occur at most once per ROOT_SCAN_INTERVAL (if configured). This prevents
-            # duplicate pushes in between scheduled scans.
-            if not self._first_deploy_push and ROOT_SCAN_INTERVAL and self._last_minimal_push_ts is not None:
-                elapsed_since_last = now_ts - self._last_minimal_push_ts
-                # Use a small epsilon to allow for timing jitter
-                if elapsed_since_last < max(1, ROOT_SCAN_INTERVAL - 1):
-                    logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, ROOT_SCAN_INTERVAL)
-                    return
-
-            to_send = []
-            signal_ttl = 3600  # 1 hour TTL
+            # Enforce minimal push gating:
+            # - If ROOT_SCAN_INTERVAL truthy: require at least ROOT_SCAN_INTERVAL since last minimal push
+            # - If ROOT_SCAN_INTERVAL falsy (0), gate pushes to at most once per 5-minute candle (aligned to 5m open)
+            if not self._first_deploy_push:
+                if ROOT_SCAN_INTERVAL:
+                    if self._last_minimal_push_ts is not None:
+                        elapsed_since_last = now_ts - self._last_minimal_push_ts
+                        if elapsed_since_last < max(1, ROOT_SCAN_INTERVAL - 1):
+                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, ROOT_SCAN_INTERVAL)
+                            return
+                else:
+                    # Align gating to 5-minute candle starts
+                    candle_start = (int(now_ts) // 300) * 300
+                    if self._last_minimal_push_ts == candle_start:
+                        logger.info("[TELEGRAM_DELTA] Skipping minimal push: already pushed during this 5m candle (start=%d)", candle_start)
+                        return
 
             # Clean up old entries
+            signal_ttl = 3600  # 1 hour TTL
             for key in list(self._last_root_signal_send.keys()):
                 if now_ts - self._last_root_signal_send[key] > signal_ttl:
                     self._last_root_signal_send.pop(key, None)
 
+            to_send = []
             # Check each signal
             for sig in root_signals:
                 sym = sig.get("symbol")
@@ -1101,7 +1138,6 @@ class Scanner:
 
                 if key not in self._last_root_signal_send:
                     to_send.append(sig)
-                    # Do not set last_root_signal_send yet — set only when actually sent
                     logger.info("[TELEGRAM_DELTA] NEW signal queued: %s %s", sym, rt)
 
             if not to_send:
@@ -1109,6 +1145,7 @@ class Scanner:
 
             # Send one Telegram message per new signal (1 signal per block) — preserve existing layout
             sent_any = False
+            sent_ts = None
             for sig in to_send:
                 try:
                     sym = sig.get("symbol")
@@ -1149,13 +1186,19 @@ class Scanner:
                     # Record that we sent this signal so we don't resend within TTL
                     self._last_root_signal_send[(sym, rt)] = now_ts
                     sent_any = True
+                    sent_ts = now_ts
                     logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
 
             # If we sent any minimal signals, record the minimal push time to gate future pushes
             if sent_any:
-                self._last_minimal_push_ts = now_ts
+                if ROOT_SCAN_INTERVAL:
+                    self._last_minimal_push_ts = sent_ts
+                else:
+                    # For 5m alignment gating, store the candle_start value (integer)
+                    candle_start = (int(sent_ts) // 300) * 300
+                    self._last_minimal_push_ts = candle_start
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

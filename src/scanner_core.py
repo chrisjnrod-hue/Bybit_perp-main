@@ -13,7 +13,7 @@ Note: This module will attempt to import pandas/ta. If unavailable, compute_tv_r
 import math
 import json
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
 
 getcontext().prec = 28
 
@@ -52,13 +52,13 @@ def tf_to_seconds(tf: str) -> int:
         return 60
 
 
-def normalize_klines(raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
+def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
     """
     Normalize various kline shapes into list of dicts:
       {"start_at", "open", "high", "low", "close", "volume", "is_closed"(optional)}
     Accepts dicts, lists, tuples and attempts to extract common fields.
     """
-    out: List[Dict[str, Any]] = []
+    out: List[Dict[str, AnyT]] = []
     if not raw_klines:
         return out
 
@@ -287,21 +287,31 @@ def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Opti
     Compute percentage change given a symbol's volume tracking dict:
       {"current": float, "previous": float}
     Returns None if insufficient data or prev <= 0. Clamps to 1.0 max.
+    Also prints debug info to console for troubleshooting.
     """
     try:
         if not vol_data:
+            print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
             return None
         prev_vol = vol_data.get("previous", 0)
         curr_vol = vol_data.get("current", 0)
         if prev_vol <= 0:
+            print(f"[VOL_DEBUG] compute_24h_volume_change: prev_vol <= 0 (prev={prev_vol}, curr={curr_vol})")
             return None
         change = (curr_vol - prev_vol) / prev_vol
-        return min(change, 1.0)
-    except Exception:
+        result = min(change, 1.0)
+        # Console debug
+        try:
+            print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
+        except Exception:
+            print(f"[VOL_DEBUG] prev={prev_vol}, curr={curr_vol}, change={change}")
+        return result
+    except Exception as e:
+        print(f"[VOL_DEBUG] compute_24h_volume_change error: {e}")
         return None
 
 
-def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
+def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
     """
     Compute a TradingView-like normalized score using pandas/ta and the TECHNICAL_RATING-style cfg.
     Inputs:
@@ -310,11 +320,23 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
       tf: optional timeframe string (not used by computation but kept for compatibility)
       price: optional current price to apply to last close
     Returns: (score, label)
+
+    This function prints concise debug messages to console describing why computation
+    may have returned a neutral score (missing libs, insufficient candles, conversion errors),
+    and prints the final computed score when successful.
     """
+    # Debug start
+    try:
+        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE}")
+    except Exception:
+        pass
+
     if not cfg.get("enabled", True):
+        print("[TV_DEBUG] TECHNICAL_RATING disabled in config -> Neutral")
         return 0.0, "Neutral"
 
     if not _PANDAS_TA_AVAILABLE:
+        print("[TV_DEBUG] pandas/ta not available -> returning Neutral")
         return 0.0, "Neutral"
 
     try:
@@ -322,6 +344,7 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
         min_candles = max(26, ma_max + 5)
 
         if not klines or len(klines) < min_candles:
+            print(f"[TV_DEBUG] insufficient candles for tf={tf}: have={len(klines) if klines else 0} need={min_candles}")
             return 0.0, "Neutral"
 
         df = pd.DataFrame(klines)
@@ -330,11 +353,15 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
                 df[col] = np.nan
 
         df = df.dropna(subset=["close"]).copy()
-        df["open"] = pd.to_numeric(df["open"], errors="coerce")
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+        try:
+            df["open"] = pd.to_numeric(df["open"], errors="coerce")
+            df["high"] = pd.to_numeric(df["high"], errors="coerce")
+            df["low"] = pd.to_numeric(df["low"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+        except Exception as e:
+            print(f"[TV_DEBUG] dtype conversion error for tf={tf}: {e}")
+            return 0.0, "Neutral"
 
         if price is not None:
             try:
@@ -342,58 +369,72 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
             except Exception:
                 pass
 
-        # Indicators
-        ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
-        for l in ma_lengths:
-            df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+        # Indicators computation with debug markers
+        try:
+            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
+            for l in ma_lengths:
+                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+            print(f"[TV_DEBUG] computed SMAs: {ma_lengths}")
 
-        macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
-        macd_result = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
-        if macd_result is not None and not macd_result.empty:
-            macd_hist_col = next((c for c in macd_result.columns if "MACD_" in c and "h" in c.lower()), None)
-            if macd_hist_col:
-                df["macd_hist"] = macd_result[macd_hist_col]
+            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
+            macd_result = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
+            if macd_result is not None and not macd_result.empty:
+                macd_hist_col = next((c for c in macd_result.columns if "MACD_" in c and "h" in c.lower()), None)
+                if macd_hist_col:
+                    df["macd_hist"] = macd_result[macd_hist_col]
+                else:
+                    df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
-                df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
-        else:
-            df["macd_hist"] = 0.0
+                df["macd_hist"] = 0.0
+            print(f"[TV_DEBUG] computed MACD (macd_result columns: {list(macd_result.columns) if macd_result is not None and hasattr(macd_result,'columns') else 'n/a'})")
 
-        df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            print("[TV_DEBUG] computed RSI")
 
-        stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
-        try:
-            st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-            if st is not None and not st.empty:
-                stoch_k_col = next((c for c in st.columns if "STOCHk" in c or "k" in c.lower()), None)
-                if stoch_k_col:
-                    df["stoch_k"] = st[stoch_k_col]
-        except Exception:
-            pass
+            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
+            try:
+                st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
+                if st is not None and not st.empty:
+                    stoch_k_col = next((c for c in st.columns if "STOCHk" in c or "k" in c.lower()), None)
+                    if stoch_k_col:
+                        df["stoch_k"] = st[stoch_k_col]
+                print("[TV_DEBUG] computed Stochastic (k)")
+            except Exception:
+                print("[TV_DEBUG] stoch calc failed (continuing)")
 
-        try:
-            adx_result = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
-            if adx_result is not None and not adx_result.empty:
-                adx_col = next((c for c in adx_result.columns if "ADX" in c), None)
-                if adx_col:
-                    df["adx"] = adx_result[adx_col]
+            try:
+                adx_result = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
+                if adx_result is not None and not adx_result.empty:
+                    adx_col = next((c for c in adx_result.columns if "ADX" in c), None)
+                    if adx_col:
+                        df["adx"] = adx_result[adx_col]
+                    else:
+                        df["adx"] = np.nan
                 else:
                     df["adx"] = np.nan
-            else:
+                print("[TV_DEBUG] computed ADX")
+            except Exception:
                 df["adx"] = np.nan
-        except Exception:
-            df["adx"] = np.nan
+                print("[TV_DEBUG] adx calc failed (continuing)")
 
-        df["obv"] = ta.obv(df["close"], df["volume"])
+            df["obv"] = ta.obv(df["close"], df["volume"])
+            print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
 
-        try:
-            bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
-                           std=cfg["indicators"].get("bollinger", [20, 2])[1])
-            if bb is not None and not bb.empty:
-                for c in bb.columns:
-                    df[c] = bb[c]
-        except Exception:
-            pass
+            try:
+                bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
+                               std=cfg["indicators"].get("bollinger", [20, 2])[1])
+                if bb is not None and not bb.empty:
+                    for c in bb.columns:
+                        df[c] = bb[c]
+                print("[TV_DEBUG] computed Bollinger Bands")
+            except Exception:
+                print("[TV_DEBUG] bb calc failed (continuing)")
 
+        except Exception as e:
+            print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
+            return 0.0, "Neutral"
+
+        # Scoring
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
@@ -447,6 +488,7 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
             scores.append((sub, weights.get("obv", 1.0)))
 
         if not scores:
+            print("[TV_DEBUG] no indicator scores computed -> Neutral")
             return 0.0, "Neutral"
 
         num = sum(s * w for (s, w) in scores)
@@ -474,12 +516,18 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
         elif score <= t["sell"]:
             label = "Sell"
 
+        # Final debug output
+        try:
+            print(f"[TV_DEBUG] tf={tf} score={score:.4f} label={label}")
+        except Exception:
+            print(f"[TV_DEBUG] tf={tf} score={score} label={label}")
         return score, label
-    except Exception:
+    except Exception as e:
+        print(f"[TV_DEBUG] compute_tv_rating error: {e}")
         return 0.0, "Neutral"
 
 
-def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, Any]:
+def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
     """
     Evaluate MTF alignment across timeframes.
     get_closes_fn(tf) -> list of closes for that tf (most recent last).
@@ -487,7 +535,7 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
     mtf_tfs: list of TFs to evaluate (e.g., ["5","15","60","240","D"])
     mtf_slope_lookback: lookback for daily slope
     """
-    tf_states: Dict[str, Dict[str, Any]] = {}
+    tf_states: Dict[str, Dict[str, AnyT]] = {}
     negative_tfs: List[str] = []
     one_d_hist: List[float] = []
 

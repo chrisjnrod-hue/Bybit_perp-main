@@ -68,9 +68,12 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
 
+        # NEW: push / dedupe state for Telegram sending
         self._first_deploy_push = True
         self._last_full_push_ts: Optional[int] = None
         self._last_root_signal_send: Dict[tuple, float] = {}
+        # New: track last minimal (delta) push timestamp to enforce "only at set scan interval"
+        self._last_minimal_push_ts: Optional[float] = None
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s)",
@@ -936,7 +939,9 @@ class Scanner:
 
         Behavior:
         - If full_push True: send full header + signals + recommendation blocks.
-        - If full_push False: only send new root signals (time-based dedup).
+        - If full_push False: only send new root signals (time-based dedup). After initial deployment,
+          minimal (delta) pushes will be gated to occur at most once per configured ROOT_SCAN_INTERVAL
+          to avoid duplication. Each signal is sent as a single Telegram message/block (1 signal per block).
         """
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
@@ -946,6 +951,9 @@ class Scanner:
                 eval_map[(e["symbol"], e["root"])] = e
 
         if full_push:
+            # Reset minimal push gating on full pushes (initial deployment or full periodic push)
+            self._last_minimal_push_ts = None
+
             tf_counts: Dict[str, int] = {}
             for sig in root_signals:
                 rt = sig.get("root", "?")
@@ -988,6 +996,7 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send first summary block")
 
+            # Send per-signal blocks (full)
             for sig in root_signals:
                 try:
                     sym        = sig["symbol"]
@@ -1028,6 +1037,7 @@ class Scanner:
                 except Exception:
                     logger.exception("Failed to send signal block for %s %s", sig.get("symbol"), rt)
 
+            # Full recommended and summary block
             try:
                 if evaluated:
                     current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
@@ -1059,17 +1069,31 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send recommended signals block")
         else:
+            # Minimal push: send only new signals (time-based dedup)
             if not root_signals:
                 return
 
-            to_send = []
             now_ts = time.time()
+
+            # Enforce minimal push gating: after first deployment, only allow minimal pushes
+            # to occur at most once per ROOT_SCAN_INTERVAL (if configured). This prevents
+            # duplicate pushes in between scheduled scans.
+            if not self._first_deploy_push and ROOT_SCAN_INTERVAL and self._last_minimal_push_ts is not None:
+                elapsed_since_last = now_ts - self._last_minimal_push_ts
+                # Use a small epsilon to allow for timing jitter
+                if elapsed_since_last < max(1, ROOT_SCAN_INTERVAL - 1):
+                    logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, ROOT_SCAN_INTERVAL)
+                    return
+
+            to_send = []
             signal_ttl = 3600  # 1 hour TTL
 
+            # Clean up old entries
             for key in list(self._last_root_signal_send.keys()):
                 if now_ts - self._last_root_signal_send[key] > signal_ttl:
                     self._last_root_signal_send.pop(key, None)
 
+            # Check each signal
             for sig in root_signals:
                 sym = sig.get("symbol")
                 rt = sig.get("root")
@@ -1077,9 +1101,14 @@ class Scanner:
 
                 if key not in self._last_root_signal_send:
                     to_send.append(sig)
-                    self._last_root_signal_send[key] = now_ts
-                    logger.info("[TELEGRAM_DELTA] NEW signal: %s %s", sym, rt)
+                    # Do not set last_root_signal_send yet — set only when actually sent
+                    logger.info("[TELEGRAM_DELTA] NEW signal queued: %s %s", sym, rt)
 
+            if not to_send:
+                return
+
+            # Send one Telegram message per new signal (1 signal per block) — preserve existing layout
+            sent_any = False
             for sig in to_send:
                 try:
                     sym = sig.get("symbol")
@@ -1117,9 +1146,16 @@ class Scanner:
                         f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
+                    # Record that we sent this signal so we don't resend within TTL
+                    self._last_root_signal_send[(sym, rt)] = now_ts
+                    sent_any = True
                     logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
+
+            # If we sent any minimal signals, record the minimal push time to gate future pushes
+            if sent_any:
+                self._last_minimal_push_ts = now_ts
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

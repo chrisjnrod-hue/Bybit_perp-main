@@ -8,7 +8,7 @@ These functions:
 - Accept inputs (klines, closes, volume dicts, config) to be unit-testable
 - Preserve behavior of original helpers (normalization, MACD wrapper, TV rating, quantize, MTF alignment)
 
-Note: This module will attempt to import pandas/ta. If unavailable, compute_tv_rating will return neutral.
+Note: This module will attempt to import pandas_ta (preferred) or the alternative 'ta' package and will attempt to compute indicators using whichever is available. If no supported TA API is present, compute_tv_rating will return neutral.
 """
 import math
 import json
@@ -21,13 +21,31 @@ getcontext().prec = 28
 try:
     import pandas as pd
     import numpy as np
-    import ta
-    _PANDAS_TA_AVAILABLE = True
 except Exception:
     pd = None  # type: ignore
     np = None  # type: ignore
-    ta = None  # type: ignore
-    _PANDAS_TA_AVAILABLE = False
+
+# Try to import pandas_ta first (preferred API: ta.sma, ta.macd, etc.)
+_PANDAS_TA_AVAILABLE = False
+_PANDAS_TA_STYLE = False
+_ta_module = None
+try:
+    import pandas_ta as ta  # type: ignore
+    _ta_module = ta
+    _PANDAS_TA_AVAILABLE = True
+    _PANDAS_TA_STYLE = True
+except Exception:
+    # Try the alternative 'ta' package (bukosabino) which uses class-based API
+    try:
+        import ta  # type: ignore
+        _ta_module = ta
+        _PANDAS_TA_AVAILABLE = True
+        _PANDAS_TA_STYLE = False
+    except Exception:
+        ta = None  # type: ignore
+        _ta_module = None
+        _PANDAS_TA_AVAILABLE = False
+        _PANDAS_TA_STYLE = False
 
 # Import MACD helper and slope function from package (keeps same external dependency)
 from .macd import macd_histogram, slope  # type: ignore
@@ -311,9 +329,126 @@ def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Opti
         return None
 
 
+# --- Helper wrappers for indicator functions (work with pandas_ta or bukosabino/ta) ---
+def _safe_sma(df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.sma(df_close, length=length)
+        else:
+            # bukosabino style
+            return _ta_module.trend.SMAIndicator(df_close, window=int(length)).sma_indicator()
+    except Exception:
+        return None
+
+
+def _safe_macd(df_close, fast: int, slow: int, signal: int):
+    """
+    Return a DataFrame-like object (or None). Try pandas_ta.macd first, else construct DataFrame for macd, macd_signal, macd_diff.
+    """
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.macd(df_close, fast=fast, slow=slow, signal=signal)
+        else:
+            # bukosabino style: MACD class
+            macd_obj = _ta_module.trend.MACD(df_close, window_slow=int(slow), window_fast=int(fast), window_sign=int(signal))
+            # Build dataframe-like structure (pandas Series/Frame) if pandas available
+            try:
+                import pandas as _pd
+                df_macd = _pd.DataFrame({
+                    "MACD": macd_obj.macd(),
+                    "MACD_signal": macd_obj.macd_signal(),
+                    "MACD_hist": macd_obj.macd_diff()
+                }, index=df_close.index)
+                return df_macd
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_rsi(df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.rsi(df_close, length=length)
+        else:
+            return _ta_module.momentum.RSIIndicator(df_close, window=int(length)).rsi()
+    except Exception:
+        return None
+
+
+def _safe_stoch(df_high, df_low, df_close, k: int, d: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.stoch(high=df_high, low=df_low, close=df_close, k=k, d=d)
+        else:
+            # bukosabino StochasticOscillator: stoch()
+            stoch_obj = _ta_module.momentum.StochasticOscillator(high=df_high, low=df_low, close=df_close, window=int(k), smooth_window=int(d))
+            # Some versions provide stoch() and stoch_signal()
+            try:
+                # return DataFrame-like with k and d if possible
+                import pandas as _pd
+                df_st = _pd.DataFrame({
+                    "STOCHk": stoch_obj.stoch(),
+                    "STOCHd": stoch_obj.stoch_signal()
+                }, index=df_close.index)
+                return df_st
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_adx(df_high, df_low, df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.adx(high=df_high, low=df_low, close=df_close, length=length)
+        else:
+            adx_obj = _ta_module.trend.ADXIndicator(high=df_high, low=df_low, close=df_close, window=int(length))
+            try:
+                import pandas as _pd
+                df_adx = _pd.DataFrame({
+                    "ADX": adx_obj.adx()
+                }, index=df_close.index)
+                return df_adx
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_obv(df_close, df_volume):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.obv(df_close, df_volume)
+        else:
+            return _ta_module.volume.OnBalanceVolumeIndicator(close=df_close, volume=df_volume).on_balance_volume()
+    except Exception:
+        return None
+
+
+def _safe_bbands(df_close, length: int, std: float):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.bbands(df_close, length=length, std=std)
+        else:
+            bb = _ta_module.volatility.BollingerBands(close=df_close, window=int(length), window_dev=float(std))
+            try:
+                import pandas as _pd
+                df_bb = _pd.DataFrame({
+                    "BB_bbm": bb.bollinger_mavg(),
+                    "BB_bbh": bb.bollinger_hband(),
+                    "BB_bbl": bb.bollinger_lband()
+                }, index=df_close.index)
+                return df_bb
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
 def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
     """
-    Compute a TradingView-like normalized score using pandas/ta and the TECHNICAL_RATING-style cfg.
+    Compute a TradingView-like normalized score using pandas/ta or fallback 'ta' and the TECHNICAL_RATING-style cfg.
     Inputs:
       klines: normalized kline dicts (with 'close','open','high','low','volume')
       cfg: TECHNICAL_RATING config dict (must contain 'indicators' etc.)
@@ -327,7 +462,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
     """
     # Debug start
     try:
-        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE}")
+        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE} pandas_ta_style={_PANDAS_TA_STYLE}")
     except Exception:
         pass
 
@@ -335,8 +470,8 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         print("[TV_DEBUG] TECHNICAL_RATING disabled in config -> Neutral")
         return 0.0, "Neutral"
 
-    if not _PANDAS_TA_AVAILABLE:
-        print("[TV_DEBUG] pandas/ta not available -> returning Neutral")
+    if not _PANDAS_TA_AVAILABLE or pd is None or np is None:
+        print("[TV_DEBUG] pandas/pandas_ta/ta not available -> returning Neutral")
         return 0.0, "Neutral"
 
     try:
@@ -369,33 +504,38 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             except Exception:
                 pass
 
-        # Indicators computation with debug markers
+        # Indicators computation with debug markers using safe wrappers
         try:
             ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
             for l in ma_lengths:
-                df[f"sma_{l}"] = ta.sma(df["close"], length=int(l))
+                sma_series = _safe_sma(df["close"], length=int(l))
+                if sma_series is not None:
+                    df[f"sma_{l}"] = sma_series
             print(f"[TV_DEBUG] computed SMAs: {ma_lengths}")
 
             macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
-            macd_result = ta.macd(df["close"], fast=macd_cfg[0], slow=macd_cfg[1], signal=macd_cfg[2])
-            if macd_result is not None and not macd_result.empty:
-                macd_hist_col = next((c for c in macd_result.columns if "MACD_" in c and "h" in c.lower()), None)
+            macd_result = _safe_macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
+            if macd_result is not None and hasattr(macd_result, "columns") and len(macd_result.columns) > 0:
+                # try to find a histogram-like column
+                macd_hist_col = next((c for c in macd_result.columns if "MACD" in str(c).upper() and ("H" in str(c).upper() or "diff" in str(c).lower())), None)
                 if macd_hist_col:
                     df["macd_hist"] = macd_result[macd_hist_col]
                 else:
+                    # fall back to last column
                     df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
                 df["macd_hist"] = 0.0
             print(f"[TV_DEBUG] computed MACD (macd_result columns: {list(macd_result.columns) if macd_result is not None and hasattr(macd_result,'columns') else 'n/a'})")
 
-            df["rsi"] = ta.rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            rsi_series = _safe_rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            df["rsi"] = rsi_series
             print("[TV_DEBUG] computed RSI")
 
             stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
             try:
-                st = ta.stoch(high=df["high"], low=df["low"], close=df["close"], k=stoch_cfg[0], d=stoch_cfg[1])
-                if st is not None and not st.empty:
-                    stoch_k_col = next((c for c in st.columns if "STOCHk" in c or "k" in c.lower()), None)
+                st = _safe_stoch(df["high"], df["low"], df["close"], k=int(stoch_cfg[0]), d=int(stoch_cfg[1]))
+                if st is not None and hasattr(st, "columns"):
+                    stoch_k_col = next((c for c in st.columns if "STOCH" in str(c).upper() or "k" in str(c).lower()), None)
                     if stoch_k_col:
                         df["stoch_k"] = st[stoch_k_col]
                 print("[TV_DEBUG] computed Stochastic (k)")
@@ -403,9 +543,9 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                 print("[TV_DEBUG] stoch calc failed (continuing)")
 
             try:
-                adx_result = ta.adx(high=df["high"], low=df["low"], close=df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
-                if adx_result is not None and not adx_result.empty:
-                    adx_col = next((c for c in adx_result.columns if "ADX" in c), None)
+                adx_result = _safe_adx(df["high"], df["low"], df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
+                if adx_result is not None and hasattr(adx_result, "columns"):
+                    adx_col = next((c for c in adx_result.columns if "ADX" in str(c).upper()), None)
                     if adx_col:
                         df["adx"] = adx_result[adx_col]
                     else:
@@ -417,13 +557,17 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                 df["adx"] = np.nan
                 print("[TV_DEBUG] adx calc failed (continuing)")
 
-            df["obv"] = ta.obv(df["close"], df["volume"])
-            print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
+            obv_series = _safe_obv(df["close"], df["volume"])
+            df["obv"] = obv_series
+            try:
+                print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
+            except Exception:
+                print("[TV_DEBUG] computed OBV")
 
             try:
-                bb = ta.bbands(df["close"], length=int(cfg["indicators"].get("bollinger", [20, 2])[0]),
-                               std=cfg["indicators"].get("bollinger", [20, 2])[1])
-                if bb is not None and not bb.empty:
+                boll_cfg = cfg["indicators"].get("bollinger", [20, 2])
+                bb = _safe_bbands(df["close"], length=int(boll_cfg[0]), std=float(boll_cfg[1]))
+                if bb is not None and hasattr(bb, "columns"):
                     for c in bb.columns:
                         df[c] = bb[c]
                 print("[TV_DEBUG] computed Bollinger Bands")
@@ -455,7 +599,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             scores.append((sub, weights.get("ma_pair", 1.0)))
 
         macd_hist = last.get("macd_hist")
-        if not pd.isna(macd_hist) and macd_hist is not None:
+        if macd_hist is not None and not pd.isna(macd_hist):
             hist_series = df["macd_hist"].dropna()
             denom = hist_series.std() if len(hist_series) > 0 else 1.0
             denom = denom if denom != 0 else 1.0
@@ -496,7 +640,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         score = float(num / denom)
 
         adx = last.get("adx")
-        if not pd.isna(adx) and adx is not None:
+        if adx is not None and not pd.isna(adx):
             adx_cfg = cfg.get("adx", {})
             thr = adx_cfg.get("threshold", 25)
             mult = adx_cfg.get("multiplier", 1.25)

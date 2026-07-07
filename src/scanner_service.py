@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional, Callable
 import math
 import inspect
 from decimal import getcontext
+import re
 
 getcontext().prec = 28
 
@@ -45,8 +46,17 @@ DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
 # New envs (parsed here)
-TRADE_RATING_ALLOW = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy").split(",")
-TRADE_RATING_ALLOW = [x.strip() for x in TRADE_RATING_ALLOW if x.strip()]
+def _norm_rating_token(s: str) -> str:
+    # remove non-alphanumeric, lowercase and strip spaces so "Strong Buy", "strongbuy", "StrongBuy!" all match
+    if not s:
+        return ""
+    return re.sub(r'[^0-9a-z]', '', str(s).strip().lower())
+
+raw_allow = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy")
+TRADE_RATING_ALLOW = [x.strip() for x in raw_allow.split(",") if x.strip()]
+# normalized lookup set for reliable comparisons
+TRADE_RATING_ALLOW_NORMALIZED = set(_norm_rating_token(x) for x in TRADE_RATING_ALLOW)
+
 # If TRADE_RATING_ALLOW is empty list -> allow any rating
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
@@ -719,7 +729,7 @@ class Scanner:
                             full_push = True
                             self._last_full_push_ts = candle_start
 
-                # compute minimal_allowed similarly to send_summary
+                # compute minimal_allowed similarly to send_summary (now uses normalized integer timestamps)
                 minimal_allowed = False
                 if full_push:
                     minimal_allowed = True
@@ -731,10 +741,10 @@ class Scanner:
                             if self._last_minimal_push_ts is None:
                                 minimal_allowed = True
                             else:
-                                elapsed_since_last = now_ts - (self._last_minimal_push_ts if self._last_minimal_push_ts else 0)
-                                minimal_allowed = elapsed_since_last >= max(1, ROOT_SCAN_INTERVAL - 1)
+                                last_ts = int(self._last_minimal_push_ts)
+                                minimal_allowed = (now_ts - last_ts) >= max(1, int(ROOT_SCAN_INTERVAL))
                         else:
-                            candle_start = (now_ts // 300) * 300
+                            candle_start = (int(time.time()) // 300) * 300
                             minimal_allowed = (self._last_minimal_push_ts != candle_start)
 
                 logger.info("[DIAGNOSTIC] push gating full_push=%s minimal_allowed=%s first_deploy=%s", full_push, minimal_allowed, self._first_deploy_push)
@@ -945,10 +955,10 @@ class Scanner:
                         logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
                 else:
                     # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
-                    if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
+                    if TRADE_NO_NEG_VOL and (vol_change is None or vol_change <= 0):
                         entry["accept"] = False
                         entry["reason"] = "negvol_blocked"
-                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%.4f): %s", vol_change, sym)
+                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%s): %s", str(vol_change), sym)
                     else:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
@@ -1039,9 +1049,9 @@ class Scanner:
                 break
 
             # Enforce TV rating gate if configured
-            tv_label = c.get("tv_label")
+            tv_label = c.get("tv_label") or ""
             if TRADE_RATING_ALLOW:
-                if tv_label not in TRADE_RATING_ALLOW:
+                if _norm_rating_token(tv_label) not in TRADE_RATING_ALLOW_NORMALIZED:
                     logger.info("Trade blocked by TRADE_RATING_ALLOW (tv_label=%s not in %s) for %s", tv_label, TRADE_RATING_ALLOW, c["symbol"])
                     c["accept"] = False
                     c["reason"] = "tv_rating_blocked"
@@ -1052,8 +1062,8 @@ class Scanner:
             vol_change = c.get("vol_change")
 
             # Double-check TRADE_NO_NEG_VOL
-            if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
-                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%.4f)", sym, vol_change)
+            if TRADE_NO_NEG_VOL and (vol_change is None or vol_change <= 0):
+                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%s)", sym, str(vol_change))
                 c["accept"] = False
                 c["reason"] = "negvol_blocked"
                 continue
@@ -1243,7 +1253,8 @@ class Scanner:
             if not root_signals:
                 return
 
-            now_ts = time.time()
+            # use integer seconds for gating
+            now_ts = int(time.time())
 
             # Enforce minimal push gating:
             # - If ROOT_SCAN_INTERVAL truthy: require at least ROOT_SCAN_INTERVAL since last minimal push
@@ -1251,13 +1262,12 @@ class Scanner:
             if not self._first_deploy_push:
                 if ROOT_SCAN_INTERVAL:
                     if self._last_minimal_push_ts is not None:
-                        elapsed_since_last = now_ts - self._last_minimal_push_ts
-                        if elapsed_since_last < max(1, ROOT_SCAN_INTERVAL - 1):
-                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, ROOT_SCAN_INTERVAL)
+                        if (now_ts - int(self._last_minimal_push_ts)) < max(1, int(ROOT_SCAN_INTERVAL)):
+                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %ds ago < scan interval %ds", now_ts - int(self._last_minimal_push_ts), int(ROOT_SCAN_INTERVAL))
                             return
                 else:
                     # Align gating to 5-minute candle starts
-                    candle_start = (int(now_ts) // 300) * 300
+                    candle_start = (now_ts // 300) * 300
                     if self._last_minimal_push_ts == candle_start:
                         logger.info("[TELEGRAM_DELTA] Skipping minimal push: already pushed during this 5m candle (start=%d)", candle_start)
                         return
@@ -1332,11 +1342,12 @@ class Scanner:
 
             # If we sent any minimal signals, record the minimal push time to gate future pushes
             if sent_any:
+                sent_ts_int = int(time.time())
                 if ROOT_SCAN_INTERVAL:
-                    self._last_minimal_push_ts = sent_ts
+                    self._last_minimal_push_ts = sent_ts_int
                 else:
                     # For 5m alignment gating, store the candle_start value (integer)
-                    candle_start = (int(sent_ts) // 300) * 300
+                    candle_start = (sent_ts_int // 300) * 300
                     self._last_minimal_push_ts = candle_start
 
     async def run(self):

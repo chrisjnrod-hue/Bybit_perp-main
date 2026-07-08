@@ -1,6 +1,5 @@
 # scanner_service.py
 # Full updated Scanner class with gating, volume fixes, prioritization, and fixed minimal push behavior.
-# Added deterministic timestamp handling and extra diagnostic logs for gating decisions.
 
 import os
 import asyncio
@@ -11,7 +10,6 @@ from typing import Dict, List, Any, Optional, Callable
 import math
 import inspect
 from decimal import getcontext
-import re
 
 getcontext().prec = 28
 
@@ -23,7 +21,7 @@ from .macd import slope  # used in a couple places still
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, MAX_OPEN_TRADES, USE_WS,
+    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING
 )
@@ -47,16 +45,8 @@ DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
 # New envs (parsed here)
-def _norm_rating_token(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return re.sub(r'[^0-9a-z]', '', str(s).strip().lower())
-
-raw_allow = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy")
-TRADE_RATING_ALLOW = [x.strip() for x in raw_allow.split(",") if x.strip()]
-TRADE_RATING_ALLOW_NORMALIZED = set(_norm_rating_token(x) for x in TRADE_RATING_ALLOW)
-TRADE_RATING_ENFORCE = len(TRADE_RATING_ALLOW_NORMALIZED) > 0
-
+TRADE_RATING_ALLOW = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy").split(",")
+TRADE_RATING_ALLOW = [x.strip() for x in TRADE_RATING_ALLOW if x.strip()]
 # If TRADE_RATING_ALLOW is empty list -> allow any rating
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
@@ -89,8 +79,7 @@ class Scanner:
         self._last_full_push_ts: Optional[int] = None
         self._last_root_signal_send: Dict[tuple, float] = {}
         # track last minimal (delta) push timestamp to enforce "only at set scan interval"
-        # stores either integer epoch seconds (when ROOT_SCAN_INTERVAL truthy) OR 5-min candle-start int (when zero)
-        self._last_minimal_push_ts: Optional[int] = None
+        self._last_minimal_push_ts: Optional[float] = None
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_ALLOW=%s TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
@@ -720,17 +709,17 @@ class Scanner:
                 await self._check_monitored_symbols()
 
                 full_push = False
-                now_ts = int(time.time())
+                now_ts = time.time()
                 if self._first_deploy_push:
                     full_push = True
                 else:
                     if ROOT_SCAN_INTERVAL == 0:
-                        candle_start = (now_ts // 300) * 300
+                        candle_start = (int(now_ts) // 300) * 300
                         if self._last_full_push_ts != candle_start:
                             full_push = True
                             self._last_full_push_ts = candle_start
 
-                # compute minimal_allowed similarly to send_summary (now uses normalized integer timestamps)
+                # compute minimal_allowed (consistent behavior)
                 minimal_allowed = False
                 if full_push:
                     minimal_allowed = True
@@ -739,20 +728,27 @@ class Scanner:
                         minimal_allowed = True
                     else:
                         if ROOT_SCAN_INTERVAL:
+                            # require at least ROOT_SCAN_INTERVAL since last minimal push
                             if self._last_minimal_push_ts is None:
                                 minimal_allowed = True
                             else:
-                                last_ts = int(self._last_minimal_push_ts)
-                                minimal_allowed = (now_ts - last_ts) >= max(1, int(ROOT_SCAN_INTERVAL))
+                                elapsed_since_last = now_ts - (self._last_minimal_push_ts or 0.0)
+                                minimal_allowed = elapsed_since_last >= max(1, float(ROOT_SCAN_INTERVAL))
                         else:
-                            candle_start = (now_ts // 300) * 300
-                            minimal_allowed = (self._last_minimal_push_ts != candle_start)
+                            # Align gating to 5-minute candle starts
+                            candle_start = (int(now_ts) // 300) * 300
+                            if self._last_minimal_push_ts is None:
+                                minimal_allowed = True
+                            else:
+                                last_candle_start = (int(self._last_minimal_push_ts) // 300) * 300
+                                minimal_allowed = last_candle_start != candle_start
 
                 logger.info("[DIAGNOSTIC] push gating full_push=%s minimal_allowed=%s first_deploy=%s", full_push, minimal_allowed, self._first_deploy_push)
 
                 evaluated = []
                 if root_signals:
-                    # Only call handle_root_signals (which can open trades and send messages) when processing is allowed
+                    # Request MTF subscriptions only when we're allowed to process openings (to limit extra work),
+                    # but always evaluate signals so summaries/notifications can still be sent.
                     if minimal_allowed or full_push:
                         for sig in root_signals:
                             try:
@@ -761,9 +757,9 @@ class Scanner:
                                     await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
                             except Exception:
                                 logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
-                        evaluated = await self.handle_root_signals(root_signals)
-                    else:
-                        logger.info("[DIAGNOSTIC] Processing skipped due to gating; %d signals detected but not processed", len(root_signals))
+
+                    # Always evaluate candidates; only allow opening trades when gating permits.
+                    evaluated = await self.handle_root_signals(root_signals, allow_open_trades=(minimal_allowed or full_push))
                 else:
                     logger.info("No root signals this interval.")
 
@@ -812,7 +808,7 @@ class Scanner:
         for sym, info in list(self._mtf_monitoring.items()):
             try:
                 if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s - removing", sym)
+                    logger.info("MONITORING EXPIRED (24h): %s â€” removing", sym)
                     to_remove.append(sym)
                     continue
 
@@ -832,7 +828,7 @@ class Scanner:
                 status = mtf_align["status"]
 
                 if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s -> %s - queuing trade open", sym, status)
+                    logger.info("MONITORING RESOLVED: %s â†’ %s â€” queuing trade open", sym, status)
                     to_remove.append(sym)
                     newly_aligned.append({
                         "symbol": sym,
@@ -855,21 +851,20 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         if newly_aligned:
-            # Only handle newly aligned when gating allows (we rely on root_scan_loop gating),
-            # but this function may be called from root_scan_loop when gating applied, so we call handle_root_signals.
-            await self.handle_root_signals(newly_aligned)
+            # When monitoring resolves we usually want to attempt openings right away,
+            # so allow_open_trades=True here.
+            await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
-    async def handle_root_signals(self, root_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         """Evaluate MTF alignment for each root signal and act on each scenario.
 
         Trading gates applied:
           - TRADE_RATING_ALLOW: when non-empty, require computed tv_label in whitelist
           - TRADE_NO_NEG_VOL: if True, require vol_change > 0 for trade opens
           - MARKET_CAP_MIN: if >0, require symbol's market cap >= threshold
-        """
-        logger.debug("[GATING] TRADE_RATING_ENFORCE=%s TRADE_RATING_ALLOW=%s NORMALIZED=%s TRADE_NO_NEG_VOL=%s VOLUME_FILTER_ENABLED=%s VOLUME_MIN_CHANGE_PCT=%s",
-                     TRADE_RATING_ENFORCE, TRADE_RATING_ALLOW, TRADE_RATING_ALLOW_NORMALIZED, TRADE_NO_NEG_VOL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT)
 
+        allow_open_trades: if False, the function will evaluate candidates and return 'evaluated' but will not place orders.
+        """
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
 
@@ -914,9 +909,6 @@ class Scanner:
                 "tv_score": tv_score,
             }
 
-            logger.debug("[EVAL] %s %s: mtf_status=%s vol_change=%s tv_label=%s tv_label_norm=%s",
-                         sym, root, mtf_status, vol_change, tv_label, _norm_rating_token(tv_label))
-
             if mtf_status in ("aligned", "daily_rising"):
                 # apply market cap filter (if configured)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
@@ -959,18 +951,18 @@ class Scanner:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s -> ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
+                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
                 else:
                     # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
-                    if TRADE_NO_NEG_VOL and (vol_change is None or vol_change <= 0):
+                    if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                         entry["accept"] = False
                         entry["reason"] = "negvol_blocked"
-                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%s): %s", str(vol_change), sym)
+                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%.4f): %s", vol_change, sym)
                     else:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s -> ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
+                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -982,7 +974,7 @@ class Scanner:
                         "negative_tfs": list(negative_tfs),
                         "last_alert": 0.0,
                     }
-                    logger.info("MTF MONITORING: %s added - waiting on: %s", sym, negative_tfs)
+                    logger.info("MTF MONITORING: %s added â€” waiting on: %s", sym, negative_tfs)
 
             evaluated.append(entry)
 
@@ -1050,32 +1042,56 @@ class Scanner:
         logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
                     len(candidates), MAX_OPEN_TRADES, current_open)
 
+        # Build quick lookup for evaluated entries to keep them in sync
+        eval_map: Dict[tuple, Dict[str, Any]] = {(e["symbol"], e["root"]): e for e in evaluated}
+
+        if not allow_open_trades:
+            # Do not perform any actual opens here — evaluation happened above.
+            # Mark candidates as suppressed for visibility in summaries and in evaluated entries.
+            for c in candidates:
+                c["open_suppressed"] = True
+                eval = eval_map.get((c["symbol"], c["root"]))
+                if eval is not None:
+                    eval["open_suppressed"] = True
+                    eval["accept"] = False
+                    eval["reason"] = "open_suppressed"
+                logger.info("Open suppressed (gating) for %s %s score=%.2f", c["symbol"], c["root"], c.get("score", 0.0))
+            # Return evaluated (candidates are still present in evaluated via earlier entries)
+            return evaluated
+
+        # Otherwise, perform openings (same logic as before)
         for c in candidates:
             if not self.trade_manager.can_open():
-                logger.info("Max open trades reached - halting further opens.")
+                logger.info("Max open trades reached â€” halting further opens.")
                 break
 
             # Enforce TV rating gate if configured
-            tv_label = c.get("tv_label") or ""
-            tv_norm = _norm_rating_token(tv_label)
-            if TRADE_RATING_ENFORCE:
-                if tv_norm not in TRADE_RATING_ALLOW_NORMALIZED:
-                    logger.info("Trade blocked by TRADE_RATING_ALLOW (tv_label=%s tv_norm=%s not in %s) for %s", tv_label, tv_norm, TRADE_RATING_ALLOW_NORMALIZED, c["symbol"])
+            tv_label = c.get("tv_label")
+            if TRADE_RATING_ALLOW:
+                if tv_label not in TRADE_RATING_ALLOW:
+                    logger.info("Trade blocked by TRADE_RATING_ALLOW (tv_label=%s not in %s) for %s", tv_label, TRADE_RATING_ALLOW, c["symbol"])
                     c["accept"] = False
                     c["reason"] = "tv_rating_blocked"
+                    # Ensure evaluated reflects this
+                    eval = eval_map.get((c["symbol"], c["root"]))
+                    if eval is not None:
+                        eval["accept"] = False
+                        eval["reason"] = "tv_rating_blocked"
                     continue
-                else:
-                    logger.debug("TV rating allowed: %s (norm=%s)", tv_label, tv_norm)
 
             sym = c["symbol"]
             price = c["price"]
             vol_change = c.get("vol_change")
 
             # Double-check TRADE_NO_NEG_VOL
-            if TRADE_NO_NEG_VOL and (vol_change is None or vol_change <= 0):
-                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%s)", sym, str(vol_change))
+            if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
+                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%.4f)", sym, vol_change)
                 c["accept"] = False
                 c["reason"] = "negvol_blocked"
+                eval = eval_map.get((c["symbol"], c["root"]))
+                if eval is not None:
+                    eval["accept"] = False
+                    eval["reason"] = "negvol_blocked"
                 continue
 
             try:
@@ -1086,12 +1102,16 @@ class Scanner:
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
-                logger.warning("Zero qty for %s after quantize - skipping.", sym)
+                logger.warning("Zero qty for %s after quantize â€” skipping.", sym)
                 c["accept"] = False
                 c["reason"] = "zero_qty"
+                eval = eval_map.get((c["symbol"], c["root"]))
+                if eval is not None:
+                    eval["accept"] = False
+                    eval["reason"] = "zero_qty"
                 continue
             if qty != qty_raw:
-                logger.debug("Qty for %s adjusted %s -> %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+                logger.debug("Qty for %s adjusted %s â†’ %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
 
             side = "Buy"
             reason_tag = c.get("reason", "signal")
@@ -1099,8 +1119,14 @@ class Scanner:
                 try:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    # Update eval map
+                    eval = eval_map.get((sym, c["root"]))
+                    if eval is not None:
+                        eval["accept"] = True
+                        eval["reason"] = "opened"
+                        eval["order"] = order
                     await send_message(
-                        f"✓ Trade Opened — {sym} {side}\n"
+                        f"âœ… Trade Opened â€” {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
                         f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                     )
@@ -1109,12 +1135,21 @@ class Scanner:
                     logger.exception("Failed to place order for %s", sym)
                     c["accept"] = False
                     c["reason"] = "order_failed"
+                    eval = eval_map.get((sym, c["root"]))
+                    if eval is not None:
+                        eval["accept"] = False
+                        eval["reason"] = "order_failed"
             else:
                 # simulated open
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
                 logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                eval = eval_map.get((sym, c["root"]))
+                if eval is not None:
+                    eval["accept"] = True
+                    eval["reason"] = "simulated"
+                    eval["simulated"] = True
                 await send_message(
-                    f"📚 Simulated Trade — {sym} {side}\n"
+                    f"ðŸ“Š Simulated Trade â€” {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
                     f"Score: {c['score']:.2f} | Reason: {reason_tag}"
                 )
@@ -1151,7 +1186,7 @@ class Scanner:
                 tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
             window_map = {"60": 30, "240": 12, "D": 5}
-            header_lines = [f"📊 Bybit Perp Root Summary — {now_str}"]
+            header_lines = [f"ðŸ“Š Bybit Perp Root Summary â€” {now_str}"]
             for rt in ROOT_TFS:
                 cnt = tf_counts.get(rt, 0)
                 win = window_map.get(rt)
@@ -1217,12 +1252,12 @@ class Scanner:
                             vol_str = str(vol_change)
 
                     block = "\n".join([
-                        f"🛎️ Bybit Perp | {rt} Signal",
+                        f"ðŸ“Œ Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Δ: {vol_str}",
+                        f"24h Vol Î”: {vol_str}",
                     ])
                     await send_message(block)
                 except Exception:
@@ -1237,7 +1272,7 @@ class Scanner:
                     accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
                     recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
-                    rec_lines = [f"🏆 Recommended Signals for Trading — {now_str}"]
+                    rec_lines = [f"ðŸ“£ Recommended Signals for Trading â€” {now_str}"]
                     rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
                     rec_lines.append(f"Slots available: {remaining}")
                     if not recommended:
@@ -1264,8 +1299,7 @@ class Scanner:
             if not root_signals:
                 return
 
-            # use integer seconds for gating
-            now_ts = int(time.time())
+            now_ts = time.time()
 
             # Enforce minimal push gating:
             # - If ROOT_SCAN_INTERVAL truthy: require at least ROOT_SCAN_INTERVAL since last minimal push
@@ -1273,23 +1307,23 @@ class Scanner:
             if not self._first_deploy_push:
                 if ROOT_SCAN_INTERVAL:
                     if self._last_minimal_push_ts is not None:
-                        if (now_ts - int(self._last_minimal_push_ts)) < max(1, int(ROOT_SCAN_INTERVAL)):
-                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %ds ago < scan interval %ds", now_ts - int(self._last_minimal_push_ts), int(ROOT_SCAN_INTERVAL))
+                        elapsed_since_last = now_ts - self._last_minimal_push_ts
+                        if elapsed_since_last < max(1, float(ROOT_SCAN_INTERVAL)):
+                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, float(ROOT_SCAN_INTERVAL))
                             return
                 else:
                     # Align gating to 5-minute candle starts
-                    candle_start = (now_ts // 300) * 300
-                    if self._last_minimal_push_ts == candle_start:
-                        logger.info("[TELEGRAM_DELTA] Skipping minimal push: already pushed during this 5m candle (start=%d)", candle_start)
-                        return
+                    candle_start = (int(now_ts) // 300) * 300
+                    if self._last_minimal_push_ts is not None:
+                        last_candle_start = (int(self._last_minimal_push_ts) // 300) * 300
+                        if last_candle_start == candle_start:
+                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: already pushed during this 5m candle (start=%d)", candle_start)
+                            return
 
             # Clean up old entries
             signal_ttl = 3600  # 1 hour TTL
             for key in list(self._last_root_signal_send.keys()):
-                try:
-                    if now_ts - int(self._last_root_signal_send[key]) > signal_ttl:
-                        self._last_root_signal_send.pop(key, None)
-                except Exception:
+                if now_ts - self._last_root_signal_send[key] > signal_ttl:
                     self._last_root_signal_send.pop(key, None)
 
             to_send = []
@@ -1306,8 +1340,9 @@ class Scanner:
             if not to_send:
                 return
 
-            # Send one Telegram message per new signal (1 signal per block)
+            # Send one Telegram message per new signal (1 signal per block) â€” preserve existing layout
             sent_any = False
+            sent_ts = None
             for sig in to_send:
                 try:
                     sym = sig.get("symbol")
@@ -1337,30 +1372,26 @@ class Scanner:
                             vol_str = str(vol_change)
 
                     block = "\n".join([
-                        f"🛎️ Bybit Perp | {rt} Signal",
+                        f"ðŸ“Œ Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Δ: {vol_str}",
+                        f"24h Vol Î”: {vol_str}",
                     ])
                     await send_message(block)
                     # Record that we sent this signal so we don't resend within TTL
                     self._last_root_signal_send[(sym, rt)] = now_ts
                     sent_any = True
+                    sent_ts = now_ts
                     logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
 
             # If we sent any minimal signals, record the minimal push time to gate future pushes
             if sent_any:
-                sent_ts_int = now_ts
-                if ROOT_SCAN_INTERVAL:
-                    self._last_minimal_push_ts = sent_ts_int
-                else:
-                    # For 5m alignment gating, store the candle_start value (integer)
-                    candle_start = (sent_ts_int // 300) * 300
-                    self._last_minimal_push_ts = candle_start
+                # Always store a float timestamp for consistent comparisons
+                self._last_minimal_push_ts = float(sent_ts)
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

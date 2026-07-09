@@ -1,5 +1,5 @@
 # scanner_service.py
-# Full updated Scanner class with gating, volume fixes, prioritization, and fixed minimal push behavior.
+# Full updated Scanner class with gating, volume fixes, prioritization, TV rating numeric threshold, and fixed minimal push behavior.
 
 import os
 import asyncio
@@ -44,10 +44,20 @@ SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# New envs (parsed here)
-TRADE_RATING_ALLOW = os.getenv("TRADE_RATING_ALLOW", "Strong Buy,Buy").split(",")
-TRADE_RATING_ALLOW = [x.strip() for x in TRADE_RATING_ALLOW if x.strip()]
-# If TRADE_RATING_ALLOW is empty list -> allow any rating
+# Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
+try:
+    TRADE_RATING_MIN = float(os.getenv("TRADE_RATING_MIN", "0.25"))
+except (ValueError, TypeError):
+    TRADE_RATING_MIN = 0.25
+
+# TV rating weighting in combined score calculation (0.0 to 1.0, where 1.0 = 100% TV weight)
+try:
+    TV_RATING_WEIGHT = float(os.getenv("TV_RATING_WEIGHT", "0.3"))
+    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))  # clamp to [0.0, 1.0]
+except (ValueError, TypeError):
+    TV_RATING_WEIGHT = 0.3
+
+# If TRADE_RATING_ALLOW is empty list -> allow any rating (backwards compatibility removed)
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
 PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
@@ -82,9 +92,9 @@ class Scanner:
         self._last_minimal_push_ts: Optional[float] = None
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_ALLOW=%s TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
-            TRADE_RATING_ALLOW, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
+            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -808,7 +818,7 @@ class Scanner:
         for sym, info in list(self._mtf_monitoring.items()):
             try:
                 if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s â€” removing", sym)
+                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
                     to_remove.append(sym)
                     continue
 
@@ -828,7 +838,7 @@ class Scanner:
                 status = mtf_align["status"]
 
                 if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s â†’ %s â€” queuing trade open", sym, status)
+                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
                     newly_aligned.append({
                         "symbol": sym,
@@ -859,7 +869,7 @@ class Scanner:
         """Evaluate MTF alignment for each root signal and act on each scenario.
 
         Trading gates applied:
-          - TRADE_RATING_ALLOW: when non-empty, require computed tv_label in whitelist
+          - TRADE_RATING_MIN: numeric threshold for TV rating score (0.0 to 2.0)
           - TRADE_NO_NEG_VOL: if True, require vol_change > 0 for trade opens
           - MARKET_CAP_MIN: if >0, require symbol's market cap >= threshold
 
@@ -910,6 +920,15 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
+                # NUMERIC TV RATING FILTER - NEW FIX
+                # Check if TV score meets minimum threshold
+                if tv_score < TRADE_RATING_MIN:
+                    entry["accept"] = False
+                    entry["reason"] = "tv_rating_below_threshold"
+                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
+                    evaluated.append(entry)
+                    continue
+
                 # apply market cap filter (if configured)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
@@ -951,7 +970,7 @@ class Scanner:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f (vol passed)", mtf_status, sym, root, score)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f (vol passed)", mtf_status, sym, root, score, tv_score)
                 else:
                     # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
                     if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
@@ -962,7 +981,7 @@ class Scanner:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f", mtf_status, sym, root, score)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f", mtf_status, sym, root, score, tv_score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -974,7 +993,7 @@ class Scanner:
                         "negative_tfs": list(negative_tfs),
                         "last_alert": 0.0,
                     }
-                    logger.info("MTF MONITORING: %s added â€” waiting on: %s", sym, negative_tfs)
+                    logger.info("MTF MONITORING: %s added – waiting on: %s", sym, negative_tfs)
 
             evaluated.append(entry)
 
@@ -1002,17 +1021,18 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                top = sorted(lst, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                # PRIORITIZE BY COMBINED SCORE (MTF + TV) - NEW FIX
+                top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
 
-            # If still slots remain, fill from other roots by score
+            # If still slots remain, fill from other roots by combined score
             if remaining_slots > 0:
                 remaining_candidates = [c for c in candidates if c not in selected]
-                remaining_sorted = sorted(remaining_candidates, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                 selected.extend(remaining_sorted)
 
-            candidates = sorted(selected, key=lambda r: r["score"], reverse=True)
+            candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
         else:
             # No root filter: apply global prioritization
             if PRIORITIZE_SLOT_ORDER:
@@ -1027,16 +1047,17 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    top = sorted(lst, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                    # PRIORITIZE BY COMBINED SCORE - NEW FIX
+                    top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)
                 if remaining_slots > 0:
                     remaining_candidates = [c for c in candidates if c not in selected]
-                    remaining_sorted = sorted(remaining_candidates, key=lambda r: r["score"], reverse=True)[:remaining_slots]
+                    remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                     selected.extend(remaining_sorted)
-                candidates = sorted(selected, key=lambda r: r["score"], reverse=True)
+                candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
             else:
-                candidates = sorted(candidates, key=lambda r: r["score"], reverse=True)
+                candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
@@ -1055,29 +1076,15 @@ class Scanner:
                     eval["open_suppressed"] = True
                     eval["accept"] = False
                     eval["reason"] = "open_suppressed"
-                logger.info("Open suppressed (gating) for %s %s score=%.2f", c["symbol"], c["root"], c.get("score", 0.0))
+                logger.info("Open suppressed (gating) for %s %s combined_score=%.2f", c["symbol"], c["root"], self._compute_combined_score(c))
             # Return evaluated (candidates are still present in evaluated via earlier entries)
             return evaluated
 
         # Otherwise, perform openings (same logic as before)
         for c in candidates:
             if not self.trade_manager.can_open():
-                logger.info("Max open trades reached â€” halting further opens.")
+                logger.info("Max open trades reached – halting further opens.")
                 break
-
-            # Enforce TV rating gate if configured
-            tv_label = c.get("tv_label")
-            if TRADE_RATING_ALLOW:
-                if tv_label not in TRADE_RATING_ALLOW:
-                    logger.info("Trade blocked by TRADE_RATING_ALLOW (tv_label=%s not in %s) for %s", tv_label, TRADE_RATING_ALLOW, c["symbol"])
-                    c["accept"] = False
-                    c["reason"] = "tv_rating_blocked"
-                    # Ensure evaluated reflects this
-                    eval = eval_map.get((c["symbol"], c["root"]))
-                    if eval is not None:
-                        eval["accept"] = False
-                        eval["reason"] = "tv_rating_blocked"
-                    continue
 
             sym = c["symbol"]
             price = c["price"]
@@ -1102,7 +1109,7 @@ class Scanner:
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
-                logger.warning("Zero qty for %s after quantize â€” skipping.", sym)
+                logger.warning("Zero qty for %s after quantize – skipping.", sym)
                 c["accept"] = False
                 c["reason"] = "zero_qty"
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1111,7 +1118,7 @@ class Scanner:
                     eval["reason"] = "zero_qty"
                 continue
             if qty != qty_raw:
-                logger.debug("Qty for %s adjusted %s â†’ %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+                logger.debug("Qty for %s adjusted %s → %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
 
             side = "Buy"
             reason_tag = c.get("reason", "signal")
@@ -1126,11 +1133,11 @@ class Scanner:
                         eval["reason"] = "opened"
                         eval["order"] = order
                     await send_message(
-                        f"âœ… Trade Opened â€” {sym} {side}\n"
+                        f"✅ Trade Opened – {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
-                        f"Score: {c['score']:.2f} | Reason: {reason_tag}"
+                        f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                     )
-                    logger.info("Real trade opened %s qty=%s score=%.2f", sym, qty, c["score"])
+                    logger.info("Real trade opened %s qty=%s combined_score=%.2f tv_score=%.4f", sym, qty, self._compute_combined_score(c), c.get('tv_score', 0.0))
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
                     c["accept"] = False
@@ -1141,23 +1148,40 @@ class Scanner:
                         eval["reason"] = "order_failed"
             else:
                 # simulated open
-                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"]})
-                logger.info("Simulated open %s qty=%s score=%.2f", sym, qty, c["score"])
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
+                logger.info("Simulated open %s qty=%s combined_score=%.2f tv_score=%.4f", sym, qty, self._compute_combined_score(c), c.get('tv_score', 0.0))
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True
                     eval["reason"] = "simulated"
                     eval["simulated"] = True
                 await send_message(
-                    f"ðŸ“Š Simulated Trade â€” {sym} {side}\n"
+                    f"🔔 Simulated Trade – {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
-                    f"Score: {c['score']:.2f} | Reason: {reason_tag}"
+                    f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                 )
 
             # Remove from monitoring if present
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated
+
+    def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
+        """
+        Compute combined score from MTF alignment score + TV rating score.
+        
+        Formula:
+          combined = (mtf_score * (1 - tv_weight)) + (tv_score * tv_weight)
+        
+        This allows TV_RATING_WEIGHT to control how much TV rating influences ranking:
+          - 0.0 = pure MTF alignment
+          - 0.3 = 70% MTF, 30% TV (default)
+          - 1.0 = pure TV rating
+        """
+        mtf_score = candidate.get("score", 0.0)
+        tv_score = candidate.get("tv_score", 0.0)
+        combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)
+        return combined
 
     async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None, full_push: bool = False):
         """
@@ -1186,7 +1210,7 @@ class Scanner:
                 tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
             window_map = {"60": 30, "240": 12, "D": 5}
-            header_lines = [f"ðŸ“Š Bybit Perp Root Summary â€” {now_str}"]
+            header_lines = [f"🔍 Bybit Perp Root Summary – {now_str}"]
             for rt in ROOT_TFS:
                 cnt = tf_counts.get(rt, 0)
                 win = window_map.get(rt)
@@ -1252,12 +1276,12 @@ class Scanner:
                             vol_str = str(vol_change)
 
                     block = "\n".join([
-                        f"ðŸ“Œ Bybit Perp | {rt} Signal",
+                        f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Î”: {vol_str}",
+                        f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
                 except Exception:
@@ -1269,10 +1293,11 @@ class Scanner:
                     current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
                     remaining = max(0, MAX_OPEN_TRADES - current_open)
                     accepted = [e for e in evaluated if e.get("accept")]
-                    accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0.0), reverse=True)
+                    # SORT BY COMBINED SCORE - NEW FIX
+                    accepted_sorted = sorted(accepted, key=lambda r: self._compute_combined_score(r), reverse=True)
                     recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
-                    rec_lines = [f"ðŸ“£ Recommended Signals for Trading â€” {now_str}"]
+                    rec_lines = [f"🏆 Recommended Signals for Trading – {now_str}"]
                     rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
                     rec_lines.append(f"Slots available: {remaining}")
                     if not recommended:
@@ -1283,13 +1308,15 @@ class Scanner:
                             rt = r["root"]
                             price = r["price"]
                             score = r.get("score", 0.0)
+                            tv_score = r.get("tv_score", 0.0)
+                            combined = self._compute_combined_score(r)
                             if price >= 1000:
                                 price_str = f"${price:,.2f}"
                             elif price >= 1:
                                 price_str = f"${price:.4f}"
                             else:
                                 price_str = f"${price:.8f}"
-                            rec_lines.append(f"  - {sym} | {rt} | {price_str} | score={score:.2f}")
+                            rec_lines.append(f"  - {sym} | {rt} | {price_str} | combined={combined:.2f} (mtf={score:.2f}, tv={tv_score:+.3f})")
 
                     await send_message("\n".join(rec_lines))
             except Exception:
@@ -1340,7 +1367,7 @@ class Scanner:
             if not to_send:
                 return
 
-            # Send one Telegram message per new signal (1 signal per block) â€” preserve existing layout
+            # Send one Telegram message per new signal (1 signal per block) – preserve existing layout
             sent_any = False
             sent_ts = None
             for sig in to_send:
@@ -1372,12 +1399,12 @@ class Scanner:
                             vol_str = str(vol_change)
 
                     block = "\n".join([
-                        f"ðŸ“Œ Bybit Perp | {rt} Signal",
+                        f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Î”: {vol_str}",
+                        f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
                     # Record that we sent this signal so we don't resend within TTL

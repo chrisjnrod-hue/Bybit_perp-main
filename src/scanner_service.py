@@ -839,7 +839,7 @@ class Scanner:
 
         Any change found here (a negative TF clearing, or full alignment resolving) is a
         "monitored MTF alignment alert" and is sent to Telegram immediately, one alert per
-        signal block â€” this runs every scan loop tick, i.e. at the configured scan interval.
+        signal block — this runs every scan loop tick, i.e. at the configured scan interval.
         """
         if not self._mtf_monitoring:
             return
@@ -853,7 +853,7 @@ class Scanner:
         for sym, info in list(self._mtf_monitoring.items()):
             try:
                 if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s â€“ removing", sym)
+                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
                     to_remove.append(sym)
                     continue
 
@@ -881,7 +881,7 @@ class Scanner:
                 root = info.get("root", "?")
 
                 if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s â†’ %s â€“ queuing trade open", sym, status)
+                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
                     vol_change = self.compute_24h_volume_change(sym)
                     vol_str = "N/A"
@@ -892,12 +892,12 @@ class Scanner:
                             vol_str = str(vol_change)
                     tv_score, tv_label = self.compute_tv_rating(sym, root, price)
                     alert_blocks.append("\n".join([
-                        f"âœ… MTF Alignment RESOLVED | {root} Signal",
+                        f"✅ MTF Alignment RESOLVED | {root} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {status}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Î”: {vol_str}",
+                        f"24h Vol Δ: {vol_str}",
                     ]))
                     newly_aligned.append({
                         "symbol": sym,
@@ -919,7 +919,7 @@ class Scanner:
                         still_neg = ", ".join(sorted(curr_neg)) if curr_neg else "none"
                         improved_str = ", ".join(sorted(improved)) if improved else "n/a"
                         alert_blocks.append("\n".join([
-                            f"â³ MTF Alignment UPDATE | {root} Signal",
+                            f"⏳ MTF Alignment UPDATE | {root} Signal",
                             f"Symbol: {sym}",
                             f"Price: {price_str}",
                             f"MTF Status: monitoring (neg: {still_neg})",
@@ -931,7 +931,7 @@ class Scanner:
         for sym in to_remove:
             self._mtf_monitoring.pop(sym, None)
 
-        # Send monitored-alignment alerts now, one signal per Telegram message block â€”
+        # Send monitored-alignment alerts now, one signal per Telegram message block —
         # matching the "set scan interval" notification format used for new root signals.
         for block in alert_blocks:
             try:
@@ -1049,7 +1049,7 @@ class Scanner:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f tv_score=%.4f (vol passed)", mtf_status, sym, root, score, tv_score)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f (vol passed)", mtf_status, sym, root, score, tv_score)
                 else:
                     # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
                     if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
@@ -1060,7 +1060,7 @@ class Scanner:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s â†’ ACCEPT: %s %s score=%.2f tv_score=%.4f", mtf_status, sym, root, score, tv_score)
+                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f", mtf_status, sym, root, score, tv_score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -1072,7 +1072,7 @@ class Scanner:
                         "negative_tfs": list(negative_tfs),
                         "last_alert": 0.0,
                     }
-                    logger.info("MTF MONITORING: %s added â€“ waiting on: %s", sym, negative_tfs)
+                    logger.info("MTF MONITORING: %s added – waiting on: %s", sym, negative_tfs)
 
             evaluated.append(entry)
 
@@ -1146,7 +1146,7 @@ class Scanner:
         eval_map: Dict[tuple, Dict[str, Any]] = {(e["symbol"], e["root"]): e for e in evaluated}
 
         if not allow_open_trades:
-            # Do not perform any actual opens here â€” evaluation happened above.
+            # Do not perform any actual opens here — evaluation happened above.
             # Mark candidates as suppressed for visibility in summaries and in evaluated entries.
             for c in candidates:
                 c["open_suppressed"] = True
@@ -1162,7 +1162,7 @@ class Scanner:
         # Otherwise, perform openings (same logic as before)
         for c in candidates:
             if not self.trade_manager.can_open():
-                logger.info("Max open trades reached â€“ halting further opens.")
+                logger.info("Max open trades reached – halting further opens.")
                 break
 
             sym = c["symbol"]
@@ -1188,7 +1188,7 @@ class Scanner:
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
-                logger.warning("Zero qty for %s after quantize â€“ skipping.", sym)
+                logger.warning("Zero qty for %s after quantize – skipping.", sym)
                 c["accept"] = False
                 c["reason"] = "zero_qty"
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1197,7 +1197,7 @@ class Scanner:
                     eval["reason"] = "zero_qty"
                 continue
             if qty != qty_raw:
-                logger.debug("Qty for %s adjusted %s â†’ %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
+                logger.debug("Qty for %s adjusted %s → %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
 
             side = "Buy"
             reason_tag = c.get("reason", "signal")
@@ -1212,7 +1212,7 @@ class Scanner:
                         eval["reason"] = "opened"
                         eval["order"] = order
                     await send_message(
-                        f"âœ… Trade Opened â€“ {sym} {side}\n"
+                        f"✅ Trade Opened – {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
                         f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                     )
@@ -1235,7 +1235,7 @@ class Scanner:
                     eval["reason"] = "simulated"
                     eval["simulated"] = True
                 await send_message(
-                    f"ðŸ”” Simulated Trade â€“ {sym} {side}\n"
+                    f"🔔 Simulated Trade – {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
                     f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                 )
@@ -1298,7 +1298,7 @@ class Scanner:
                     accepted_sorted = sorted(accepted, key=lambda r: self._compute_combined_score(r), reverse=True)
                     recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
-                    rec_lines = [f"ðŸ† Recommended Signals for Trading â€“ {now_str}"]
+                    rec_lines = [f"🏆 Recommended Signals for Trading – {now_str}"]
                     rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
                     rec_lines.append(f"Slots available: {remaining}")
                     if not recommended:
@@ -1323,7 +1323,7 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send recommended signals block")
 
-            # --- 2) Root TF summary header (counts) ---
+            # --- 2) Summary of all root-TF signals a-z and counts per TF in one block ---
             try:
                 tf_counts: Dict[str, int] = {}
                 for sig in root_signals:
@@ -1331,7 +1331,7 @@ class Scanner:
                     tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
                 window_map = {"60": 30, "240": 12, "D": 5}
-                header_lines = [f"ðŸ” Bybit Perp Root Summary â€“ {now_str}"]
+                header_lines = [f"🔍 Bybit Perp Root Summary – {now_str}"]
                 for rt in ROOT_TFS:
                     cnt = tf_counts.get(rt, 0)
                     win = window_map.get(rt)
@@ -1345,7 +1345,7 @@ class Scanner:
                 if not root_signals:
                     header_lines.append("  None")
                 else:
-                    # For compact summary keep symbol | tf | price in this header (details come next)
+                    # Sorted alphabetically from a-z
                     for sig in sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", ""))):
                         sym = sig.get("symbol")
                         rt = sig.get("root")
@@ -1365,12 +1365,9 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send first summary block")
 
-            # --- 3) Every signal a-z, one Telegram message per signal (current signal info) ---
+            # --- 3) Every signal a-z, one Telegram message per signal block ---
             try:
-                if not root_signals:
-                    # Already sent header with "None", nothing else to do
-                    pass
-                else:
+                if root_signals:
                     # Sort alphabetically by symbol then by root
                     sorted_signals = sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", "")))
 
@@ -1402,34 +1399,33 @@ class Scanner:
                                 except Exception:
                                     vol_str = str(vol_change)
 
-                            # One signal, one Telegram message block, with full current signal info
+                            # Detailed signal block layout
                             block = "\n".join([
-                                f"ðŸ“Œ Bybit Perp | {rt} Signal",
+                                f"📌 Bybit Perp | {rt} Signal",
                                 f"Symbol: {sym}",
                                 f"Price: {price_str}",
                                 f"MTF Status: {mtf_str}",
                                 f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                                f"24h Vol Î”: {vol_str}",
+                                f"24h Vol Δ: {vol_str}",
                             ])
                             await send_message(block)
 
-                            # Record this send so the next "set scan interval" minimal push
-                            # doesn't immediately re-announce the same signal as "new".
+                            # Record this send so the next scan interval cycle doesn't duplicate it
                             self._last_root_signal_send[(sym, rt)] = now_ts
                         except Exception:
                             logger.exception("Failed to send detailed signal block for %s %s", sig.get("symbol"), sig.get("root"))
             except Exception:
                 logger.exception("Failed to send per-signal detailed signal blocks")
         else:
-            # Minimal push: send only new signals (time-based dedup)
+            # Minimal push: send only new signals (at regular set scan interval)
             if not root_signals:
                 return
 
             now_ts = time.time()
 
-            # Enforce minimal push gating:
-            # - If ROOT_SCAN_INTERVAL truthy: require at least ROOT_SCAN_INTERVAL since last minimal push
-            # - If ROOT_SCAN_INTERVAL falsy (0), gate pushes to at most once per 5-minute candle (aligned to 5m open)
+            # Enforce scan interval push gating:
+            # - If ROOT_SCAN_INTERVAL truthy: require interval since last minimal push
+            # - If ROOT_SCAN_INTERVAL is 0: gate pushes to 5-minute candle open
             if not self._first_deploy_push:
                 if ROOT_SCAN_INTERVAL:
                     if self._last_minimal_push_ts is not None:
@@ -1453,7 +1449,6 @@ class Scanner:
                     self._last_root_signal_send.pop(key, None)
 
             to_send = []
-            # Check each signal
             for sig in root_signals:
                 sym = sig.get("symbol")
                 rt = sig.get("root")
@@ -1466,7 +1461,7 @@ class Scanner:
             if not to_send:
                 return
 
-            # Send one Telegram message per new signal (1 signal per block) â€“ preserve existing layout
+            # Send one Telegram message per new signal (1 signal per block)
             sent_any = False
             sent_ts = None
             for sig in to_send:
@@ -1498,15 +1493,14 @@ class Scanner:
                             vol_str = str(vol_change)
 
                     block = "\n".join([
-                        f"ðŸ“Œ Bybit Perp | {rt} Signal",
+                        f"📌 Bybit Perp | {rt} Signal",
                         f"Symbol: {sym}",
                         f"Price: {price_str}",
                         f"MTF Status: {mtf_str}",
                         f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Î”: {vol_str}",
+                        f"24h Vol Δ: {vol_str}",
                     ])
                     await send_message(block)
-                    # Record that we sent this signal so we don't resend within TTL
                     self._last_root_signal_send[(sym, rt)] = now_ts
                     sent_any = True
                     sent_ts = now_ts
@@ -1514,9 +1508,7 @@ class Scanner:
                 except Exception:
                     logger.exception("Failed to send minimal signal block for %s %s", sig.get("symbol"), rt)
 
-            # If we sent any minimal signals, record the minimal push time to gate future pushes
             if sent_any:
-                # Always store a float timestamp for consistent comparisons
                 self._last_minimal_push_ts = float(sent_ts)
 
     async def run(self):

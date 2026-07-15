@@ -1,10 +1,6 @@
 # scanner_service.py
 # Full updated Scanner class with gating, volume fixes, prioritization, TV rating numeric threshold,
-# and corrected Telegram notification order:
-#   - Initial deploy & every root-TF candle open -> recommended block, then summary+counts block,
-#     then one message per signal (a-z).
-#   - Every scan interval in between -> new root signals and monitored MTF alignment alerts,
-#     one message per signal.
+# corrected Telegram notification order, duplicate-trade prevention, and epoch modulo sleep alignment.
 
 import os
 import asyncio
@@ -49,7 +45,7 @@ SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
+# Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
 try:
     TRADE_RATING_MIN = float(os.getenv("TRADE_RATING_MIN", "0.25"))
 except (ValueError, TypeError):
@@ -91,10 +87,8 @@ class Scanner:
 
         # push / dedupe state for Telegram sending
         self._first_deploy_push = True
-        # changed to dict to track per-root-TF candle starts
         self._last_full_push_ts: Dict[str, int] = {}
         self._last_root_signal_send: Dict[tuple, float] = {}
-        # track last minimal (delta) push timestamp to enforce "only at set scan interval"
         self._last_minimal_push_ts: Optional[float] = None
 
         logger.info(
@@ -797,7 +791,7 @@ class Scanner:
                             except Exception:
                                 logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                    # Always evaluate candidates; only allow opening trades when gating permits.
+                    # Always evaluate candidates; only allow open trades when gating permits.
                     evaluated = await self.handle_root_signals(root_signals, allow_open_trades=(minimal_allowed or full_push))
                 else:
                     logger.info("No root signals this interval.")
@@ -818,20 +812,21 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
+                # Mathematically bulletproof sub-second alignment to the next 5-minute candle
                 now = time.time()
-                now_struct = time.gmtime(now)
-                current_minute = now_struct.tm_min
-                current_second = now_struct.tm_sec
-
-                next_5m_minute = ((current_minute // 5) + 1) * 5
-
-                if next_5m_minute >= 60:
-                    to_sleep = (60 - current_minute) * 60 - current_second
-                else:
-                    to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
-
-                to_sleep = max(0, to_sleep)
-                logger.debug("[DIAGNOSTIC] Aligning to next 5m candle: sleeping %.1f seconds", to_sleep)
+                interval_seconds = 300  # 5 minutes
+                
+                # Seconds elapsed inside the current 5-minute block
+                seconds_into_current_candle = now % interval_seconds
+                
+                # Time remaining to cross the boundary, plus a 0.5s safety buffer
+                to_sleep = (interval_seconds - seconds_into_current_candle) + 0.5
+                
+                logger.debug(
+                    "[DIAGNOSTIC] Aligning to next 5m candle (now: %s): sleeping %.2f seconds (includes 0.5s buffer)", 
+                    time.strftime("%M:%S", time.gmtime(now)), 
+                    to_sleep
+                )
                 await asyncio.sleep(to_sleep)
 
     async def _check_monitored_symbols(self):
@@ -951,11 +946,20 @@ class Scanner:
           - TRADE_RATING_MIN: numeric threshold for TV rating score (0.0 to 2.0)
           - TRADE_NO_NEG_VOL: if True, require vol_change > 0 for trade opens
           - MARKET_CAP_MIN: if >0, require symbol's market cap >= threshold
+          - Duplicate open prevention: bypass symbols currently open in TradeManager
 
         allow_open_trades: if False, the function will evaluate candidates and return 'evaluated' but will not place orders.
         """
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
+
+        # Safely extract currently open symbols to prevent duplicate trade spam
+        open_symbols = []
+        if hasattr(self.trade_manager, "open_trades"):
+            if isinstance(self.trade_manager.open_trades, dict):
+                open_symbols = list(self.trade_manager.open_trades.keys())
+            elif isinstance(self.trade_manager.open_trades, list):
+                open_symbols = [t.get("symbol") for t in self.trade_manager.open_trades if isinstance(t, dict)]
 
         for item in root_signals:
             sym = item["symbol"]
@@ -964,6 +968,21 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
+
+            # Prevent duplication of trades that are already open
+            if sym in open_symbols:
+                logger.debug("Skipping %s - Trade already open.", sym)
+                evaluated.append({
+                    "symbol": sym,
+                    "root": root,
+                    "price": price,
+                    "accept": False,
+                    "reason": "already_open",
+                    "tv_score": tv_score,
+                    "tv_label": tv_label,
+                    "score": 0.0
+                })
+                continue
 
             hist = item.get("hist", [])
             if not hist:
@@ -999,7 +1018,7 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # NUMERIC TV RATING FILTER - NEW FIX
+                # NUMERIC TV RATING FILTER
                 # Check if TV score meets minimum threshold
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
@@ -1008,7 +1027,7 @@ class Scanner:
                     evaluated.append(entry)
                     continue
 
-                # apply market cap filter (if configured)
+                # Apply market cap filter (if configured)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
                         symbol_info = await self.client.get_symbol_info(sym)
@@ -1035,7 +1054,7 @@ class Scanner:
                         logger.exception("Market cap check failed for %s", sym)
                         # fall through and let other gates decide
 
-                # volume gate: (existing config gate)
+                # Volume gate (existing config gate)
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None:
                         entry["accept"] = False
@@ -1051,7 +1070,7 @@ class Scanner:
                         to_open.append(entry)
                         logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f (vol passed)", mtf_status, sym, root, score, tv_score)
                 else:
-                    # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
+                    # Even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
                     if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                         entry["accept"] = False
                         entry["reason"] = "negvol_blocked"
@@ -1083,7 +1102,7 @@ class Scanner:
 
         candidates = to_open
 
-        # If ROOT_FILTER is applied, pick top across roots first (preserve earlier behavior)
+        # If ROOT_FILTER is applied, pick top across roots first
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
@@ -1100,7 +1119,7 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                # PRIORITIZE BY COMBINED SCORE (MTF + TV) - NEW FIX
+                # Prioritize by combined score (MTF + TV)
                 top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
@@ -1126,7 +1145,7 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    # PRIORITIZE BY COMBINED SCORE - NEW FIX
+                    # Prioritize by combined score
                     top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)
@@ -1159,7 +1178,7 @@ class Scanner:
             # Return evaluated (candidates are still present in evaluated via earlier entries)
             return evaluated
 
-        # Otherwise, perform openings (same logic as before)
+        # Otherwise, perform openings
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached – halting further opens.")
@@ -1417,30 +1436,11 @@ class Scanner:
             except Exception:
                 logger.exception("Failed to send per-signal detailed signal blocks")
         else:
-            # Minimal push: send only new signals (at regular set scan interval)
+            # Minimal push: send only new signals using TTL deduplication
             if not root_signals:
                 return
 
             now_ts = time.time()
-
-            # Enforce scan interval push gating:
-            # - If ROOT_SCAN_INTERVAL truthy: require interval since last minimal push
-            # - If ROOT_SCAN_INTERVAL is 0: gate pushes to 5-minute candle open
-            if not self._first_deploy_push:
-                if ROOT_SCAN_INTERVAL:
-                    if self._last_minimal_push_ts is not None:
-                        elapsed_since_last = now_ts - self._last_minimal_push_ts
-                        if elapsed_since_last < max(1, float(ROOT_SCAN_INTERVAL)):
-                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: last push %.1fs ago < scan interval %.1fs", elapsed_since_last, float(ROOT_SCAN_INTERVAL))
-                            return
-                else:
-                    # Align gating to 5-minute candle starts
-                    candle_start = (int(now_ts) // 300) * 300
-                    if self._last_minimal_push_ts is not None:
-                        last_candle_start = (int(self._last_minimal_push_ts) // 300) * 300
-                        if last_candle_start == candle_start:
-                            logger.info("[TELEGRAM_DELTA] Skipping minimal push: already pushed during this 5m candle (start=%d)", candle_start)
-                            return
 
             # Clean up old entries
             signal_ttl = 3600  # 1 hour TTL

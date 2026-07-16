@@ -1,119 +1,161 @@
+# scanner_service.py
+# Thin wrapper that coordinates ScannerOrchestrator and ScannerEvaluator
+
 import asyncio
 import time
-from typing import Dict, List, Any, Optional
+from typing import List, Dict, Any, Optional
 
 from .logger import get_logger
-from .config import (
-    ROOT_TFS, ROOT_SCAN_INTERVAL, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY
-)
-from .telegram import send_message
-from .scanner_base import ScannerBase
+from .bybit_client import BybitClient
+from .trade_manager import TradeManager
+from .ratelimiter import TokenBucket
+from .scanner_orchestrator import ScannerOrchestrator
+from .scanner_evaluator import ScannerEvaluator
+from .config import ROOT_TFS, ROOT_SCAN_INTERVAL, MTF_TFS
 
-logger = get_logger("scanner_service")
+logger = get_logger("scanner")
 
-class Scanner(ScannerBase):
+
+class Scanner:
+    """Main Scanner class coordinating orchestrator and evaluator."""
+    
     def __init__(self):
-        super().__init__()
+        self.rate_limiter = TokenBucket(max(1.0, float(1)))
+        self.client = BybitClient(rate_limiter=self.rate_limiter)
+        self.trade_manager = TradeManager()
+        
+        self.orchestrator = ScannerOrchestrator(
+            client=self.client,
+            trade_manager=self.trade_manager,
+            rate_limiter=self.rate_limiter
+        )
+        
+        self.evaluator = ScannerEvaluator(
+            kline_store=self.orchestrator.kline_store,
+            trade_manager=self.trade_manager,
+            client=self.client,
+            last_price_cache=self.orchestrator._last_price_cache
+        )
+        
+        self._stop = False
+        self._task: Optional[asyncio.Task] = None
+
+    def register_callback(self, cb):
+        self.orchestrator.register_callback(cb)
 
     async def root_scan_loop(self):
+        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        loop_count = 0
+
         while not self._stop:
+            loop_count += 1
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
             start = time.time()
-            if not self.symbols: await self.discover_symbols()
-            
-            root_signals = []
-            async def check_symbol(sym: str):
-                price = await self.client.get_latest_price(sym)
-                if not price: return
-                self._last_price_cache[sym] = price
-                await self._update_24h_volume(sym)
-                for root in ROOT_TFS:
-                    macd_line, sig, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
-                    if self.detect_flip_current_open(hist, 0.0):
-                        last_c = self.kline_store.get(sym, {}).get(root, [])
-                        start_at = last_c[-1].get("start_at") if last_c else time.time()
-                        tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                        root_signals.append({
-                            "symbol": sym, "root": root, "price": price, "hist": hist,
-                            "vol_change": self.compute_24h_volume_change(sym),
-                            "start_at": start_at, "tv_score": tv_score, "tv_label": tv_label
-                        })
 
-            for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
-                batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
-                await asyncio.gather(*[check_symbol(s) for s in batch])
-                await asyncio.sleep(REQUEST_BATCH_DELAY)
+            try:
+                if not self.orchestrator.symbols:
+                    logger.info("[DIAGNOSTIC] root_scan_loop: Discovering symbols...")
+                    await self.orchestrator.discover_symbols()
+                    if self.orchestrator.symbols:
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.orchestrator.symbols))
+                        await self.orchestrator.seed_all()
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                    else:
+                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
+                        await asyncio.sleep(10)
+                        continue
 
-            await self._check_monitored_symbols()
-            evaluated = await self.handle_root_signals(root_signals, allow_open_trades=True)
-            await self.send_summary(root_signals, evaluated=evaluated, full_push=True)
-            
+                await self.orchestrator._ensure_rest_poller()
+
+                # Root signal detection
+                root_signals: List[Dict[str, Any]] = []
+                logger.info("[DIAGNOSTIC] root_scan_loop: Checking %d symbols", len(self.orchestrator.symbols))
+
+                async def check_symbol(sym: str):
+                    try:
+                        price = await self.client.get_latest_price(sym)
+                        if price is None:
+                            return
+                        
+                        self.orchestrator._last_price_cache[sym] = price
+                        await self.orchestrator._update_24h_volume(sym)
+
+                        for root in ROOT_TFS:
+                            macd_line, sig, hist = self.evaluator.compute_macd_for(
+                                sym, root, include_price=price, use_ws_current=True
+                            )
+                            
+                            if not hist or len(hist) < 2:
+                                continue
+                            
+                            prev = hist[-2]
+                            cur = hist[-1]
+                            flip = prev is not None and prev <= 0 and cur is not None and cur > 0
+                            
+                            if flip:
+                                vol_change = self.evaluator.compute_24h_volume_change(sym, self.orchestrator._24h_volumes)
+                                tv_score, tv_label = self.evaluator.compute_tv_rating(sym, root, price)
+                                
+                                root_signals.append({
+                                    "symbol": sym,
+                                    "root": root,
+                                    "price": price,
+                                    "hist": hist,
+                                    "vol_change": vol_change,
+                                    "tv_score": tv_score,
+                                    "tv_label": tv_label
+                                })
+                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
+                    except Exception:
+                        logger.exception("Error checking symbol %s", sym)
+
+                for i in range(0, len(self.orchestrator.symbols), 100):
+                    if self._stop:
+                        break
+                    batch = self.orchestrator.symbols[i:i + 100]
+                    tasks = [asyncio.create_task(check_symbol(s)) for s in batch]
+                    await asyncio.gather(*tasks)
+
+                logger.info("[DIAGNOSTIC] root_scan_loop: Found %d signals", len(root_signals))
+
+                # Check monitored symbols
+                await self.evaluator._check_monitored_symbols(self.orchestrator._24h_volumes)
+
+                # Evaluate candidates
+                evaluated = await self.evaluator.handle_root_signals(root_signals, self.orchestrator._24h_volumes)
+
+                # Send summary
+                await self.evaluator.send_summary(root_signals, evaluated=evaluated)
+
+            except Exception:
+                logger.exception("Error in root scan loop")
+
             elapsed = time.time() - start
-            await asyncio.sleep(max(0, ROOT_SCAN_INTERVAL - elapsed))
-
-    async def _check_monitored_symbols(self):
-        to_remove = []
-        newly_aligned = []
-        for sym, info in list(self._mtf_monitoring.items()):
-            price = self._last_price_cache.get(sym) or await self.client.get_latest_price(sym)
-            if not price: continue
-            
-            mtf = self._compute_mtf_alignment(sym, price)
-            if mtf["status"] in ("aligned", "daily_rising"):
-                to_remove.append(sym)
-                tv_score, tv_label = self.compute_tv_rating(sym, info["root"], price)
-                newly_aligned.append({"symbol": sym, "root": info["root"], "price": price, "tv_score": tv_score, "tv_label": tv_label, "from_monitoring": True})
+            if ROOT_SCAN_INTERVAL:
+                to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
+                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping %.1f seconds", to_sleep)
+                await asyncio.sleep(to_sleep)
             else:
-                # FIX: Silent logging prevents spamming telegram during MTF re-alignment
-                logger.info("MTF Update for %s: neg=%s", sym, mtf.get("negative_tfs"))
-        
-        for sym in to_remove: self._mtf_monitoring.pop(sym, None)
-        if newly_aligned: await self.handle_root_signals(newly_aligned, allow_open_trades=True)
+                await asyncio.sleep(60)
 
-    async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
-        evaluated = []
-        for item in root_signals:
-            sym, price, root = item["symbol"], item["price"], item["root"]
-            mtf = self._compute_mtf_alignment(sym, price)
-            
-            if mtf["status"] in ("aligned", "daily_rising"):
-                item.update({"accept": True, "reason": "aligned"})
-                evaluated.append(item)
-            elif mtf["status"] == "monitoring":
-                if sym not in self._mtf_monitoring:
-                    self._mtf_monitoring[sym] = {"root": root, "started_at": time.time()}
-                item.update({"accept": False, "reason": "monitoring"})
-                evaluated.append(item)
-        return evaluated
-
-    async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None, full_push: bool = False):
-        now_ts = time.time()
-        
-        # FIX: Deduplication based on candle start_at
-        if full_push:
-            for sig in root_signals:
-                sym, rt = sig.get("symbol"), sig.get("root")
-                start_at = sig.get("start_at", now_ts)
-                
-                # Check if we have already alerted for this specific candle
-                if self._last_root_signal_send.get((sym, rt)) != start_at:
-                    vol_str = f"{sig.get('vol_change', 0):+.2f}%"
-                    block = (
-                        f"📌 Bybit Perp | {rt} Signal\n"
-                        f"Symbol: {sym}\n"
-                        f"Price: {sig['price']}\n"
-                        f"TV Rating: {sig.get('tv_label')} ({sig.get('tv_score', 0):+.3f})\n"
-                        f"24h Vol Δ: {vol_str}"
-                    )
-                    await send_message(block)
-                    self._last_root_signal_send[(sym, rt)] = start_at
-        else:
-            # Minimal/delta push logic (if used)
-            pass
+    async def discover_symbols(self) -> List[str]:
+        return await self.orchestrator.discover_symbols()
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())
-        await self._task
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            logger.info("Scanner run cancelled")
+        finally:
+            try:
+                await self.client.close()
+            except Exception:
+                logger.exception("Error closing client")
 
     def stop(self):
+        logger.info("Stopping scanner...")
         self._stop = True
-        if self._task: self._task.cancel()
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self.orchestrator.stop()

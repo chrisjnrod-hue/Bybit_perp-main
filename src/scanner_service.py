@@ -1,8 +1,9 @@
-# scanner_service.py
+# scanner_service.py (NEW - thin coordinator)
 # Thin wrapper that coordinates ScannerOrchestrator and ScannerEvaluator
 
 import asyncio
 import time
+import os
 from typing import List, Dict, Any, Optional
 
 from .logger import get_logger
@@ -11,9 +12,11 @@ from .trade_manager import TradeManager
 from .ratelimiter import TokenBucket
 from .scanner_orchestrator import ScannerOrchestrator
 from .scanner_evaluator import ScannerEvaluator
-from .config import ROOT_TFS, ROOT_SCAN_INTERVAL, MTF_TFS
+from .config import ROOT_TFS, ROOT_SCAN_INTERVAL
 
 logger = get_logger("scanner")
+
+DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
 
 class Scanner:
@@ -40,10 +43,14 @@ class Scanner:
         self._stop = False
         self._task: Optional[asyncio.Task] = None
 
+        logger.info("Scanner initialized - ready to run")
+
     def register_callback(self, cb):
+        """Register callback for events from orchestrator."""
         self.orchestrator.register_callback(cb)
 
     async def root_scan_loop(self):
+        """Main scanning loop - detects signals and evaluates trades."""
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
 
@@ -53,6 +60,7 @@ class Scanner:
             start = time.time()
 
             try:
+                # 1. Discover symbols if needed
                 if not self.orchestrator.symbols:
                     logger.info("[DIAGNOSTIC] root_scan_loop: Discovering symbols...")
                     await self.orchestrator.discover_symbols()
@@ -65,21 +73,26 @@ class Scanner:
                         await asyncio.sleep(10)
                         continue
 
+                # 2. Ensure REST poller running
                 await self.orchestrator._ensure_rest_poller()
 
-                # Root signal detection
+                # 3. Detect root signals
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Checking %d symbols", len(self.orchestrator.symbols))
 
                 async def check_symbol(sym: str):
                     try:
+                        # Get current price
                         price = await self.client.get_latest_price(sym)
                         if price is None:
                             return
                         
                         self.orchestrator._last_price_cache[sym] = price
+                        
+                        # Update volume tracking
                         await self.orchestrator._update_24h_volume(sym)
 
+                        # Check each root timeframe for MACD flip
                         for root in ROOT_TFS:
                             macd_line, sig, hist = self.evaluator.compute_macd_for(
                                 sym, root, include_price=price, use_ws_current=True
@@ -88,6 +101,7 @@ class Scanner:
                             if not hist or len(hist) < 2:
                                 continue
                             
+                            # Detect zero-cross flip
                             prev = hist[-2]
                             cur = hist[-1]
                             flip = prev is not None and prev <= 0 and cur is not None and cur > 0
@@ -109,6 +123,7 @@ class Scanner:
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
+                # Process symbols in batches
                 for i in range(0, len(self.orchestrator.symbols), 100):
                     if self._stop:
                         break
@@ -118,30 +133,37 @@ class Scanner:
 
                 logger.info("[DIAGNOSTIC] root_scan_loop: Found %d signals", len(root_signals))
 
-                # Check monitored symbols
+                # 4. Check monitored symbols for alignment resolution
                 await self.evaluator._check_monitored_symbols(self.orchestrator._24h_volumes)
 
-                # Evaluate candidates
-                evaluated = await self.evaluator.handle_root_signals(root_signals, self.orchestrator._24h_volumes)
+                # 5. Evaluate candidates and apply gates
+                evaluated = await self.evaluator.handle_root_signals(
+                    root_signals, 
+                    self.orchestrator._24h_volumes
+                )
 
-                # Send summary
+                # 6. Send Telegram summaries
                 await self.evaluator.send_summary(root_signals, evaluated=evaluated)
 
             except Exception:
                 logger.exception("Error in root scan loop")
 
+            # 7. Sleep until next interval
             elapsed = time.time() - start
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping %.1f seconds", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
+                logger.info("[DIAGNOSTIC] root_scan_loop: No interval configured, sleeping 60s")
                 await asyncio.sleep(60)
 
     async def discover_symbols(self) -> List[str]:
+        """Public method to discover symbols."""
         return await self.orchestrator.discover_symbols()
 
     async def run(self):
+        """Start the scanner main loop."""
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task
@@ -154,6 +176,7 @@ class Scanner:
                 logger.exception("Error closing client")
 
     def stop(self):
+        """Stop the scanner and cleanup."""
         logger.info("Stopping scanner...")
         self._stop = True
         if self._task and not self._task.done():

@@ -16,13 +16,14 @@ from .scanner_core import (
     compute_24h_volume_change_from,
     compute_tv_rating_from,
     compute_mtf_alignment,
+    quantize_qty,
 )
 from .config import (
     TRADE_ENABLED, ROOT_TFS, MTF_TFS, MAX_OPEN_TRADES, 
     VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT,
     TRADE_NO_NEG_VOL, MARKET_CAP_MIN, TRADE_RATING_MIN, 
     TV_RATING_WEIGHT, MTF_SLOPE_LOOKBACK, PRIORITIZE_SLOT_ORDER,
-    ROOT_SCAN_INTERVAL
+    ROOT_SCAN_INTERVAL, ROOT_FILTER, TECHNICAL_RATING
 )
 
 logger = get_logger("scanner")
@@ -94,7 +95,7 @@ class ScannerEvaluator:
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
         """Compute TV rating for symbol at timeframe."""
         klines = self.kline_store.get(symbol, {}).get(tf, [])
-        return compute_tv_rating_from(klines, {"enabled": True, "indicators": {}, "weights": {}, "tolerance": {}, "thresholds": {}}, tf=tf, price=price)
+        return compute_tv_rating_from(klines, TECHNICAL_RATING, tf=tf, price=price)
 
     def _compute_mtf_alignment(self, symbol: str, price: float):
         """Compute MTF alignment status."""
@@ -210,7 +211,7 @@ class ScannerEvaluator:
                 logger.exception("Failed to send MTF monitoring alert block")
 
         if newly_aligned:
-            await self.handle_root_signals(newly_aligned, allow_open_trades=True)
+            await self.handle_root_signals(newly_aligned, vol_data, allow_open_trades=True)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], vol_data: Dict, allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         """Evaluate MTF alignment and apply trading gates."""
@@ -340,11 +341,54 @@ class ScannerEvaluator:
         candidates = to_open
 
         # Prioritization & slot management
-        if ROOT_FILTER := getattr(self, '_root_filter', False):  # Placeholder - set from config
-            # ... (preserve original ROOT_FILTER logic)
-            pass
+        if ROOT_FILTER:
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for c in candidates:
+                grouped.setdefault(c["root"], []).append(c)
+
+            selected: List[Dict[str, Any]] = []
+            order_list = PRIORITIZE_SLOT_ORDER if PRIORITIZE_SLOT_ORDER else ROOT_TFS
+            remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
+
+            for rt in order_list:
+                if remaining_slots <= 0:
+                    break
+                lst = grouped.get(rt, [])
+                if not lst:
+                    continue
+                top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                selected.extend(top)
+                remaining_slots -= len(top)
+
+            if remaining_slots > 0:
+                remaining_candidates = [c for c in candidates if c not in selected]
+                remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                selected.extend(remaining_sorted)
+
+            candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
         else:
-            candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
+            if PRIORITIZE_SLOT_ORDER:
+                remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
+                selected: List[Dict[str, Any]] = []
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                for c in candidates:
+                    grouped.setdefault(c["root"], []).append(c)
+                for rt in PRIORITIZE_SLOT_ORDER:
+                    if remaining_slots <= 0:
+                        break
+                    lst = grouped.get(rt, [])
+                    if not lst:
+                        continue
+                    top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                    selected.extend(top)
+                    remaining_slots -= len(top)
+                if remaining_slots > 0:
+                    remaining_candidates = [c for c in candidates if c not in selected]
+                    remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                    selected.extend(remaining_sorted)
+                candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
+            else:
+                candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
 
         current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
         logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
@@ -386,7 +430,6 @@ class ScannerEvaluator:
             
             symbol_info = await self.client.get_symbol_info(sym)
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
-            from .scanner_core import quantize_qty
             qty = quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             
             if qty <= 0 or math.isclose(qty, 0.0):

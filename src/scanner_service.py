@@ -1,5 +1,6 @@
 # scanner_service.py
-# Full updated Scanner class with gating, volume fixes, prioritization, TV rating numeric threshold, and fixed minimal push behavior.
+# Core scanning, signal evaluation, and trade management orchestration.
+# Telegram messaging delegated to scanner_telegram.py
 
 import os
 import asyncio
@@ -37,6 +38,8 @@ from .scanner_core import (
     compute_tv_rating_from,
     compute_mtf_alignment,
 )
+
+from .scanner_telegram import TelegramSummary
 
 logger = get_logger("scanner")
 
@@ -84,14 +87,8 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
 
-        # push / dedupe state for Telegram sending
-        self._first_deploy_push = True
-        # Track last root TF candle start for detecting new candle opens
-        self._last_full_push_ts: Dict[str, int] = {}
-        # Track last scan interval push timestamp
-        self._last_scan_interval_push_ts: Optional[float] = None
-        # Track which (symbol, root) pairs have been sent in current scan interval
-        self._sent_this_interval: set = set()
+        # Initialize Telegram state manager
+        self.telegram = TelegramSummary()
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
@@ -722,29 +719,10 @@ class Scanner:
 
                 # Determine if this is a full push or scan interval push
                 now_ts = time.time()
-                is_full_push = False
-                is_candle_open = False
+                is_full_push = self.telegram.check_full_push(now_ts)
+                is_candle_open = self.telegram.check_candle_open(now_ts)
 
-                if self._first_deploy_push:
-                    is_full_push = True
-                else:
-                    # Check if any root TF candle has opened (new candle start)
-                    for rt in ROOT_TFS:
-                        try:
-                            tf_seconds = self._tf_to_seconds(rt)
-                            if not tf_seconds or tf_seconds <= 0:
-                                continue
-                            candle_start = (int(now_ts) // tf_seconds) * tf_seconds
-                            last = self._last_full_push_ts.get(rt)
-                            if last != candle_start:
-                                is_full_push = True
-                                is_candle_open = True
-                                # update stored start for this root tf
-                                self._last_full_push_ts[rt] = candle_start
-                        except Exception:
-                            continue
-
-                logger.info("[PUSH_GATING] is_full_push=%s is_candle_open=%s first_deploy=%s", is_full_push, is_candle_open, self._first_deploy_push)
+                logger.info("[PUSH_GATING] is_full_push=%s is_candle_open=%s first_deploy=%s", is_full_push, is_candle_open, self.telegram.is_first_deploy())
 
                 evaluated = []
                 if root_signals:
@@ -763,15 +741,11 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
 
-                # Reset sent_this_interval on full push or candle open
-                if is_full_push:
-                    self._sent_this_interval.clear()
-
                 # Send appropriate Telegram messages
-                await self.send_summary(root_signals, evaluated=evaluated, full_push=is_full_push, is_candle_open=is_candle_open)
+                await self.telegram.send_summary(root_signals, evaluated=evaluated, full_push=is_full_push, is_candle_open=is_candle_open)
 
-                if self._first_deploy_push and is_full_push:
-                    self._first_deploy_push = False
+                if is_full_push:
+                    self.telegram.mark_full_push_sent()
 
             except Exception:
                 logger.exception("Error in root scan loop")
@@ -1175,227 +1149,6 @@ class Scanner:
         tv_score = candidate.get("tv_score", 0.0)
         combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)
         return combined
-
-    async def send_summary(self, root_signals: List[Dict[str, Any]], evaluated: Optional[List[Dict[str, Any]]] = None, full_push: bool = False, is_candle_open: bool = False):
-        """
-        Telegram summary with three distinct modes:
-        
-        1. INITIAL DEPLOY (full_push=True, first_deploy):
-           - Recommended trading signals block
-           - Root TF summary with signal counts (a-z)
-           - Aggregated detailed signals (a-z, one signal per block)
-        
-        2. SET SCAN INTERVAL (full_push=False):
-           - One new signal per block (deduplicated per scan interval)
-           - Only signals not yet sent in current interval
-        
-        3. ROOT TFS CANDLE OPEN (full_push=True, is_candle_open=True):
-           - Same as INITIAL DEPLOY format
-        """
-        now_str = time.strftime("%H:%M UTC", time.gmtime())
-
-        eval_map: Dict[tuple, Dict[str, Any]] = {}
-        if evaluated:
-            for e in evaluated:
-                eval_map[(e["symbol"], e["root"])] = e
-
-        if full_push:
-            # FULL PUSH MODE: Initial deploy or candle open
-            # Reset interval dedup on full push
-            self._sent_this_interval.clear()
-
-            # --- 1) Recommended block (sent first) ---
-            try:
-                if evaluated:
-                    current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-                    remaining = max(0, MAX_OPEN_TRADES - current_open)
-                    accepted = [e for e in evaluated if e.get("accept")]
-                    # SORT BY COMBINED SCORE (descending)
-                    accepted_sorted = sorted(accepted, key=lambda r: self._compute_combined_score(r), reverse=True)
-                    recommended = accepted_sorted[:remaining] if remaining > 0 else []
-
-                    rec_lines = [f"🏆 Recommended Signals for Trading – {now_str}"]
-                    rec_lines.append(f"Open trades: {current_open} / {MAX_OPEN_TRADES}")
-                    rec_lines.append(f"Slots available: {remaining}")
-                    if not recommended:
-                        rec_lines.append("No recommended signals to open at this time.")
-                    else:
-                        for r in recommended:
-                            sym = r["symbol"]
-                            rt = r["root"]
-                            price = r["price"]
-                            combined = self._compute_combined_score(r)
-                            score = r.get("score", 0.0)
-                            tv_score = r.get("tv_score", 0.0)
-                            if price >= 1000:
-                                price_str = f"${price:,.2f}"
-                            elif price >= 1:
-                                price_str = f"${price:.4f}"
-                            else:
-                                price_str = f"${price:.8f}"
-                            rec_lines.append(f"  - {sym} | {rt} | {price_str} | combined={combined:.2f} (mtf={score:.2f}, tv={tv_score:+.3f})")
-
-                    await send_message("\n".join(rec_lines))
-            except Exception:
-                logger.exception("Failed to send recommended signals block")
-
-            # --- 2) Root TF summary header (counts) ---
-            try:
-                tf_counts: Dict[str, int] = {}
-                for sig in root_signals:
-                    rt = sig.get("root", "?")
-                    tf_counts[rt] = tf_counts.get(rt, 0) + 1
-
-                window_map = {"60": 30, "240": 12, "D": 5}
-                header_lines = [f"🔍 Bybit Perp Root Summary – {now_str}"]
-                for rt in ROOT_TFS:
-                    cnt = tf_counts.get(rt, 0)
-                    win = window_map.get(rt)
-                    if cnt:
-                        if win:
-                            header_lines.append(f"  {rt}: {cnt} (window: {win})")
-                        else:
-                            header_lines.append(f"  {rt}: {cnt}")
-                header_lines.append("")
-                header_lines.append("Signals (all root TF signals):")
-                if not root_signals:
-                    header_lines.append("  None")
-                else:
-                    # For compact summary keep symbol | tf | price in this header
-                    for sig in sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", ""))):
-                        sym = sig.get("symbol")
-                        rt = sig.get("root")
-                        price = sig.get("price", 0)
-                        try:
-                            if price >= 1000:
-                                price_str = f"${price:,.2f}"
-                            elif price >= 1:
-                                price_str = f"${price:.4f}"
-                            else:
-                                price_str = f"${price:.8f}"
-                        except Exception:
-                            price_str = str(price)
-                        header_lines.append(f"  - {sym} | {rt} | {price_str}")
-
-                await send_message("\n".join(header_lines))
-            except Exception:
-                logger.exception("Failed to send root summary block")
-
-            # --- 3) Aggregated alphabetical detailed signals (ONE BLOCK) ---
-            try:
-                if not root_signals:
-                    # Already sent header with "None", nothing else to do
-                    pass
-                else:
-                    # Sort alphabetically by symbol then by root
-                    sorted_signals = sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", "")))
-
-                    detail_lines = [f"📋 Signals (detailed) – {now_str}"]
-                    for sig in sorted_signals:
-                        sym        = sig.get("symbol")
-                        rt         = sig.get("root")
-                        price      = sig.get("price", 0)
-                        vol_change = sig.get("vol_change")
-                        tv_score   = sig.get("tv_score", 0.0)
-                        tv_label   = sig.get("tv_label", "Neutral")
-                        eval_entry = eval_map.get((sym, rt), {})
-
-                        mtf_status = eval_entry.get("mtf_status", "N/A")
-                        negative_tfs = eval_entry.get("negative_tfs", [])
-                        mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
-
-                        if price >= 1000:
-                            price_str = f"${price:,.2f}"
-                        elif price >= 1:
-                            price_str = f"${price:.4f}"
-                        else:
-                            price_str = f"${price:.8f}"
-
-                        vol_str = "N/A"
-                        if vol_change is not None:
-                            try:
-                                vol_str = f"{vol_change * 100:+.1f}%"
-                            except Exception:
-                                vol_str = str(vol_change)
-
-                        # Single-line summary per signal for the aggregated block
-                        detail_lines.append(f"  - {sym} | {rt} | {price_str} | TV: {tv_label} ({tv_score:+.3f}) | 24h Vol Δ: {vol_str} | MTF: {mtf_str}")
-
-                    # Send as one aggregate message
-                    await send_message("\n".join(detail_lines))
-                    
-                    # Mark all signals as sent in this full push
-                    for sig in root_signals:
-                        sym = sig.get("symbol")
-                        rt = sig.get("root")
-                        self._sent_this_interval.add((sym, rt))
-                        
-            except Exception:
-                logger.exception("Failed to send aggregated detailed signals block")
-        else:
-            # SCAN INTERVAL MODE: Send one new signal per block (deduplicated)
-            if not root_signals:
-                return
-
-            # Find new signals (not yet sent in this interval)
-            to_send = []
-            for sig in root_signals:
-                sym = sig.get("symbol")
-                rt = sig.get("root")
-                key = (sym, rt)
-                
-                if key not in self._sent_this_interval:
-                    to_send.append(sig)
-                    logger.info("[TELEGRAM_DELTA] NEW signal queued: %s %s", sym, rt)
-
-            if not to_send:
-                logger.info("[TELEGRAM_DELTA] No new signals to send in this interval")
-                return
-
-            # Send one Telegram message per new signal (1 signal per block)
-            for sig in to_send:
-                try:
-                    sym = sig.get("symbol")
-                    rt = sig.get("root")
-                    price = sig.get("price")
-                    vol_change = sig.get("vol_change")
-                    tv_score = sig.get("tv_score", 0.0)
-                    tv_label = sig.get("tv_label", "Neutral")
-                    eval_entry = eval_map.get((sym, rt), {})
-
-                    mtf_status = eval_entry.get("mtf_status", "N/A")
-                    negative_tfs = eval_entry.get("negative_tfs", [])
-                    mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
-
-                    if price >= 1000:
-                        price_str = f"${price:,.2f}"
-                    elif price >= 1:
-                        price_str = f"${price:.4f}"
-                    else:
-                        price_str = f"${price:.8f}"
-
-                    vol_str = "N/A"
-                    if vol_change is not None:
-                        try:
-                            vol_str = f"{vol_change * 100:+.1f}%"
-                        except Exception:
-                            vol_str = str(vol_change)
-
-                    block = "\n".join([
-                        f"📌 Bybit Perp | {rt} Signal – {now_str}",
-                        f"Symbol: {sym}",
-                        f"Price: {price_str}",
-                        f"MTF Status: {mtf_str}",
-                        f"TV Rating: {tv_label} ({tv_score:+.3f})",
-                        f"24h Vol Δ: {vol_str}",
-                    ])
-                    await send_message(block)
-                    
-                    # Mark as sent in current interval
-                    self._sent_this_interval.add((sym, rt))
-                    logger.info("[TELEGRAM_SENT] %s %s", sym, rt)
-                except Exception:
-                    logger.exception("Failed to send scan interval signal block for %s %s", sig.get("symbol"), rt)
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())

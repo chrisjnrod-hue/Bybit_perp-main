@@ -1,3 +1,4 @@
+
 # scanner_service.py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
@@ -613,27 +614,6 @@ class Scanner:
 
         while not self._stop:
             loop_count += 1
-            now_ts = time.time()
-            
-            # Detect which new root candles just opened
-            current_hour = time.gmtime(now_ts).tm_hour
-            current_minute = time.gmtime(now_ts).tm_min
-            
-            new_candle_tfs = []
-            if current_minute < 5:  # Only evaluates true on the first 5m scan of a new hour
-                new_candle_tfs.append("60")  # 1h candle open
-                if current_hour % 4 == 0:
-                    new_candle_tfs.append("240")  # 4h candle open
-                if current_hour == 0:
-                    new_candle_tfs.append("D")  # 1d candle open
-            
-            # Intelligently clear cache for old signals expiring on new root candles
-            if new_candle_tfs:
-                to_remove = [sym for sym, info in self._mtf_monitoring.items() if info.get("root") in new_candle_tfs]
-                for sym in to_remove:
-                    self._mtf_monitoring.pop(sym, None)
-                if to_remove:
-                    logger.info("[CACHE CLEAR] Expired %d monitored signals on new candles: %s", len(to_remove), new_candle_tfs)
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
 
@@ -763,13 +743,7 @@ class Scanner:
                     logger.info("No root signals this interval.")
 
                 # Send appropriate Telegram messages
-                await self.telegram.send_summary(
-                    root_signals, 
-                    evaluated=evaluated, 
-                    full_push=is_full_push, 
-                    is_candle_open=is_candle_open,
-                    new_candle_tfs=new_candle_tfs
-                )
+                await self.telegram.send_summary(root_signals, evaluated=evaluated, full_push=is_full_push, is_candle_open=is_candle_open)
 
                 if is_full_push:
                     self.telegram.mark_full_push_sent()
@@ -784,11 +758,19 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # ROOT_SCAN_INTERVAL == 0 -> Align perfectly to the 5m candle open
-                now_time = time.time()
-                next_5m = ((int(now_time) // 300) + 1) * 300
-                # +2 seconds buffer allows the exchange to fully close and publish the new candle
-                to_sleep = max(0, next_5m - now_time + 2.0)
+                now = time.time()
+                now_struct = time.gmtime(now)
+                current_minute = now_struct.tm_min
+                current_second = now_struct.tm_sec
+
+                next_5m_minute = ((current_minute // 5) + 1) * 5
+
+                if next_5m_minute >= 60:
+                    to_sleep = (60 - current_minute) * 60 - current_second
+                else:
+                    to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
+
+                to_sleep = max(0, to_sleep)
                 logger.debug("[DIAGNOSTIC] Aligning to next 5m candle: sleeping %.1f seconds", to_sleep)
                 await asyncio.sleep(to_sleep)
 
@@ -870,10 +852,7 @@ class Scanner:
             root = item["root"]
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
-            
-            # Safely enforce float, defaulting to 0.0 if explicitly None
-            tv_score_raw = item.get("tv_score")
-            tv_score = float(tv_score_raw) if tv_score_raw is not None else 0.0
+            tv_score = item.get("tv_score", 0.0)
 
             hist = item.get("hist", [])
             if not hist:
@@ -909,7 +888,8 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # STRICT NUMERIC TV RATING FILTER
+                # NUMERIC TV RATING FILTER - NEW FIX
+                # Check if TV score meets minimum threshold
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"

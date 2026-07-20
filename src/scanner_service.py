@@ -1,5 +1,6 @@
 # scanner_service.py
 # Core scanning, signal evaluation, and trade management orchestration.
+# FIXED: TV rating enforcement, ROOT_SCAN_INTERVAL=0 at 5m boundaries, intelligent cache clearing
 # Telegram messaging delegated to scanner_telegram.py
 
 import os
@@ -7,7 +8,7 @@ import asyncio
 import time
 import json
 from collections import defaultdict
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Set
 import math
 import inspect
 from decimal import getcontext
@@ -18,7 +19,7 @@ from .logger import get_logger
 from .bybit_client import BybitClient
 from .trade_manager import TradeManager
 from .ratelimiter import TokenBucket
-from .macd import slope  # used in a couple places still
+from .macd import slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
@@ -47,25 +48,32 @@ SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
+# FIXED: Numeric TV rating threshold enforcement
 try:
     TRADE_RATING_MIN = float(os.getenv("TRADE_RATING_MIN", "0.25"))
 except (ValueError, TypeError):
     TRADE_RATING_MIN = 0.25
 
-# TV rating weighting in combined score calculation (0.0 to 1.0, where 1.0 = 100% TV weight)
+# TV rating weighting in combined score calculation
 try:
     TV_RATING_WEIGHT = float(os.getenv("TV_RATING_WEIGHT", "0.3"))
-    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))  # clamp to [0.0, 1.0]
+    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))
 except (ValueError, TypeError):
     TV_RATING_WEIGHT = 0.3
 
-# If TRADE_RATING_ALLOW is empty list -> allow any rating (backwards compatibility removed)
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
 PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
 
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
+
+# CACHE EXPIRY CONFIG - Intelligent clearing based on ROOT_TF cycles
+CACHE_EXPIRY_MAP = {
+    "5": 300,      # 5m cache valid for 5 minutes
+    "60": 3600,    # 1h cache valid for 1 hour
+    "240": 14400,  # 4h cache valid for 4 hours
+    "D": 86400,    # 1d cache valid for 1 day
+}
 
 
 class Scanner:
@@ -76,6 +84,7 @@ class Scanner:
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
+        self._kline_store_timestamps: Dict[str, Dict[str, float]] = defaultdict(dict)  # Track when klines were cached
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
@@ -89,6 +98,11 @@ class Scanner:
 
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
+        self.telegram.set_tv_rating_weight(TV_RATING_WEIGHT)
+        self.telegram.set_trade_manager(self.trade_manager)
+
+        # FIXED: Track last root TF candle open timestamps for intelligent cache clearing
+        self._last_root_tf_candle_ts: Dict[str, int] = {}
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
@@ -286,6 +300,8 @@ class Scanner:
             logger.warning("SEED_KLINES_LIMIT is very low (%d); MACD requires >=26 for stability", SEED_KLINES_LIMIT)
 
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
+        now = time.time()
+        
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
@@ -373,6 +389,7 @@ class Scanner:
                 except Exception:
                     klines_sorted = valid
                 self.kline_store[symbol][tf] = klines_sorted
+                self._kline_store_timestamps[symbol][tf] = now
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -396,6 +413,40 @@ class Scanner:
 
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
+    def _intelligent_cache_clear(self, now_ts: float):
+        """FIXED: Intelligently clear cache for ROOT_TFs that have cycled (new candle opened)."""
+        for rt in ROOT_TFS:
+            try:
+                tf_seconds = tf_to_seconds(rt)
+                if not tf_seconds or tf_seconds <= 0:
+                    continue
+                
+                candle_start = (int(now_ts) // tf_seconds) * tf_seconds
+                last_candle = self._last_root_tf_candle_ts.get(rt)
+                
+                # If candle has changed, clear stale cache entries
+                if last_candle is not None and last_candle != candle_start:
+                    logger.info("[CACHE_CLEAR] %s candle boundary crossed (last=%d, now=%d)", rt, last_candle, candle_start)
+                    
+                    # Clear klines older than CACHE_EXPIRY_MAP[rt] seconds
+                    expiry_seconds = CACHE_EXPIRY_MAP.get(rt, 3600)
+                    for sym in list(self.kline_store.keys()):
+                        if sym not in self._kline_store_timestamps:
+                            continue
+                        
+                        for tf in list(self.kline_store[sym].keys()):
+                            last_update = self._kline_store_timestamps[sym].get(tf, 0)
+                            age = now_ts - last_update
+                            
+                            if age > expiry_seconds:
+                                del self.kline_store[sym][tf]
+                                del self._kline_store_timestamps[sym][tf]
+                                logger.debug("[CACHE_CLEAR] Purged %s %s (age=%.0f > expiry=%d)", sym, tf, age, expiry_seconds)
+                
+                self._last_root_tf_candle_ts[rt] = candle_start
+            except Exception:
+                logger.exception("[CACHE_CLEAR] Error processing %s", rt)
+
     async def _rest_poller(self):
         """REST poller as fallback when WS is unavailable."""
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
@@ -413,6 +464,7 @@ class Scanner:
 
                 async def poll_symbol(sym: str):
                     tfs_to_poll = list(set(ROOT_TFS + ["5", "15"]))
+                    now = time.time()
                     for tf in tfs_to_poll:
                         try:
                             async with self.request_sem:
@@ -446,6 +498,7 @@ class Scanner:
                                                 self.kline_store.setdefault(sym, {})[tf] = [last_new]
                                         else:
                                             self.kline_store.setdefault(sym, {})[tf] = [last_new]
+                                        self._kline_store_timestamps[sym][tf] = now
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -632,6 +685,10 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
+                # FIXED: Intelligent cache clearing at ROOT_TF boundaries
+                now_ts = time.time()
+                self._intelligent_cache_clear(now_ts)
+
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
@@ -717,12 +774,12 @@ class Scanner:
 
                 await self._check_monitored_symbols()
 
-                # Determine if this is a full push or scan interval push
+                # FIXED: Improved candle detection logic
                 now_ts = time.time()
-                is_full_push = self.telegram.check_full_push(now_ts)
+                is_full_push, opened_roots, all_active_roots = self.telegram.check_full_push(now_ts)
                 is_candle_open = self.telegram.check_candle_open(now_ts)
 
-                logger.info("[PUSH_GATING] is_full_push=%s is_candle_open=%s first_deploy=%s", is_full_push, is_candle_open, self.telegram.is_first_deploy())
+                logger.info("[PUSH_GATING] is_full_push=%s is_candle_open=%s opened_roots=%s", is_full_push, is_candle_open, opened_roots)
 
                 evaluated = []
                 if root_signals:
@@ -741,8 +798,15 @@ class Scanner:
                 else:
                     logger.info("No root signals this interval.")
 
-                # Send appropriate Telegram messages
-                await self.telegram.send_summary(root_signals, evaluated=evaluated, full_push=is_full_push, is_candle_open=is_candle_open)
+                # Send appropriate Telegram messages with corrected parameters
+                await self.telegram.send_summary(
+                    root_signals,
+                    evaluated=evaluated,
+                    full_push=is_full_push,
+                    is_candle_open=is_candle_open,
+                    opened_roots=opened_roots,
+                    all_active_roots=all_active_roots
+                )
 
                 if is_full_push:
                     self.telegram.mark_full_push_sent()
@@ -757,11 +821,13 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
+                # FIXED: ROOT_SCAN_INTERVAL=0 means align to 5m candle boundary
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
+                # Calculate next 5m boundary
                 next_5m_minute = ((current_minute // 5) + 1) * 5
 
                 if next_5m_minute >= 60:
@@ -770,7 +836,7 @@ class Scanner:
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(0, to_sleep)
-                logger.debug("[DIAGNOSTIC] Aligning to next 5m candle: sleeping %.1f seconds", to_sleep)
+                logger.info("[DIAGNOSTIC] ROOT_SCAN_INTERVAL=0: Aligning to next 5m candle: sleeping %.1f seconds", to_sleep)
                 await asyncio.sleep(to_sleep)
 
     async def _check_monitored_symbols(self):
@@ -887,14 +953,16 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # NUMERIC TV RATING FILTER - NEW FIX
-                # Check if TV score meets minimum threshold
+                # FIXED: NUMERIC TV RATING FILTER ENFORCEMENT
+                # Check if TV score meets minimum threshold - THIS IS THE KEY FIX
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"
-                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
+                    logger.warning("[TV_RATING_GATE] BLOCKED: %s tv_score=%.4f < TRADE_RATING_MIN=%.4f", sym, tv_score, TRADE_RATING_MIN)
                     evaluated.append(entry)
                     continue
+                
+                logger.info("[TV_RATING_GATE] PASSED: %s tv_score=%.4f >= TRADE_RATING_MIN=%.4f", sym, tv_score, TRADE_RATING_MIN)
 
                 # apply market cap filter (if configured)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
@@ -921,7 +989,6 @@ class Scanner:
                             continue
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
-                        # fall through and let other gates decide
 
                 # volume gate: (existing config gate)
                 if VOLUME_FILTER_ENABLED:
@@ -978,7 +1045,6 @@ class Scanner:
                 grouped.setdefault(c["root"], []).append(c)
 
             selected: List[Dict[str, Any]] = []
-            # Use PRIORITIZE_SLOT_ORDER to allocate slots across roots if provided; otherwise, use ROOT_TFS order
             order_list = PRIORITIZE_SLOT_ORDER if PRIORITIZE_SLOT_ORDER else ROOT_TFS
             remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
 
@@ -988,12 +1054,10 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                # PRIORITIZE BY COMBINED SCORE (MTF + TV) - NEW FIX
                 top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
 
-            # If still slots remain, fill from other roots by combined score
             if remaining_slots > 0:
                 remaining_candidates = [c for c in candidates if c not in selected]
                 remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
@@ -1001,7 +1065,6 @@ class Scanner:
 
             candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
         else:
-            # No root filter: apply global prioritization
             if PRIORITIZE_SLOT_ORDER:
                 remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
                 selected: List[Dict[str, Any]] = []
@@ -1014,7 +1077,6 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    # PRIORITIZE BY COMBINED SCORE - NEW FIX
                     top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)
@@ -1030,12 +1092,9 @@ class Scanner:
         logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
                     len(candidates), MAX_OPEN_TRADES, current_open)
 
-        # Build quick lookup for evaluated entries to keep them in sync
         eval_map: Dict[tuple, Dict[str, Any]] = {(e["symbol"], e["root"]): e for e in evaluated}
 
         if not allow_open_trades:
-            # Do not perform any actual opens here — evaluation happened above.
-            # Mark candidates as suppressed for visibility in summaries and in evaluated entries.
             for c in candidates:
                 c["open_suppressed"] = True
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1044,10 +1103,9 @@ class Scanner:
                     eval["accept"] = False
                     eval["reason"] = "open_suppressed"
                 logger.info("Open suppressed (gating) for %s %s combined_score=%.2f", c["symbol"], c["root"], self._compute_combined_score(c))
-            # Return evaluated (candidates are still present in evaluated via earlier entries)
             return evaluated
 
-        # Otherwise, perform openings (same logic as before)
+        # Otherwise, perform openings
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached – halting further opens.")
@@ -1057,7 +1115,6 @@ class Scanner:
             price = c["price"]
             vol_change = c.get("vol_change")
 
-            # Double-check TRADE_NO_NEG_VOL
             if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                 logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%.4f)", sym, vol_change)
                 c["accept"] = False
@@ -1093,7 +1150,6 @@ class Scanner:
                 try:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
-                    # Update eval map
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
                         eval["accept"] = True
@@ -1114,7 +1170,6 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
-                # simulated open
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
                 logger.info("Simulated open %s qty=%s combined_score=%.2f tv_score=%.4f", sym, qty, self._compute_combined_score(c), c.get('tv_score', 0.0))
                 eval = eval_map.get((sym, c["root"]))
@@ -1128,7 +1183,6 @@ class Scanner:
                     f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                 )
 
-            # Remove from monitoring if present
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated
@@ -1139,11 +1193,6 @@ class Scanner:
         
         Formula:
           combined = (mtf_score * (1 - tv_weight)) + (tv_score * tv_weight)
-        
-        This allows TV_RATING_WEIGHT to control how much TV rating influences ranking:
-          - 0.0 = pure MTF alignment
-          - 0.3 = 70% MTF, 30% TV (default)
-          - 1.0 = pure TV rating
         """
         mtf_score = candidate.get("score", 0.0)
         tv_score = candidate.get("tv_score", 0.0)

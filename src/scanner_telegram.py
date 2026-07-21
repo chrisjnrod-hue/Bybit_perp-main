@@ -28,6 +28,9 @@ class TelegramSummary:
 
         # Tracks (symbol, root) that have had a "new-signal" block sent in the current candle interval
         self._sent_this_interval: set = set()
+        
+        # Track the last candle start time to detect candle boundary
+        self._last_candle_start: Optional[float] = None
 
         # Scoring/limits/trade manager
         self._tv_rating_weight = 0.3
@@ -89,6 +92,25 @@ class TelegramSummary:
         if self._first_deploy_push:
             self._first_deploy_push = False
 
+    def _get_smallest_root_candle_start(self, now_ts: float) -> Optional[float]:
+        """Get the current candle start for the smallest ROOT_TFS timeframe."""
+        try:
+            if not ROOT_TFS:
+                return None
+            from .scanner_core import tf_to_seconds
+            
+            # Find smallest TF (to detect candle boundary most frequently)
+            smallest_candle_start = None
+            for rt in ROOT_TFS:
+                tf_seconds = tf_to_seconds(rt)
+                if tf_seconds and tf_seconds > 0:
+                    candle_start = (int(now_ts) // tf_seconds) * tf_seconds
+                    if smallest_candle_start is None or candle_start > smallest_candle_start:
+                        smallest_candle_start = candle_start
+            return smallest_candle_start
+        except Exception:
+            return None
+
     async def send_summary(
         self,
         root_signals: List[Dict[str, Any]],
@@ -102,8 +124,10 @@ class TelegramSummary:
           root_signals: list of root-TF signal dicts (each should include symbol, root, price, vol_change, tv_score/label, mtf_status, etc.)
           evaluated: optional list with evaluated metadata (accept, score, tv_score, tv_label, mtf_status, negative_tfs, etc.)
           full_push: True for initial deploy or candle-open full push
+          is_candle_open: True if a root TF candle just opened
         """
-        now_str = time.strftime("%H:%M UTC", time.gmtime())
+        now_ts = time.time()
+        now_str = time.strftime("%H:%M UTC", time.gmtime(now_ts))
 
         # Build evaluated lookup for fallback values and combined scoring
         eval_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -121,6 +145,7 @@ class TelegramSummary:
         if full_push:
             # For full-push we clear the per-interval dedupe so the full push is always fresh
             self._sent_this_interval.clear()
+            self._last_candle_start = self._get_smallest_root_candle_start(now_ts)
 
             # 1) Recommended
             try:
@@ -144,6 +169,13 @@ class TelegramSummary:
             self.mark_full_push_sent()
         else:
             # Scan-interval mode: only send NEW root signals, one block per new signal
+            # Check if we've crossed into a new candle, if so reset the interval tracker
+            current_candle_start = self._get_smallest_root_candle_start(now_ts)
+            if self._last_candle_start is not None and current_candle_start != self._last_candle_start:
+                logger.info("[SCAN_CANDLE_BOUNDARY] Candle transitioned, resetting interval dedupe")
+                self._sent_this_interval.clear()
+            self._last_candle_start = current_candle_start
+            
             try:
                 await self._send_scan_interval_signals(root_signals, eval_map, now_str)
             except Exception:
@@ -306,7 +338,8 @@ class TelegramSummary:
         eval_map: Dict[Tuple[str, str], Dict[str, Any]],
         now_str: str
     ):
-        """Send ONLY new root signals found in this scan, one message per signal (A→Z)."""
+        """Send ONLY new root signals found in this scan, one message per signal (A→Z).
+        Uses same message format as deploy full-push for consistency."""
         if not root_signals:
             logger.info("[SCAN] no root signals in this scan")
             return
@@ -351,15 +384,29 @@ class TelegramSummary:
                 price_str = self._format_price(price)
                 vol_str = self._format_volume_change(vol_change)
 
-                block = "\n".join([
+                # Use same block format as full-push for consistency with deploy order
+                block_lines = [
                     f"📌 Bybit Perp | {rt} Signal – {now_str}",
                     f"Symbol: {sym}",
                     f"Price: {price_str}",
+                ]
+
+                # Include Combined Score if evaluated info is available (matches full-push format)
+                if eval_entry:
+                    try:
+                        combined = self._compute_combined_score(eval_entry)
+                        score = eval_entry.get("score", 0.0)
+                        block_lines.append(f"Combined Score: {combined:.2f} (mtf={score:.2f})")
+                    except Exception:
+                        pass
+
+                block_lines.extend([
                     f"MTF Status: {mtf_str}",
                     f"TV Rating: {tv_label} ({float(tv_score):+.3f})",
                     f"24h Vol Δ: {vol_str}",
                 ])
 
+                block = "\n".join(block_lines)
                 await send_message(block)
 
                 # Mark as sent in this interval so we won't re-send it in the same candle

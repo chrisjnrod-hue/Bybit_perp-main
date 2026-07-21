@@ -1,6 +1,6 @@
 # scanner_telegram.py
 # Telegram messaging, state management, and message formatting.
-# Full-push: Recommended -> Root Summary -> A→Z one-block-per-signal
+# Full-push: Recommended -> Root Summary (with counts breakdown) -> A→Z one-block-per-signal
 # Scan-interval: Only new root signals, one-block-per-signal
 # Defensive: normalized keys for dedupe and lookup, robust fallbacks.
 
@@ -62,7 +62,6 @@ class TelegramSummary:
                 candle_start = (int(now_ts) // tf_seconds) * tf_seconds
                 last = self._last_full_push_ts.get(rt)
                 if last != candle_start:
-                    # update last seen for this root TF and signal full-push
                     self._last_full_push_ts[rt] = candle_start
                     return True
             except Exception:
@@ -99,7 +98,6 @@ class TelegramSummary:
                 return None
             from .scanner_core import tf_to_seconds
             
-            # Find smallest TF (to detect candle boundary most frequently)
             smallest_candle_start = None
             for rt in ROOT_TFS:
                 tf_seconds = tf_to_seconds(rt)
@@ -118,18 +116,10 @@ class TelegramSummary:
         full_push: bool = False,
         is_candle_open: bool = False
     ):
-        """Main entry to send telegram summary/messages.
-
-        Args:
-          root_signals: list of root-TF signal dicts (each should include symbol, root, price, vol_change, tv_score/label, mtf_status, etc.)
-          evaluated: optional list with evaluated metadata (accept, score, tv_score, tv_label, mtf_status, negative_tfs, etc.)
-          full_push: True for initial deploy or candle-open full push
-          is_candle_open: True if a root TF candle just opened
-        """
+        """Main entry to send telegram summary/messages."""
         now_ts = time.time()
         now_str = time.strftime("%H:%M UTC", time.gmtime(now_ts))
 
-        # Build evaluated lookup for fallback values and combined scoring
         eval_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if evaluated:
             for e in evaluated:
@@ -143,7 +133,6 @@ class TelegramSummary:
                     continue
 
         if full_push:
-            # For full-push we clear the per-interval dedupe so the full push is always fresh
             self._sent_this_interval.clear()
             self._last_candle_start = self._get_smallest_root_candle_start(now_ts)
 
@@ -153,23 +142,20 @@ class TelegramSummary:
             except Exception:
                 logger.exception("Failed to send recommended block")
 
-            # 2) Root TF summary/count block (single block)
+            # 2) Root TF summary counts block + short list
             try:
                 await self._send_root_summary_block(root_signals, now_str)
             except Exception:
                 logger.exception("Failed to send root summary block")
 
-            # 3) A→Z listing of ALL signals: one telegram block per signal (detailed)
+            # 3) A→Z listing of ALL signals: one telegram block per signal
             try:
                 await self._send_all_signals_one_block_each(root_signals, eval_map, now_str)
             except Exception:
                 logger.exception("Failed to send per-signal blocks for full-push")
 
-            # mark first deploy done if applicable
             self.mark_full_push_sent()
         else:
-            # Scan-interval mode: only send NEW root signals, one block per new signal
-            # Check if we've crossed into a new candle, if so reset the interval tracker
             current_candle_start = self._get_smallest_root_candle_start(now_ts)
             if self._last_candle_start is not None and current_candle_start != self._last_candle_start:
                 logger.info("[SCAN_CANDLE_BOUNDARY] Candle transitioned, resetting interval dedupe")
@@ -198,7 +184,6 @@ class TelegramSummary:
         remaining = max(0, self._max_open_trades - current_open)
         accepted = [e for e in evaluated if e and e.get("accept")]
 
-        # sort by combined score (descending)
         accepted_sorted = sorted(accepted, key=lambda r: self._compute_combined_score(r), reverse=True)
         recommended = accepted_sorted[:remaining] if remaining > 0 else []
 
@@ -225,24 +210,19 @@ class TelegramSummary:
             logger.exception("send_message failed for recommended block")
 
     async def _send_root_summary_block(self, root_signals: List[Dict[str, Any]], now_str: str):
-        """Send a single Root TF summary/counts block plus a short alphabetical list."""
+        """Send Root TF summary counts breakdown block alongside alphabetical list."""
         tf_counts: Dict[str, int] = {}
         for sig in root_signals:
-            rt = sig.get("root", "?")
+            rt = str(sig.get("root", "?"))
             tf_counts[rt] = tf_counts.get(rt, 0) + 1
 
-        window_map = {"60": 30, "240": 12, "D": 5}
         lines = [f"🔍 Bybit Perp Root Summary – {now_str}"]
+        lines.append("Root Timeframe Counts:")
 
-        # show counts per configured ROOT_TFS in order
+        # Show counts per configured ROOT_TFS in order with fallback count check
         for rt in ROOT_TFS:
             cnt = tf_counts.get(rt, 0)
-            win = window_map.get(rt)
-            if cnt:
-                if win:
-                    lines.append(f"  {rt}: {cnt} (window: {win})")
-                else:
-                    lines.append(f"  {rt}: {cnt}")
+            lines.append(f"  - {rt}: {cnt} signals")
 
         lines.append("")
         lines.append("Signals (short list):")
@@ -280,7 +260,6 @@ class TelegramSummary:
                 rt_raw = sig.get("root", None)
                 sym, rt = _normalize_key(sym_raw, rt_raw)
 
-                # prefer values from root_signals; fallback to evaluated
                 eval_entry = eval_map.get((sym, rt), {})
 
                 price = sig.get("price", None)
@@ -293,21 +272,23 @@ class TelegramSummary:
                 tv_score = sig.get("tv_score", None)
                 if tv_score is None:
                     tv_score = eval_entry.get("tv_score", 0.0)
-                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", "N/A")
+                
+                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", None)
+                if not mtf_status or mtf_status == "N/A":
+                    mtf_status = sig.get("reason", "aligned")
+                
                 negative_tfs = sig.get("negative_tfs", None) or eval_entry.get("negative_tfs", []) or []
 
                 mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
                 price_str = self._format_price(price)
                 vol_str = self._format_volume_change(vol_change)
 
-                # Build block (matches screenshot template fields)
                 block_lines = [
                     f"📋 Bybit Perp | {rt} Signal – {now_str}",
                     f"Symbol: {sym}",
                     f"Price: {price_str}",
                 ]
 
-                # If we have evaluated scoring info, include Combined Score
                 if eval_entry:
                     try:
                         combined = self._compute_combined_score(eval_entry)
@@ -323,8 +304,6 @@ class TelegramSummary:
                 ])
 
                 await send_message("\n".join(block_lines))
-
-                # mark as sent for this interval (prevents re-sending as new-signal in same candle)
                 self._sent_this_interval.add((sym, rt))
                 logger.info("[FULLPUSH_SIGNAL_SENT] %s %s", sym, rt)
             except Exception:
@@ -338,13 +317,11 @@ class TelegramSummary:
         eval_map: Dict[Tuple[str, str], Dict[str, Any]],
         now_str: str
     ):
-        """Send ONLY new root signals found in this scan, one message per signal (A→Z).
-        Uses same message format as deploy full-push for consistency."""
+        """Send ONLY new root signals found in this scan, one message per signal (A→Z)."""
         if not root_signals:
             logger.info("[SCAN] no root signals in this scan")
             return
 
-        # Find new signals (not yet sent this interval)
         new_signals = []
         for sig in root_signals:
             sym_raw = sig.get("symbol", None)
@@ -359,14 +336,12 @@ class TelegramSummary:
             logger.info("[TELEGRAM_DELTA] no new signals to send this interval")
             return
 
-        # Deterministic A→Z ordering by key (symbol, root)
         new_signals_sorted = sorted(new_signals, key=lambda t: (t[0][0], t[0][1]))
 
         for (sym, rt), sig in new_signals_sorted:
             try:
                 eval_entry = eval_map.get((sym, rt), {})
 
-                # prefer root_signals values, fallback to eval_entry
                 price = sig.get("price", None)
                 if price is None:
                     price = eval_entry.get("price")
@@ -377,21 +352,23 @@ class TelegramSummary:
                 tv_score = sig.get("tv_score", None)
                 if tv_score is None:
                     tv_score = eval_entry.get("tv_score", 0.0)
-                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", "N/A")
+                
+                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", None)
+                if not mtf_status or mtf_status == "N/A":
+                    mtf_status = sig.get("reason", "aligned")
+                
                 negative_tfs = sig.get("negative_tfs", None) or eval_entry.get("negative_tfs", []) or []
 
                 mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
                 price_str = self._format_price(price)
                 vol_str = self._format_volume_change(vol_change)
 
-                # Use same block format as full-push for consistency with deploy order
                 block_lines = [
                     f"📌 Bybit Perp | {rt} Signal – {now_str}",
                     f"Symbol: {sym}",
                     f"Price: {price_str}",
                 ]
 
-                # Include Combined Score if evaluated info is available (matches full-push format)
                 if eval_entry:
                     try:
                         combined = self._compute_combined_score(eval_entry)
@@ -409,11 +386,10 @@ class TelegramSummary:
                 block = "\n".join(block_lines)
                 await send_message(block)
 
-                # Mark as sent in this interval so we won't re-send it in the same candle
                 self._sent_this_interval.add((sym, rt))
                 logger.info("[SCAN_NEW_SENT] %s %s", sym, rt)
             except Exception:
-                logger.exception("Failed to send scan-interval block for %s %s", sig.get("symbol"), sig.get("root"))
+                logger.exception("Failed to send scan-interval block for %s %s", sym.get("symbol"), sym.get("root"))
 
     async def send_single_signal_block(self, sig: Dict[str, Any]):
         """Format and send a single signal block immediately (one message per signal)."""
@@ -423,7 +399,6 @@ class TelegramSummary:
             sym, rt = _normalize_key(sym_raw, rt_raw)
             key = (sym, rt)
 
-            # Check if already sent in this interval to avoid redundancy
             if key in self._sent_this_interval:
                 return
 
@@ -434,7 +409,11 @@ class TelegramSummary:
             vol_change = sig.get("vol_change", None)
             tv_label = sig.get("tv_label", "Neutral")
             tv_score = sig.get("tv_score", 0.0)
-            mtf_status = sig.get("mtf_status", None) or sig.get("reason", "N/A")
+            
+            mtf_status = sig.get("mtf_status", None)
+            if not mtf_status or mtf_status == "N/A":
+                mtf_status = sig.get("reason", "aligned")
+                
             negative_tfs = sig.get("negative_tfs", []) or []
 
             mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
@@ -447,7 +426,6 @@ class TelegramSummary:
                 f"Price: {price_str}",
             ]
 
-            # If combined score metrics exist in signal payload
             try:
                 combined = self._compute_combined_score(sig)
                 score = sig.get("score", 0.0)
@@ -477,7 +455,6 @@ class TelegramSummary:
         try:
             if price is None:
                 return "N/A"
-            # attempt to coerce numeric-like strings to float safely
             if isinstance(price, str):
                 try:
                     price_val = float(price)

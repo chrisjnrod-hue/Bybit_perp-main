@@ -1,19 +1,11 @@
 # scanner_telegram_Version2.py
 # Telegram messaging, state management, and message formatting.
-# Implements the exact ordering and behavior you requested:
-# - Full-push (initial deploy or root-TF candle open):
-#     1) Recommended signals block
-#     2) Root TF summary/counts block (single block)
-#     3) A→Z listing of ALL signals — ONE TELEGRAM BLOCK PER SIGNAL
-#     After full-push the (symbol,root) pairs are marked as "new-signal sent"
-# - Scan-interval (midcandle, full_push=False):
-#     - Send ONLY NEW root signals discovered in this scan, one block per signal (A→Z)
-# - Dedup:
-#     - _sent_this_interval avoids re-sending identical "new-signal" blocks in the same candle.
-#     - Full-push clears _sent_this_interval before broadcasting so full-push always publishes fresh.
+# Full-push: Recommended -> Root Summary -> A→Z one-block-per-signal
+# Scan-interval: Only new root signals, one-block-per-signal
+# Defensive: normalized keys for dedupe and lookup, robust fallbacks.
 
 import time
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from .logger import get_logger
 from .config import ROOT_TFS, MAX_OPEN_TRADES
 from .telegram import send_message
@@ -21,17 +13,13 @@ from .telegram import send_message
 logger = get_logger("scanner_telegram_version2")
 
 
-class TelegramSummary:
-    """Manage Telegram message state and formatting for full-push and scan-interval modes.
+def _normalize_key(symbol: Any, root: Any) -> Tuple[str, str]:
+    """Return normalized (symbol, root) tuple for consistent lookup/storage."""
+    return ("" if symbol is None else str(symbol), "" if root is None else str(root))
 
-    Behavior:
-      - Full-push: recommended -> root summary -> one block per signal (A→Z). Clears dedupe set
-        before sending and marks each (symbol,root) as sent after sending the per-signal blocks.
-      - Scan-interval: sends only new root signals found in the scan (one block per signal).
-        Uses _sent_this_interval to avoid duplicates in the same candle.
-      - Per-signal block prefers values from root_signals and falls back to evaluated entries
-        when fields are missing.
-    """
+
+class TelegramSummary:
+    """Manage Telegram message state and formatting for full-push and scan-interval modes."""
 
     def __init__(self):
         self._first_deploy_push = True
@@ -75,7 +63,6 @@ class TelegramSummary:
                     self._last_full_push_ts[rt] = candle_start
                     return True
             except Exception:
-                # If tf_to_seconds fails for a TF, ignore it
                 continue
         return False
 
@@ -91,7 +78,6 @@ class TelegramSummary:
                     continue
                 candle_start = (int(now_ts) // tf_seconds) * tf_seconds
                 last = self._last_full_push_ts.get(rt)
-                # candle opened if last exists and is different from current start
                 if last is not None and last != candle_start:
                     return True
             except Exception:
@@ -120,11 +106,15 @@ class TelegramSummary:
         now_str = time.strftime("%H:%M UTC", time.gmtime())
 
         # Build evaluated lookup for fallback values and combined scoring
-        eval_map: Dict[tuple, Dict[str, Any]] = {}
+        eval_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if evaluated:
             for e in evaluated:
                 try:
-                    eval_map[(e["symbol"], e["root"])] = e
+                    sym = e.get("symbol")
+                    rt = e.get("root")
+                    if sym is None or rt is None:
+                        continue
+                    eval_map[_normalize_key(sym, rt)] = e
                 except Exception:
                     continue
 
@@ -228,7 +218,7 @@ class TelegramSummary:
         if not root_signals:
             lines.append("  None")
         else:
-            for sig in sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", ""))):
+            for sig in sorted(root_signals, key=lambda s: (str(s.get("symbol", "")), str(s.get("root", "")))):
                 sym = sig.get("symbol", "N/A")
                 rt = sig.get("root", "N/A")
                 price = sig.get("price", None)
@@ -243,31 +233,38 @@ class TelegramSummary:
     async def _send_all_signals_one_block_each(
         self,
         root_signals: List[Dict[str, Any]],
-        eval_map: Dict[tuple, Dict[str, Any]],
+        eval_map: Dict[Tuple[str, str], Dict[str, Any]],
         now_str: str
     ):
         """Send one detailed Telegram block per signal (A→Z). Prefer root_signals values, fallback to eval_map."""
         if not root_signals:
             return
 
-        sorted_signals = sorted(root_signals, key=lambda s: (s.get("symbol", ""), s.get("root", "")))
+        sorted_signals = sorted(root_signals, key=lambda s: (str(s.get("symbol", "")), str(s.get("root", ""))))
 
         for sig in sorted_signals:
             try:
-                sym = sig.get("symbol", "N/A")
-                rt = sig.get("root", "N/A")
+                sym_raw = sig.get("symbol", None)
+                rt_raw = sig.get("root", None)
+                sym, rt = _normalize_key(sym_raw, rt_raw)
 
                 # prefer values from root_signals; fallback to evaluated
                 eval_entry = eval_map.get((sym, rt), {})
 
-                price = sig.get("price", eval_entry.get("price"))
-                vol_change = sig.get("vol_change", eval_entry.get("vol_change"))
-                tv_label = sig.get("tv_label", eval_entry.get("tv_label", "Neutral"))
-                tv_score = sig.get("tv_score", eval_entry.get("tv_score", 0.0))
-                mtf_status = sig.get("mtf_status", eval_entry.get("mtf_status", "N/A"))
-                negative_tfs = sig.get("negative_tfs", eval_entry.get("negative_tfs", [])) or []
+                price = sig.get("price", None)
+                if price is None:
+                    price = eval_entry.get("price")
+                vol_change = sig.get("vol_change", None)
+                if vol_change is None:
+                    vol_change = eval_entry.get("vol_change")
+                tv_label = sig.get("tv_label", None) or eval_entry.get("tv_label", "Neutral")
+                tv_score = sig.get("tv_score", None)
+                if tv_score is None:
+                    tv_score = eval_entry.get("tv_score", 0.0)
+                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", "N/A")
+                negative_tfs = sig.get("negative_tfs", None) or eval_entry.get("negative_tfs", []) or []
 
-                mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
+                mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
                 price_str = self._format_price(price)
                 vol_str = self._format_volume_change(vol_change)
 
@@ -285,12 +282,11 @@ class TelegramSummary:
                         score = eval_entry.get("score", 0.0)
                         block_lines.append(f"Combined Score: {combined:.2f} (mtf={score:.2f})")
                     except Exception:
-                        # ignore combined if compute fails
                         pass
 
                 block_lines.extend([
                     f"MTF Status: {mtf_str}",
-                    f"TV Rating: {tv_label} ({tv_score:+.3f})",
+                    f"TV Rating: {tv_label} ({float(tv_score):+.3f})",
                     f"24h Vol Δ: {vol_str}",
                 ])
 
@@ -307,7 +303,7 @@ class TelegramSummary:
     async def _send_scan_interval_signals(
         self,
         root_signals: List[Dict[str, Any]],
-        eval_map: Dict[tuple, Dict[str, Any]],
+        eval_map: Dict[Tuple[str, str], Dict[str, Any]],
         now_str: str
     ):
         """Send ONLY new root signals found in this scan, one message per signal (A→Z)."""
@@ -318,35 +314,40 @@ class TelegramSummary:
         # Find new signals (not yet sent this interval)
         new_signals = []
         for sig in root_signals:
-            sym = sig.get("symbol")
-            rt = sig.get("root")
+            sym_raw = sig.get("symbol", None)
+            rt_raw = sig.get("root", None)
+            sym, rt = _normalize_key(sym_raw, rt_raw)
             key = (sym, rt)
             if key not in self._sent_this_interval:
-                new_signals.append(sig)
+                new_signals.append((key, sig))
                 logger.info("[TELEGRAM_DELTA] queued new signal: %s %s", sym, rt)
 
         if not new_signals:
             logger.info("[TELEGRAM_DELTA] no new signals to send this interval")
             return
 
-        # Deterministic A→Z ordering
-        new_signals_sorted = sorted(new_signals, key=lambda s: (s.get("symbol", ""), s.get("root", "")))
+        # Deterministic A→Z ordering by key (symbol, root)
+        new_signals_sorted = sorted(new_signals, key=lambda t: (t[0][0], t[0][1]))
 
-        for sig in new_signals_sorted:
+        for (sym, rt), sig in new_signals_sorted:
             try:
-                sym = sig.get("symbol", "N/A")
-                rt = sig.get("root", "N/A")
                 eval_entry = eval_map.get((sym, rt), {})
 
                 # prefer root_signals values, fallback to eval_entry
-                price = sig.get("price", eval_entry.get("price"))
-                vol_change = sig.get("vol_change", eval_entry.get("vol_change"))
-                tv_label = sig.get("tv_label", eval_entry.get("tv_label", "Neutral"))
-                tv_score = sig.get("tv_score", eval_entry.get("tv_score", 0.0))
-                mtf_status = sig.get("mtf_status", eval_entry.get("mtf_status", "N/A"))
-                negative_tfs = sig.get("negative_tfs", eval_entry.get("negative_tfs", [])) or []
+                price = sig.get("price", None)
+                if price is None:
+                    price = eval_entry.get("price")
+                vol_change = sig.get("vol_change", None)
+                if vol_change is None:
+                    vol_change = eval_entry.get("vol_change")
+                tv_label = sig.get("tv_label", None) or eval_entry.get("tv_label", "Neutral")
+                tv_score = sig.get("tv_score", None)
+                if tv_score is None:
+                    tv_score = eval_entry.get("tv_score", 0.0)
+                mtf_status = sig.get("mtf_status", None) or eval_entry.get("mtf_status", "N/A")
+                negative_tfs = sig.get("negative_tfs", None) or eval_entry.get("negative_tfs", []) or []
 
-                mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(negative_tfs)})"
+                mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
                 price_str = self._format_price(price)
                 vol_str = self._format_volume_change(vol_change)
 
@@ -355,7 +356,7 @@ class TelegramSummary:
                     f"Symbol: {sym}",
                     f"Price: {price_str}",
                     f"MTF Status: {mtf_str}",
-                    f"TV Rating: {tv_label} ({tv_score:+.3f})",
+                    f"TV Rating: {tv_label} ({float(tv_score):+.3f})",
                     f"24h Vol Δ: {vol_str}",
                 ])
 
@@ -369,26 +370,38 @@ class TelegramSummary:
 
     # --- Formatting helpers ---
 
-    def _format_price(self, price: Optional[float]) -> str:
-        """Format price with sensible precision and handle None."""
+    def _format_price(self, price: Optional[Any]) -> str:
+        """Format price with sensible precision and handle None or string input."""
         try:
             if price is None:
                 return "N/A"
-            if price >= 1000:
-                return f"${price:,.2f}"
-            elif price >= 1:
-                return f"${price:.4f}"
+            # attempt to coerce numeric-like strings to float safely
+            if isinstance(price, str):
+                try:
+                    price_val = float(price)
+                except Exception:
+                    return price
             else:
-                return f"${price:.8f}"
+                price_val = float(price)
+            if price_val >= 1000:
+                return f"${price_val:,.2f}"
+            elif price_val >= 1:
+                return f"${price_val:.4f}"
+            else:
+                return f"${price_val:.8f}"
         except Exception:
             return str(price)
 
-    def _format_volume_change(self, vol_change: Optional[float]) -> str:
+    def _format_volume_change(self, vol_change: Optional[Any]) -> str:
         """Format volume change percentage (input expected as fractional e.g. 0.012 -> +1.2%)."""
         if vol_change is None:
             return "N/A"
         try:
-            return f"{vol_change * 100:+.1f}%"
+            if isinstance(vol_change, str):
+                vol_val = float(vol_change)
+            else:
+                vol_val = float(vol_change)
+            return f"{vol_val * 100:+.1f}%"
         except Exception:
             return str(vol_change)
 

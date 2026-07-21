@@ -1,4 +1,4 @@
-# scanner_telegram_Version2.py
+# scanner_telegram.py
 # Telegram messaging, state management, and message formatting.
 # Full-push: Recommended -> Root Summary -> A→Z one-block-per-signal
 # Scan-interval: Only new root signals, one-block-per-signal
@@ -10,7 +10,7 @@ from .logger import get_logger
 from .config import ROOT_TFS, MAX_OPEN_TRADES
 from .telegram import send_message
 
-logger = get_logger("scanner_telegram_version2")
+logger = get_logger("scanner_telegram")
 
 
 def _normalize_key(symbol: Any, root: Any) -> Tuple[str, str]:
@@ -414,6 +414,61 @@ class TelegramSummary:
                 logger.info("[SCAN_NEW_SENT] %s %s", sym, rt)
             except Exception:
                 logger.exception("Failed to send scan-interval block for %s %s", sig.get("symbol"), sig.get("root"))
+
+    async def send_single_signal_block(self, sig: Dict[str, Any]):
+        """Format and send a single signal block immediately (one message per signal)."""
+        try:
+            sym_raw = sig.get("symbol", None)
+            rt_raw = sig.get("root", None)
+            sym, rt = _normalize_key(sym_raw, rt_raw)
+            key = (sym, rt)
+
+            # Check if already sent in this interval to avoid redundancy
+            if key in self._sent_this_interval:
+                return
+
+            now_ts = time.time()
+            now_str = time.strftime("%H:%M UTC", time.gmtime(now_ts))
+
+            price = sig.get("price", None)
+            vol_change = sig.get("vol_change", None)
+            tv_label = sig.get("tv_label", "Neutral")
+            tv_score = sig.get("tv_score", 0.0)
+            mtf_status = sig.get("mtf_status", None) or sig.get("reason", "N/A")
+            negative_tfs = sig.get("negative_tfs", []) or []
+
+            mtf_str = mtf_status if not negative_tfs else f"{mtf_status} (neg: {','.join(map(str, negative_tfs))})"
+            price_str = self._format_price(price)
+            vol_str = self._format_volume_change(vol_change)
+
+            block_lines = [
+                f"📌 Bybit Perp | {rt} Signal – {now_str}",
+                f"Symbol: {sym}",
+                f"Price: {price_str}",
+            ]
+
+            # If combined score metrics exist in signal payload
+            try:
+                combined = self._compute_combined_score(sig)
+                score = sig.get("score", 0.0)
+                if score > 0 or combined > 0:
+                    block_lines.append(f"Combined Score: {combined:.2f} (mtf={score:.2f})")
+            except Exception:
+                pass
+
+            block_lines.extend([
+                f"MTF Status: {mtf_str}",
+                f"TV Rating: {tv_label} ({float(tv_score):+.3f})",
+                f"24h Vol Δ: {vol_str}",
+            ])
+
+            block = "\n".join(block_lines)
+            await send_message(block)
+
+            self._sent_this_interval.add(key)
+            logger.info("[SINGLE_SIGNAL_BLOCK_SENT] %s %s", sym, rt)
+        except Exception:
+            logger.exception("Failed to send single signal block for %s %s", sig.get("symbol"), sig.get("root"))
 
     # --- Formatting helpers ---
 

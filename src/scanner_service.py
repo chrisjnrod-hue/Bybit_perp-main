@@ -694,7 +694,7 @@ class Scanner:
 
                         self._last_price_cache[sym] = price
 
-                        # Update volume for EVERY symbol
+                        # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
                         for root in ROOT_TFS:
@@ -727,6 +727,9 @@ class Scanner:
                                     start_at = None
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
+                                
+                                # Pre-compute MTF alignment so immediate blocks never show N/A status
+                                mtf_align = self._compute_mtf_alignment(sym, price)
 
                                 sig_item = {
                                     "symbol": sym,
@@ -736,7 +739,10 @@ class Scanner:
                                     "vol_change": vol_change,
                                     "start_at": start_at,
                                     "tv_score": tv_score,
-                                    "tv_label": tv_label
+                                    "tv_label": tv_label,
+                                    "mtf_status": mtf_align.get("status", "N/A"),
+                                    "negative_tfs": mtf_align.get("negative_tfs", []),
+                                    "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
                                 logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
@@ -847,14 +853,17 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
+                    vol_change = self.compute_24h_volume_change(sym)
                     resolved_item = {
                         "symbol": sym,
                         "root": info["root"],
                         "price": price,
                         "hist": [],
-                        "vol_change": self.compute_24h_volume_change(sym),
+                        "vol_change": vol_change,
                         "from_monitoring": True,
-                        "mtf_status": status
+                        "mtf_status": status,
+                        "negative_tfs": mtf_align.get("negative_tfs", []),
+                        "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                     }
                     newly_aligned.append(resolved_item)
                     

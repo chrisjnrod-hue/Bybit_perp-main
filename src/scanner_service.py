@@ -581,7 +581,7 @@ class Scanner:
                 else:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", vol)
                 prev = self._24h_volumes[symbol].get("previous", 0)
                 curr = self._24h_volumes[symbol].get("current", 0)
                 logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
@@ -783,9 +783,22 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate candidates for trade manager execution without triggering summary pushes
+                # Evaluate candidates for trade manager execution and capture the results
+                evaluated_signals = []
                 if root_signals:
-                    await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
+
+                # Dispatch Telegram summary messages
+                if hasattr(self.telegram, "send_summary"):
+                    try:
+                        await self.telegram.send_summary(
+                            root_signals=root_signals,
+                            evaluated=evaluated_signals,
+                            full_push=is_full_push,
+                            is_candle_open=is_full_push
+                        )
+                    except Exception:
+                        logger.exception("Failed to dispatch Telegram summary")
 
                 if is_full_push:
                     self.telegram.mark_full_push_sent()
@@ -960,7 +973,7 @@ class Scanner:
                         if marketcap is not None and marketcap < MARKET_CAP_MIN:
                             entry["accept"] = False
                             entry["reason"] = "market_cap_filtered"
-                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
+                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, MARKET_CAP_MIN)
                             evaluated.append(entry)
                             continue
                     except Exception:

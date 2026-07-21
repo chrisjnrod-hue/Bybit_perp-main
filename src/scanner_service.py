@@ -616,13 +616,8 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFs have just opened a new candle.
-        Returns list of ROOT_TFs that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
-        
-        For example, if ROOT_TFS = ["60", "240", "D"]:
-          - 60 (1h): candles open at :00 of each hour
-          - 240 (4h): candles open at :00 of 0, 4, 8, 12, 16, 20 UTC hours
-          - D (1d): candles open at 00:00 UTC
+        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
         now_struct = time.gmtime(now)
@@ -634,21 +629,16 @@ class Scanner:
             try:
                 tf_seconds = self._tf_to_seconds(tf)
                 
-                # For daily or higher, measure from midnight UTC
                 if tf in ("D", "W"):
                     if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
                         opens.append(tf)
                 else:
-                    # For minutes/hours: find how many seconds into the current candle we are
                     if tf_seconds >= 3600:
-                        # Hour-based TF (e.g., 1h, 4h, etc.)
                         candles_per_day = 86400 // tf_seconds
-                        candle_index = current_hour // (24 // candles_per_day)
                         seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
                         if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
                             opens.append(tf)
                     else:
-                        # Minute-based TF (e.g., 5, 15, 60)
                         seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
                         if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
                             opens.append(tf)
@@ -738,7 +728,7 @@ class Scanner:
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
 
-                                root_signals.append({
+                                sig_item = {
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
@@ -747,8 +737,16 @@ class Scanner:
                                     "start_at": start_at,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label
-                                })
+                                }
+                                root_signals.append(sig_item)
                                 logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
+                                
+                                # Send individual block per newly found root signal immediately
+                                if hasattr(self.telegram, "send_single_signal_block"):
+                                    try:
+                                        await self.telegram.send_single_signal_block(sig_item)
+                                    except Exception:
+                                        logger.exception("Failed to send single root signal block for %s %s", sym, root)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -767,57 +765,21 @@ class Scanner:
 
                 await self._check_monitored_symbols()
 
-                # Determine if this is a full push or scan interval push
                 now_ts = time.time()
-                
-                # FIXED: Detect which ROOT_TFs have candles opening now
-                tfs_opening_now = self._detect_tf_candle_opens(now_ts) if not ROOT_SCAN_INTERVAL else []
-                
                 is_full_push = self.telegram.check_full_push(now_ts)
-                is_candle_open = self.telegram.check_candle_open(now_ts)
 
-                logger.info("[PUSH_GATING] is_full_push=%s is_candle_open=%s tfs_opening_now=%s first_deploy=%s", 
-                           is_full_push, is_candle_open, tfs_opening_now, self.telegram.is_first_deploy())
+                if root_signals and is_full_push:
+                    for sig in root_signals:
+                        try:
+                            sym = sig["symbol"]
+                            if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
+                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                        except Exception:
+                            logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                evaluated = []
+                # Evaluate candidates for trade manager execution without triggering summary pushes
                 if root_signals:
-                    # Request MTF subscriptions only when we're allowed to process openings
-                    if is_full_push:
-                        for sig in root_signals:
-                            try:
-                                sym = sig["symbol"]
-                                if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                                    await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
-                            except Exception:
-                                logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
-
-                    # Always evaluate candidates
-                    evaluated = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
-                else:
-                    logger.info("No root signals this interval.")
-
-                # Send appropriate Telegram messages
-                # FIXED: Dispatch per TF that opened (if ROOT_SCAN_INTERVAL = 0)
-                if tfs_opening_now:
-                    for tf in tfs_opening_now:
-                        tf_signals = [sig for sig in root_signals if sig["root"] == tf]
-                        tf_evaluated = [e for e in evaluated if e["root"] == tf]
-                        logger.info("[TELEGRAM_DISPATCH] Sending summary for TF=%s (signals=%d, evaluated=%d)", tf, len(tf_signals), len(tf_evaluated))
-                        await self.telegram.send_summary(
-                            tf_signals, 
-                            evaluated=tf_evaluated, 
-                            full_push=is_full_push, 
-                            is_candle_open=is_candle_open,
-                            root_tf=tf
-                        )
-                else:
-                    # No per-TF dispatch; send aggregate summary
-                    await self.telegram.send_summary(
-                        root_signals, 
-                        evaluated=evaluated, 
-                        full_push=is_full_push, 
-                        is_candle_open=is_candle_open
-                    )
+                    await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
                 if is_full_push:
                     self.telegram.mark_full_push_sent()
@@ -832,23 +794,18 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                # FIXED: Align exactly to next 5-minute candle open (at :00 seconds)
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
-                # Calculate next 5-minute boundary minute marker
                 next_5m_minute = ((current_minute // 5) + 1) * 5
 
                 if next_5m_minute >= 60:
-                    # Wrap to next hour at :00
                     to_sleep = (60 - current_minute) * 60 - current_second
                 else:
-                    # Same hour, calculate sleep to target minute at :00 seconds
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
-                # Ensure we sleep at least 1 second but cap at 300 (5 minutes)
                 to_sleep = max(1, min(300, to_sleep))
                 
                 logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
@@ -890,14 +847,23 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
-                    newly_aligned.append({
+                    resolved_item = {
                         "symbol": sym,
                         "root": info["root"],
                         "price": price,
                         "hist": [],
                         "vol_change": self.compute_24h_volume_change(sym),
                         "from_monitoring": True,
-                    })
+                        "mtf_status": status
+                    }
+                    newly_aligned.append(resolved_item)
+                    
+                    # Send individual block per resolved MTF alignment immediately
+                    if hasattr(self.telegram, "send_single_signal_block"):
+                        try:
+                            await self.telegram.send_single_signal_block(resolved_item)
+                        except Exception:
+                            logger.exception("Failed to send single resolved MTF block for %s", sym)
                 else:
                     prev_neg = set(info.get("negative_tfs", []))
                     curr_neg = set(mtf_align.get("negative_tfs", []))
@@ -911,19 +877,9 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         if newly_aligned:
-            # When monitoring resolves we usually want to attempt openings right away
             await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
-        """Evaluate MTF alignment for each root signal and act on each scenario.
-
-        Trading gates applied:
-          - TRADE_RATING_MIN: numeric threshold for TV rating score (0.0 to 2.0)
-          - TRADE_NO_NEG_VOL: if True, require vol_change > 0 for trade opens
-          - MARKET_CAP_MIN: if >0, require symbol's market cap >= threshold
-
-        allow_open_trades: if False, the function will evaluate candidates and return 'evaluated' but will not place orders.
-        """
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
 
@@ -969,16 +925,13 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # FIXED: TV RATING FILTER - UNIFIED REJECTION HANDLING
-                # Check if TV score meets minimum threshold
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"
                     logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
                     evaluated.append(entry)
-                    continue  # Exit early: TV gate failed, no further processing
+                    continue
 
-                # apply market cap filter (if configured)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
                         symbol_info = await self.client.get_symbol_info(sym)
@@ -1000,43 +953,30 @@ class Scanner:
                             entry["reason"] = "market_cap_filtered"
                             logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
                             evaluated.append(entry)
-                            continue  # Exit early: market cap gate failed
+                            continue
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
-                        # fall through and let other gates decide
 
-                # volume gate: (existing config gate)
                 if VOLUME_FILTER_ENABLED:
-                    if vol_change is None:
+                    if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
                         entry["accept"] = False
                         entry["reason"] = "vol_filter_blocked"
-                        logger.info("Volume gate blocked open (no vol_change): %s", sym)
                         evaluated.append(entry)
-                        continue  # Exit early: volume gate failed
-                    elif vol_change < VOLUME_MIN_CHANGE_PCT:
-                        entry["accept"] = False
-                        entry["reason"] = "vol_filter_blocked"
-                        logger.info("Volume gate blocked open (vol_change %.3f < threshold %.3f): %s", vol_change, VOLUME_MIN_CHANGE_PCT, sym)
-                        evaluated.append(entry)
-                        continue  # Exit early: volume gate failed
+                        continue
                     else:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f (vol passed)", mtf_status, sym, root, score, tv_score)
                 else:
-                    # even if VOLUME_FILTER_DISABLED, enforce TRADE_NO_NEG_VOL if configured
                     if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                         entry["accept"] = False
                         entry["reason"] = "negvol_blocked"
-                        logger.info("Trade blocked by TRADE_NO_NEG_VOL (vol_change=%.4f): %s", vol_change, sym)
                         evaluated.append(entry)
-                        continue  # Exit early: negative volume gate failed
+                        continue
                     else:
                         entry["accept"] = True
                         entry["reason"] = mtf_status
                         to_open.append(entry)
-                        logger.info("MTF %s → ACCEPT: %s %s score=%.2f tv_score=%.4f", mtf_status, sym, root, score, tv_score)
 
             elif mtf_status == "monitoring":
                 entry["reason"] = "monitoring"
@@ -1048,25 +988,19 @@ class Scanner:
                         "negative_tfs": list(negative_tfs),
                         "last_alert": 0.0,
                     }
-                    logger.info("MTF MONITORING: %s added – waiting on: %s", sym, negative_tfs)
 
             evaluated.append(entry)
 
         await self._emit_event("candidates_evaluated", evaluated)
 
-        logger.warning("[CANDIDATES_SUMMARY] Total evaluated=%d, Accepted/To Open=%d, Monitoring now=%d",
-                       len(evaluated), len([e for e in evaluated if e.get("accept")]), len(self._mtf_monitoring))
-
         candidates = to_open
 
-        # If ROOT_FILTER is applied, pick top across roots first (preserve earlier behavior)
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
                 grouped.setdefault(c["root"], []).append(c)
 
             selected: List[Dict[str, Any]] = []
-            # Use PRIORITIZE_SLOT_ORDER to allocate slots across roots if provided; otherwise, use ROOT_TFS order
             order_list = PRIORITIZE_SLOT_ORDER if PRIORITIZE_SLOT_ORDER else ROOT_TFS
             remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
 
@@ -1076,12 +1010,10 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                # PRIORITIZE BY COMBINED SCORE (MTF + TV)
                 top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
 
-            # If still slots remain, fill from other roots by combined score
             if remaining_slots > 0:
                 remaining_candidates = [c for c in candidates if c not in selected]
                 remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
@@ -1089,7 +1021,6 @@ class Scanner:
 
             candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
         else:
-            # No root filter: apply global prioritization
             if PRIORITIZE_SLOT_ORDER:
                 remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
                 selected: List[Dict[str, Any]] = []
@@ -1102,7 +1033,6 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    # PRIORITIZE BY COMBINED SCORE
                     top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)
@@ -1114,16 +1044,9 @@ class Scanner:
             else:
                 candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
 
-        current_open = len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0
-        logger.info("Candidates to open after prioritization: %d (MAX_OPEN_TRADES=%d, currently_open=%d)",
-                    len(candidates), MAX_OPEN_TRADES, current_open)
-
-        # Build quick lookup for evaluated entries to keep them in sync
         eval_map: Dict[tuple, Dict[str, Any]] = {(e["symbol"], e["root"]): e for e in evaluated}
 
         if not allow_open_trades:
-            # Do not perform any actual opens here — evaluation happened above.
-            # Mark candidates as suppressed for visibility in summaries and in evaluated entries.
             for c in candidates:
                 c["open_suppressed"] = True
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1131,11 +1054,8 @@ class Scanner:
                     eval["open_suppressed"] = True
                     eval["accept"] = False
                     eval["reason"] = "open_suppressed"
-                logger.info("Open suppressed (gating) for %s %s combined_score=%.2f", c["symbol"], c["root"], self._compute_combined_score(c))
-            # Return evaluated (candidates are still present in evaluated via earlier entries)
             return evaluated
 
-        # Otherwise, perform openings (same logic as before)
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached – halting further opens.")
@@ -1145,9 +1065,7 @@ class Scanner:
             price = c["price"]
             vol_change = c.get("vol_change")
 
-            # Double-check TRADE_NO_NEG_VOL
             if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
-                logger.info("Trade blocked by TRADE_NO_NEG_VOL at final check for %s (vol_change=%.4f)", sym, vol_change)
                 c["accept"] = False
                 c["reason"] = "negvol_blocked"
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1164,7 +1082,6 @@ class Scanner:
             qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
-                logger.warning("Zero qty for %s after quantize – skipping.", sym)
                 c["accept"] = False
                 c["reason"] = "zero_qty"
                 eval = eval_map.get((c["symbol"], c["root"]))
@@ -1172,8 +1089,6 @@ class Scanner:
                     eval["accept"] = False
                     eval["reason"] = "zero_qty"
                 continue
-            if qty != qty_raw:
-                logger.debug("Qty for %s adjusted %s → %s (step=%s min=%s)", sym, qty_raw, qty, symbol_info.get("step"), symbol_info.get("min_qty"))
 
             side = "Buy"
             reason_tag = c.get("reason", "signal")
@@ -1181,7 +1096,6 @@ class Scanner:
                 try:
                     order = await self.client.create_order(sym, side, qty)
                     self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
-                    # Update eval map
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
                         eval["accept"] = True
@@ -1192,7 +1106,6 @@ class Scanner:
                         f"Price: {price} | Qty: {qty:.6f}\n"
                         f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                     )
-                    logger.info("Real trade opened %s qty=%s combined_score=%.2f tv_score=%.4f", sym, qty, self._compute_combined_score(c), c.get('tv_score', 0.0))
                 except Exception:
                     logger.exception("Failed to place order for %s", sym)
                     c["accept"] = False
@@ -1202,9 +1115,7 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
-                # simulated open
                 self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
-                logger.info("Simulated open %s qty=%s combined_score=%.2f tv_score=%.4f", sym, qty, self._compute_combined_score(c), c.get('tv_score', 0.0))
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True
@@ -1216,23 +1127,11 @@ class Scanner:
                     f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
                 )
 
-            # Remove from monitoring if present
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated
 
     def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
-        """
-        Compute combined score from MTF alignment score + TV rating score.
-        
-        Formula:
-          combined = (mtf_score * (1 - tv_weight)) + (tv_score * tv_weight)
-        
-        This allows TV_RATING_WEIGHT to control how much TV rating influences ranking:
-          - 0.0 = pure MTF alignment
-          - 0.3 = 70% MTF, 30% TV (default)
-          - 1.0 = pure TV rating
-        """
         mtf_score = candidate.get("score", 0.0)
         tv_score = candidate.get("tv_score", 0.0)
         combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)

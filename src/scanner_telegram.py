@@ -50,8 +50,9 @@ class TelegramSummary:
 
     def check_full_push(self, now_ts: float) -> bool:
         """Return True if this should be a full push (initial deploy or any root TF candle open)."""
+        is_full_push = False
         if self._first_deploy_push:
-            return True
+            is_full_push = True
 
         for rt in ROOT_TFS:
             try:
@@ -63,10 +64,10 @@ class TelegramSummary:
                 last = self._last_full_push_ts.get(rt)
                 if last != candle_start:
                     self._last_full_push_ts[rt] = candle_start
-                    return True
+                    is_full_push = True
             except Exception:
                 continue
-        return False
+        return is_full_push
 
     def check_candle_open(self, now_ts: float) -> bool:
         """Return True if any root TF candle just opened (and not the first deploy)."""

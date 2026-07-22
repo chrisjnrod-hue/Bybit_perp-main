@@ -647,6 +647,68 @@ class Scanner:
         
         return opens
 
+    async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
+        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
+        newly_aligned: List[Dict[str, Any]] = []
+        if not self._mtf_monitoring:
+            return newly_aligned
+
+        MONITORING_MAX_AGE = 86400
+        now = time.time()
+        to_remove: List[str] = []
+
+        for sym, info in list(self._mtf_monitoring.items()):
+            try:
+                if now - info.get("started_at", now) > MONITORING_MAX_AGE:
+                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
+                    to_remove.append(sym)
+                    continue
+
+                price = self._last_price_cache.get(sym)
+                if price is None:
+                    try:
+                        async with self.request_sem:
+                            price = await self.client.get_latest_price(sym)
+                        if price:
+                            self._last_price_cache[sym] = price
+                    except Exception:
+                        pass
+                if price is None:
+                    continue
+
+                mtf_align = self._compute_mtf_alignment(sym, price)
+                status = mtf_align["status"]
+
+                if status in ("aligned", "daily_rising"):
+                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
+                    to_remove.append(sym)
+                    vol_change = self.compute_24h_volume_change(sym)
+                    resolved_item = {
+                        "symbol": sym,
+                        "root": info["root"],
+                        "price": price,
+                        "hist": [],
+                        "vol_change": vol_change,
+                        "from_monitoring": True,
+                        "mtf_status": status,
+                        "negative_tfs": mtf_align.get("negative_tfs", []),
+                        "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
+                    }
+                    newly_aligned.append(resolved_item)
+                else:
+                    prev_neg = set(info.get("negative_tfs", []))
+                    curr_neg = set(mtf_align.get("negative_tfs", []))
+                    if curr_neg != prev_neg:
+                        self._mtf_monitoring[sym]["negative_tfs"] = list(curr_neg)
+                        self._mtf_monitoring[sym]["last_alert"] = now
+            except Exception:
+                logger.exception("Error checking monitored symbol %s", sym)
+
+        for sym in to_remove:
+            self._mtf_monitoring.pop(sym, None)
+
+        return newly_aligned
+
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
@@ -747,12 +809,6 @@ class Scanner:
                                 root_signals.append(sig_item)
                                 logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
                                 
-                                # Send individual block per newly found root signal immediately
-                                if hasattr(self.telegram, "send_single_signal_block"):
-                                    try:
-                                        await self.telegram.send_single_signal_block(sig_item)
-                                    except Exception:
-                                        logger.exception("Failed to send single root signal block for %s %s", sym, root)
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -769,7 +825,12 @@ class Scanner:
 
                 logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
 
-                await self._check_monitored_symbols()
+                # Capture newly aligned monitored signals and evaluate them immediately
+                newly_aligned = await self._check_monitored_symbols()
+                evaluated_aligned = []
+                if newly_aligned:
+                    # Allow execution for monitored signals that are now fully aligned
+                    evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
                 now_ts = time.time()
                 is_full_push = self.telegram.check_full_push(now_ts)
@@ -783,10 +844,15 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate candidates for trade manager execution and capture the results
+                # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
                     evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
+
+                # Combine both new signals and resolved monitoring signals for the Telegram summary
+                if newly_aligned:
+                    root_signals.extend(newly_aligned)
+                    evaluated_signals.extend(evaluated_aligned)
 
                 # Dispatch Telegram summary messages
                 if hasattr(self.telegram, "send_summary"):
@@ -830,76 +896,6 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
                            to_sleep, current_minute, current_second, next_5m_minute % 60)
                 await asyncio.sleep(to_sleep)
-
-    async def _check_monitored_symbols(self):
-        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
-        if not self._mtf_monitoring:
-            return
-
-        MONITORING_MAX_AGE = 86400
-        now = time.time()
-        to_remove: List[str] = []
-        newly_aligned: List[Dict[str, Any]] = []
-
-        for sym, info in list(self._mtf_monitoring.items()):
-            try:
-                if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
-                    to_remove.append(sym)
-                    continue
-
-                price = self._last_price_cache.get(sym)
-                if price is None:
-                    try:
-                        async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
-                        if price:
-                            self._last_price_cache[sym] = price
-                    except Exception:
-                        pass
-                if price is None:
-                    continue
-
-                mtf_align = self._compute_mtf_alignment(sym, price)
-                status = mtf_align["status"]
-
-                if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
-                    to_remove.append(sym)
-                    vol_change = self.compute_24h_volume_change(sym)
-                    resolved_item = {
-                        "symbol": sym,
-                        "root": info["root"],
-                        "price": price,
-                        "hist": [],
-                        "vol_change": vol_change,
-                        "from_monitoring": True,
-                        "mtf_status": status,
-                        "negative_tfs": mtf_align.get("negative_tfs", []),
-                        "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
-                    }
-                    newly_aligned.append(resolved_item)
-                    
-                    # Send individual block per resolved MTF alignment immediately
-                    if hasattr(self.telegram, "send_single_signal_block"):
-                        try:
-                            await self.telegram.send_single_signal_block(resolved_item)
-                        except Exception:
-                            logger.exception("Failed to send single resolved MTF block for %s", sym)
-                else:
-                    prev_neg = set(info.get("negative_tfs", []))
-                    curr_neg = set(mtf_align.get("negative_tfs", []))
-                    if curr_neg != prev_neg:
-                        self._mtf_monitoring[sym]["negative_tfs"] = list(curr_neg)
-                        self._mtf_monitoring[sym]["last_alert"] = now
-            except Exception:
-                logger.exception("Error checking monitored symbol %s", sym)
-
-        for sym in to_remove:
-            self._mtf_monitoring.pop(sym, None)
-
-        if newly_aligned:
-            await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []

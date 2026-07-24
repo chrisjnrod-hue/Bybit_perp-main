@@ -24,7 +24,8 @@ from .config import (
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
     MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
-    REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING
+    REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
+    MID_CANDLE_FLIP_MAX_SEC
 )
 from .telegram import send_message
 
@@ -95,9 +96,9 @@ class Scanner:
         self.telegram = TelegramSummary()
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MID_CANDLE_FLIP_MAX_SEC=%d",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
-            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
+            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MID_CANDLE_FLIP_MAX_SEC
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -580,11 +581,16 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     to_remove.append(sym)
                     vol_change = self.compute_24h_volume_change(sym)
+                    root_tf = info.get("root", "60")
+                    last_candles = self.kline_store.get(sym, {}).get(root_tf, [])
+                    start_at = last_candles[-1].get("start_at") if last_candles else None
+
                     resolved_item = {
                         "symbol": sym,
-                        "root": info["root"],
+                        "root": root_tf,
                         "price": price,
                         "hist": [],
+                        "start_at": start_at,
                         "vol_change": vol_change,
                         "from_monitoring": True,
                         "mtf_status": status,
@@ -773,6 +779,8 @@ class Scanner:
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
 
+        now_sec = time.time()
+
         for item in root_signals:
             sym = item["symbol"]
             price = item["price"]
@@ -780,6 +788,18 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
+
+            # Resolve candle start_at timestamp and check elapsed time since candle open
+            start_at = item.get("start_at")
+            if start_at is None:
+                last_candles = self.kline_store.get(sym, {}).get(root, [])
+                if last_candles:
+                    start_at = last_candles[-1].get("start_at")
+
+            elapsed_sec = None
+            if start_at is not None:
+                start_at_sec = (start_at / 1000.0) if start_at >= 1e11 else float(start_at)
+                elapsed_sec = max(0.0, now_sec - start_at_sec)
 
             hist = item.get("hist", [])
             if not hist:
@@ -812,9 +832,18 @@ class Scanner:
                 "reason": "pending",
                 "tv_label": tv_label,
                 "tv_score": tv_score,
+                "elapsed_sec": elapsed_sec,
             }
 
             if mtf_status in ("aligned", "daily_rising"):
+                # Mid candle flip filter: block opening trade if flip occurred past MID_CANDLE_FLIP_MAX_SEC
+                if MID_CANDLE_FLIP_MAX_SEC > 0 and elapsed_sec is not None and elapsed_sec > MID_CANDLE_FLIP_MAX_SEC:
+                    entry["accept"] = False
+                    entry["reason"] = "mid_candle_flip_blocked"
+                    evaluated.append(entry)
+                    logger.info("TRADE OPEN BLOCKED (Mid Candle Flip): %s %s elapsed %.1fs > threshold %ds", sym, root, elapsed_sec, MID_CANDLE_FLIP_MAX_SEC)
+                    continue
+
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"

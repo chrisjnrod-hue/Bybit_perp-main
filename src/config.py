@@ -1,4 +1,3 @@
-# config.py
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
@@ -88,6 +87,11 @@ FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
+# ---- Mid-Candle Flip Filter ----
+# Maximum allowed seconds since candle open to allow opening trades (0 = disabled).
+# e.g., 900 = 15m max elapsed, 300 = 5m max elapsed.
+MID_CANDLE_FLIP_MAX_SEC = safe_int_env("MID_CANDLE_FLIP_MAX_SEC", 0)
+
 # ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----
 # VOLUME_FILTER_ENABLED=true  → block trade opens when 24h vol change % is negative
 # VOLUME_FILTER_ENABLED=false → ignore volume, open trades freely (default: true)
@@ -117,8 +121,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # -------------------------
 # TradingView-like Technical Rating config (local implementation)
 # -------------------------
-# This block provides default indicator parameters, weights and mapping thresholds
-# used by the local TradingView-like "Technical Rating" computation. Tune as needed.
 TECHNICAL_RATING = {
     "enabled": True,
     "ta_backend": "pandas_ta",  # "pandas_ta" recommended (pure Python)

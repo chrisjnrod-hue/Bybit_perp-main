@@ -7,7 +7,7 @@ import asyncio
 import time
 import json
 from collections import defaultdict
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Tuple
 import math
 import inspect
 from decimal import getcontext
@@ -18,7 +18,7 @@ from .logger import get_logger
 from .bybit_client import BybitClient
 from .trade_manager import TradeManager
 from .ratelimiter import TokenBucket
-from .macd import slope  # used in a couple places still
+from .macd import slope
 from .config import (
     EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
     ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
@@ -31,6 +31,7 @@ from .telegram import send_message
 from .scanner_core import (
     tf_to_seconds,
     normalize_klines,
+    merge_klines,
     quantize_qty,
     compute_macd_from_closes,
     detect_flip_current_open,
@@ -47,27 +48,22 @@ SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
 try:
     TRADE_RATING_MIN = float(os.getenv("TRADE_RATING_MIN", "0.25"))
 except (ValueError, TypeError):
     TRADE_RATING_MIN = 0.25
 
-# TV rating weighting in combined score calculation (0.0 to 1.0, where 1.0 = 100% TV weight)
 try:
     TV_RATING_WEIGHT = float(os.getenv("TV_RATING_WEIGHT", "0.3"))
-    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))  # clamp to [0.0, 1.0]
+    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))
 except (ValueError, TypeError):
     TV_RATING_WEIGHT = 0.3
 
-# If TRADE_RATING_ALLOW is empty list -> allow any rating (backwards compatibility removed)
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
 PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
 
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
-
-# Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
 
@@ -90,11 +86,12 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
         
-        # Track which ROOT_TF candles have opened in the current cycle
+        # Signal deduplication cache: (symbol, root_tf, start_at) -> timestamp_fired
+        self._fired_signals: Dict[Tuple[str, str, int], float] = {}
+
         self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
-        # Initialize Telegram state manager
         self.telegram = TelegramSummary()
 
         logger.info(
@@ -135,6 +132,13 @@ class Scanner:
                 continue
         logger.debug("No client method among %s succeeded", names)
         return None
+
+    def _prune_fired_signals(self, now: float):
+        """Prune deduplication cache entries older than 24 hours."""
+        cutoff = now - 86400
+        expired = [k for k, v in self._fired_signals.items() if v < cutoff]
+        for k in expired:
+            del self._fired_signals[k]
 
     async def _get_symbols(self) -> List[str]:
         try:
@@ -304,38 +308,6 @@ class Scanner:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 
-                if DEBUG_SURGICAL_LOGS:
-                    try:
-                        if isinstance(raw, dict):
-                            logger.info("[SURGICAL_LOG_0] API_KEYS %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
-                            for key in ["list", "result", "data"]:
-                                if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
-                                    first_item = raw[key][0]
-                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s",
-                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
-                                    break
-                        elif isinstance(raw, (list, tuple)):
-                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s",
-                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
-                    except Exception as e:
-                        logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
-
-                if DEBUG_SURGICAL_LOGS:
-                    try:
-                        if isinstance(raw, dict) and "list" in raw:
-                            sample_raw = raw["list"][:3] if isinstance(raw["list"], list) else raw["list"]
-                        elif isinstance(raw, dict) and "result" in raw:
-                            sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
-                        elif isinstance(raw, dict) and "data" in raw:
-                            sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
-                        elif isinstance(raw, list):
-                            sample_raw = raw[:3]
-                        else:
-                            sample_raw = str(raw)[:200]
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
-                    except Exception as e:
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, str(e)[:100])
-
                 normalized = normalize_klines(raw, tf)
 
                 valid = []
@@ -359,26 +331,10 @@ class Scanner:
                     except Exception:
                         continue
 
-                if DEBUG_SURGICAL_LOGS:
-                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d",
-                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
-                    if len(valid) == 0 and len(normalized) > 0:
-                        sample_norm = normalized[:2]
-                        logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
-
                 if not valid:
-                    try:
-                        txt = json.dumps(raw, default=str)
-                    except Exception:
-                        txt = str(raw)
-                    snippet_trunc = (txt[:500] + '...') if len(txt) > 500 else txt
-                    logger.debug("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
                     continue
 
-                try:
-                    klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
-                except Exception:
-                    klines_sorted = valid
+                klines_sorted = merge_klines([], valid)
                 self.kline_store[symbol][tf] = klines_sorted
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
@@ -404,7 +360,7 @@ class Scanner:
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
     async def _rest_poller(self):
-        """REST poller as fallback when WS is unavailable."""
+        """REST poller fallback using sequential timestamp merging."""
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
         poll_count = 0
         try:
@@ -427,32 +383,9 @@ class Scanner:
                                 normalized = normalize_klines(data, tf) if data else []
 
                                 if normalized:
-                                    lst = self.kline_store.get(sym, {}).get(tf, [])
-                                    last_new = None
-
-                                    for c in reversed(normalized):
-                                        if c.get("close") is not None:
-                                            last_new = {
-                                                "start_at": c.get("start_at"),
-                                                "open": c.get("open"),
-                                                "high": c.get("high"),
-                                                "low": c.get("low"),
-                                                "close": float(c.get("close")),
-                                                "volume": c.get("volume")
-                                            }
-                                            break
-
-                                    if last_new:
-                                        if lst:
-                                            try:
-                                                if lst[-1].get("start_at") == last_new.get("start_at"):
-                                                    lst[-1] = last_new
-                                                else:
-                                                    lst.append(last_new)
-                                            except Exception:
-                                                self.kline_store.setdefault(sym, {})[tf] = [last_new]
-                                        else:
-                                            self.kline_store.setdefault(sym, {})[tf] = [last_new]
+                                    existing = self.kline_store.get(sym, {}).get(tf, [])
+                                    updated = merge_klines(existing, normalized)
+                                    self.kline_store.setdefault(sym, {})[tf] = updated
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -478,7 +411,6 @@ class Scanner:
         logger.info("REST poller stopped")
 
     async def _ensure_rest_poller(self):
-        """Ensure REST poller is running as fallback when WS is unavailable."""
         if USE_WS and self.client.is_ws_connected():
             if self._rest_poller_task and not self._rest_poller_task.done():
                 try:
@@ -495,7 +427,6 @@ class Scanner:
         logger.info("[REST_POLLER_START] WS unavailable, starting REST poller as fallback")
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
-    # Wrappers that use core helpers
     def _tf_to_seconds(self, tf: str) -> int:
         return tf_to_seconds(tf)
 
@@ -507,15 +438,18 @@ class Scanner:
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
-        Build closes list from kline_store and call core.compute_macd_from_closes.
-        The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
+        Build closes list and invoke compute_macd_from_closes with safe boundary price injection.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
+        last_start_at = None
+
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
+                    if c.get("start_at") is not None:
+                        last_start_at = int(c.get("start_at"))
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
@@ -532,21 +466,26 @@ class Scanner:
             except Exception:
                 pass
 
-        return compute_macd_from_closes(closes, include_price=current_price)
+        append_live = False
+        if last_start_at is not None:
+            tf_sec = tf_to_seconds(tf)
+            now_ms = int(time.time() * 1000)
+            last_start_ms = last_start_at if last_start_at >= 1e11 else last_start_at * 1000
+            if now_ms >= (last_start_ms + (tf_sec * 1000)):
+                append_live = True
+
+        return compute_macd_from_closes(closes, include_price=current_price, append_live=append_live)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume data - tries multiple client method names and keys for robustness."""
         try:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
-                logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
-            # Normalize nested shapes
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], (dict, list)):
                     if isinstance(data["data"], dict):
@@ -581,13 +520,7 @@ class Scanner:
                 else:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", vol)
-                prev = self._24h_volumes[symbol].get("previous", 0)
-                curr = self._24h_volumes[symbol].get("current", 0)
-                logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
                 return vol
-            else:
-                logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
         except Exception:
             logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
         return None
@@ -614,41 +547,7 @@ class Scanner:
             return closes
         return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
-    def _detect_tf_candle_opens(self, now: float) -> List[str]:
-        """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
-        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
-        """
-        opens = []
-        now_struct = time.gmtime(now)
-        current_hour = now_struct.tm_hour
-        current_minute = now_struct.tm_min
-        current_second = now_struct.tm_sec
-        
-        for tf in ROOT_TFS:
-            try:
-                tf_seconds = self._tf_to_seconds(tf)
-                
-                if tf in ("D", "W"):
-                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
-                        opens.append(tf)
-                else:
-                    if tf_seconds >= 3600:
-                        candles_per_day = 86400 // tf_seconds
-                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-                    else:
-                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-            except Exception:
-                logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
-        
-        return opens
-
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
-        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
         newly_aligned: List[Dict[str, Any]] = []
         if not self._mtf_monitoring:
             return newly_aligned
@@ -660,7 +559,6 @@ class Scanner:
         for sym, info in list(self._mtf_monitoring.items()):
             try:
                 if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
                     to_remove.append(sym)
                     continue
 
@@ -680,7 +578,6 @@ class Scanner:
                 status = mtf_align["status"]
 
                 if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
                     vol_change = self.compute_24h_volume_change(sym)
                     resolved_item = {
@@ -715,27 +612,24 @@ class Scanner:
 
         while not self._stop:
             loop_count += 1
+            now_ts = time.time()
+            self._prune_fired_signals(now_ts)
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
 
             start = time.time()
             try:
                 if not self.symbols:
-                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
                     await self.discover_symbols()
                     if self.symbols:
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
                     else:
-                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
                         await asyncio.sleep(10)
                         continue
 
                 await self._ensure_rest_poller()
 
                 root_signals: List[Dict[str, Any]] = []
-                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
                     try:
@@ -755,13 +649,9 @@ class Scanner:
                             return
 
                         self._last_price_cache[sym] = price
-
-                        # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
                         for root in ROOT_TFS:
-                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
-
                             macd_line, sig, hist = self.compute_macd_for(
                                 sym,
                                 root,
@@ -771,26 +661,21 @@ class Scanner:
 
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
 
-                            logger.info(
-                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
-                                sym,
-                                root,
-                                flip
-                            )
-
                             if hist and flip:
-                                vol_change = self.compute_24h_volume_change(sym)
-                                start_at = None
-                                try:
-                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                    if last_candles:
-                                        start_at = last_candles[-1].get("start_at")
-                                except Exception:
-                                    start_at = None
+                                last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                start_at = last_candles[-1].get("start_at") if last_candles else None
 
+                                # Deduplication Check: avoid second flip signal on same candle cycle
+                                sig_key = (sym, root, start_at)
+                                if start_at is not None and sig_key in self._fired_signals:
+                                    logger.debug("[DEDUP] Signal already fired for %s %s at start_at=%s; skipping duplicate", sym, root, start_at)
+                                    continue
+
+                                if start_at is not None:
+                                    self._fired_signals[sig_key] = time.time()
+
+                                vol_change = self.compute_24h_volume_change(sym)
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                                
-                                # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
                                 sig_item = {
@@ -823,16 +708,11 @@ class Scanner:
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
-                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
-
-                # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
                 evaluated_aligned = []
                 if newly_aligned:
-                    # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
-                now_ts = time.time()
                 is_full_push = self.telegram.check_full_push(now_ts)
 
                 if root_signals and is_full_push:
@@ -844,17 +724,14 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
                     evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
-                # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
                     root_signals.extend(newly_aligned)
                     evaluated_signals.extend(evaluated_aligned)
 
-                # Dispatch Telegram summary messages
                 if hasattr(self.telegram, "send_summary"):
                     try:
                         await self.telegram.send_summary(
@@ -876,14 +753,12 @@ class Scanner:
 
             if ROOT_SCAN_INTERVAL:
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
-                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
                 now = time.time()
                 now_struct = time.gmtime(now)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
-
                 next_5m_minute = ((current_minute // 5) + 1) * 5
 
                 if next_5m_minute >= 60:
@@ -892,9 +767,6 @@ class Scanner:
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(1, min(300, to_sleep))
-                
-                logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
-                           to_sleep, current_minute, current_second, next_5m_minute % 60)
                 await asyncio.sleep(to_sleep)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
@@ -946,7 +818,6 @@ class Scanner:
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"
-                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
                     evaluated.append(entry)
                     continue
 
@@ -969,7 +840,6 @@ class Scanner:
                         if marketcap is not None and marketcap < MARKET_CAP_MIN:
                             entry["accept"] = False
                             entry["reason"] = "market_cap_filtered"
-                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, MARKET_CAP_MIN)
                             evaluated.append(entry)
                             continue
                     except Exception:
@@ -1076,7 +946,6 @@ class Scanner:
 
         for c in candidates:
             if not self.trade_manager.can_open():
-                logger.info("Max open trades reached – halting further opens.")
                 break
 
             sym = c["symbol"]

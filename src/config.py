@@ -1,3 +1,4 @@
+# config.py - COMPLETE UPDATED VERSION
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
@@ -87,11 +88,6 @@ FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
-# ---- Mid-Candle Flip Filter ----
-# Maximum allowed seconds since candle open to allow opening trades (0 = disabled).
-# e.g., 900 = 15m max elapsed, 300 = 5m max elapsed.
-MID_CANDLE_FLIP_MAX_SEC = safe_int_env("MID_CANDLE_FLIP_MAX_SEC", 0)
-
 # ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----
 # VOLUME_FILTER_ENABLED=true  → block trade opens when 24h vol change % is negative
 # VOLUME_FILTER_ENABLED=false → ignore volume, open trades freely (default: true)
@@ -111,6 +107,31 @@ MTF_1D_ALLOW_NEGATIVE_RISING = safe_bool_env("MTF_1D_ALLOW_NEGATIVE_RISING", Tru
 
 MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
 
+# ---- MACD Flip & Candle Age Filtering ----
+# Prevent mid-candle flips from opening trades.
+# FLIP_CANDLE_AGE_MAX_SEC: maximum age (seconds) of a candle where flip is considered "fresh"
+# When a flip is detected on a candle older than this threshold, the trade is blocked
+# Set to 0 to accept flips at any candle age (old behavior; not recommended)
+# Recommended: 300 (5 min), 600 (10 min), or 900 (15 min)
+FLIP_CANDLE_AGE_MAX_SEC = safe_int_env("FLIP_CANDLE_AGE_MAX_SEC", 300)
+
+# Signal deduplication: cache window to prevent the same candle from re-triggering a signal
+# Tracks (symbol, timeframe, candle_open_time) across scan cycles
+# Set to 0 to disable deduplication (not recommended; causes duplicate signals)
+SIGNAL_DEDUP_WINDOW = safe_int_env("SIGNAL_DEDUP_WINDOW", 60)
+
+# ---- TV Rating Trade Filters ----
+# Minimum TV rating score required to open a trade
+# Typical scale: 0.0 (Neutral), 0.25 (Buy), 0.6 (Strong Buy)
+# Set to 0.0 to disable (allow any aligned signal regardless of TV rating)
+# Recommended: 0.25 (Buy) or 0.4 (Conservative)
+TRADE_RATING_MIN = safe_float_env("TRADE_RATING_MIN", 0.25)
+
+# When True, sort candidates by TV rating (highest first) during slot allocation
+# This ensures the best-rated signals get priority when MAX_OPEN_TRADES is reached
+# Works with ROOT_FILTER=true, PRIORITIZE_SLOT_ORDER, or standalone mode
+TRADE_RATING_PRIORITIZE = safe_bool_env("TRADE_RATING_PRIORITIZE", True)
+
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
@@ -121,6 +142,8 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # -------------------------
 # TradingView-like Technical Rating config (local implementation)
 # -------------------------
+# This block provides default indicator parameters, weights and mapping thresholds
+# used by the local TradingView-like "Technical Rating" computation. Tune as needed.
 TECHNICAL_RATING = {
     "enabled": True,
     "ta_backend": "pandas_ta",  # "pandas_ta" recommended (pure Python)

@@ -517,13 +517,18 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
+        Includes intelligent logic to append vs replace current_price based on timeframe.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
+        last_start_at = 0
+        
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
+                    if c.get("start_at") is not None:
+                        last_start_at = int(c.get("start_at"))
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
@@ -540,7 +545,21 @@ class Scanner:
             except Exception:
                 pass
 
-        return compute_macd_from_closes(closes, include_price=current_price)
+        if current_price is not None:
+            tf_secs = self._tf_to_seconds(tf)
+            now = time.time()
+            
+            # If real time has passed the close time of the last cached candle, append!
+            if last_start_at > 0 and now >= (last_start_at + tf_secs):
+                closes.append(current_price)
+            else:
+                if closes:
+                    closes[-1] = current_price
+                else:
+                    closes.append(current_price)
+
+        # Pass include_price=None so scanner_core doesn't overwrite it again
+        return compute_macd_from_closes(closes, include_price=None)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)
@@ -850,14 +869,11 @@ class Scanner:
 
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
-                                start_at = None
-                                try:
-                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                    if last_candles:
-                                        start_at = last_candles[-1].get("start_at")
-                                except Exception:
-                                    start_at = None
-
+                                
+                                # Mathematically calculate the true start of the current candle
+                                tf_secs = self._tf_to_seconds(root)
+                                start_at = (int(now) // tf_secs) * tf_secs
+                                
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now)
                                 

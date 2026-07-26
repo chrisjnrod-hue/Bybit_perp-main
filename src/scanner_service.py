@@ -517,18 +517,16 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        Includes intelligent logic to append vs replace current_price based on timeframe.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
-        last_start_at = 0
+        last_start_at = None
         
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
-                    if c.get("start_at") is not None:
-                        last_start_at = int(c.get("start_at"))
+                    last_start_at = c.get("start_at")
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
@@ -544,21 +542,23 @@ class Scanner:
                     current_price = float(ws_last.get("close"))
             except Exception:
                 pass
-
+                
         if current_price is not None:
-            tf_secs = self._tf_to_seconds(tf)
-            now = time.time()
-            
-            # If real time has passed the close time of the last cached candle, append!
-            if last_start_at > 0 and now >= (last_start_at + tf_secs):
-                closes.append(current_price)
-            else:
-                if closes:
-                    closes[-1] = current_price
-                else:
+            if last_start_at is not None:
+                tf_sec = self._tf_to_seconds(tf)
+                now = time.time()
+                # Use a small 2-second tolerance for clock drift or early wakeup.
+                # If current time has advanced past the close of the last stored candle,
+                # we must append current_price as a NEW candle instead of overwriting the previous.
+                if (now + 2) - int(last_start_at) >= tf_sec:
                     closes.append(current_price)
+                else:
+                    if closes:
+                        closes[-1] = current_price
+            else:
+                closes.append(current_price)
 
-        # Pass include_price=None so scanner_core doesn't overwrite it again
+        # Pass None so compute_macd_from_closes doesn't blindly overwrite our logic
         return compute_macd_from_closes(closes, include_price=None)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
@@ -630,20 +630,38 @@ class Scanner:
         def _get_closes(tf: str) -> List[float]:
             items = self.kline_store.get(symbol, {}).get(tf, [])
             closes = []
+            last_start_at = None
+            
             for c in items:
                 try:
                     if isinstance(c, dict) and c.get("close") is not None:
                         closes.append(float(c.get("close")))
+                        last_start_at = c.get("start_at")
                     elif isinstance(c, (int, float)):
                         closes.append(float(c))
                 except Exception:
                     continue
+                    
+            if last_start_at is not None:
+                tf_sec = self._tf_to_seconds(tf)
+                now = time.time()
+                # 2-second tolerance for clock drift or early wakeup.
+                if (now + 2) - int(last_start_at) >= tf_sec:
+                    closes.append(price)
+                else:
+                    if closes:
+                        closes[-1] = price
+            elif price is not None:
+                closes.append(price)
+                
             return closes
-        return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
+            
+        # Pass price=None so compute_mtf_alignment/compute_macd_from_closes doesn't overwrite our logic
+        return compute_mtf_alignment(_get_closes, None, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -869,11 +887,22 @@ class Scanner:
 
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
-                                
-                                # Mathematically calculate the true start of the current candle
-                                tf_secs = self._tf_to_seconds(root)
-                                start_at = (int(now) // tf_secs) * tf_secs
-                                
+                                start_at = None
+                                try:
+                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                    if last_candles and last_candles[-1].get("start_at") is not None:
+                                        store_start = int(last_candles[-1].get("start_at"))
+                                        tf_sec = self._tf_to_seconds(root)
+                                        now_int = int(now + 2)
+                                        # Deduce the true timestamp of the newly opened candle, even if WS is lagging
+                                        if now_int - store_start >= tf_sec:
+                                            missed_candles = (now_int - store_start) // tf_sec
+                                            start_at = store_start + (missed_candles * tf_sec)
+                                        else:
+                                            start_at = store_start
+                                except Exception:
+                                    start_at = None
+
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now)
                                 

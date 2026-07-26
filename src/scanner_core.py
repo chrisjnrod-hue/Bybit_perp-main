@@ -1,5 +1,5 @@
-# scanner_core.py - NO CHANGES TO THIS FILE
-# Included for completeness - remains the same as before
+# scanner_core.py
+
 """
 scanner_core.py
 
@@ -67,6 +67,10 @@ def tf_to_seconds(tf: str) -> int:
                 return int(s[:-1]) * 86400
             except Exception:
                 return 24 * 3600
+        if s == "W" or s.endswith("w"):
+            if s == "W":
+                return 7 * 24 * 3600
+            return int(s[:-1]) * 7 * 24 * 3600
         return int(s) * 60
     except Exception:
         return 60
@@ -671,7 +675,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         return 0.0, "Neutral"
 
 
-def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
+def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: Optional[float], mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
     """
     Evaluate MTF alignment across timeframes.
     get_closes_fn(tf) -> list of closes for that tf (most recent last).

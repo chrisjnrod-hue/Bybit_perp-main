@@ -99,6 +99,11 @@ class Scanner:
         # Prevents same candle from generating multiple signals across scan cycles
         self._signal_cache: Dict[Tuple[str, str, int], float] = {}
 
+        # NEW: Flip state tracker for deduplication
+        # Tracks (symbol, tf) -> {"processed": bool, "timestamp": float}
+        # This prevents signals on subsequent green candles after an initial flip
+        self._flip_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
 
@@ -520,13 +525,10 @@ class Scanner:
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
-        last_start_at = None
-        
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
-                    last_start_at = c.get("start_at")
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
@@ -542,24 +544,8 @@ class Scanner:
                     current_price = float(ws_last.get("close"))
             except Exception:
                 pass
-                
-        if current_price is not None:
-            if last_start_at is not None:
-                tf_sec = self._tf_to_seconds(tf)
-                now = time.time()
-                # Use a small 2-second tolerance for clock drift or early wakeup.
-                # If current time has advanced past the close of the last stored candle,
-                # we must append current_price as a NEW candle instead of overwriting the previous.
-                if (now + 2) - int(last_start_at) >= tf_sec:
-                    closes.append(current_price)
-                else:
-                    if closes:
-                        closes[-1] = current_price
-            else:
-                closes.append(current_price)
 
-        # Pass None so compute_macd_from_closes doesn't blindly overwrite our logic
-        return compute_macd_from_closes(closes, include_price=None)
+        return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)
@@ -630,38 +616,20 @@ class Scanner:
         def _get_closes(tf: str) -> List[float]:
             items = self.kline_store.get(symbol, {}).get(tf, [])
             closes = []
-            last_start_at = None
-            
             for c in items:
                 try:
                     if isinstance(c, dict) and c.get("close") is not None:
                         closes.append(float(c.get("close")))
-                        last_start_at = c.get("start_at")
                     elif isinstance(c, (int, float)):
                         closes.append(float(c))
                 except Exception:
                     continue
-                    
-            if last_start_at is not None:
-                tf_sec = self._tf_to_seconds(tf)
-                now = time.time()
-                # 2-second tolerance for clock drift or early wakeup.
-                if (now + 2) - int(last_start_at) >= tf_sec:
-                    closes.append(price)
-                else:
-                    if closes:
-                        closes[-1] = price
-            elif price is not None:
-                closes.append(price)
-                
             return closes
-            
-        # Pass price=None so compute_mtf_alignment/compute_macd_from_closes doesn't overwrite our logic
-        return compute_mtf_alignment(_get_closes, None, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
+        return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        Detect which ROOT_TFS have just opened a new candle.
+        FIXED: Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -691,6 +659,62 @@ class Scanner:
                 logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
         
         return opens
+
+    def _should_generate_flip_signal(self, symbol: str, tf: str, hist_cur: Optional[float], hist_prev: Optional[float], now: float) -> bool:
+        """
+        Determines if a flip signal should be generated based on MACD histogram state.
+        Prevents duplicate signals on subsequent green candles by tracking flip state.
+        
+        Returns True only on the FIRST flip (prev <= 0 -> cur > 0), then False for subsequent green candles.
+        Resets when histogram goes negative again.
+        """
+        if SIGNAL_DEDUP_WINDOW <= 0:
+            # Deduplication disabled; generate signal on any flip
+            return hist_prev is not None and hist_prev <= 0 and hist_cur is not None and hist_cur > 0
+        
+        if hist_cur is None or hist_prev is None:
+            return False
+        
+        state_key = (symbol, tf)
+        current_state = self._flip_state.get(state_key, {})
+        
+        # If histogram is negative or zero, we're not in a "flipped" state
+        if hist_cur <= 0:
+            # Reset: histogram went back down, clear the flip state
+            if state_key in self._flip_state:
+                del self._flip_state[state_key]
+            return False
+        
+        # Histogram is positive (hist_cur > 0)
+        # Check if this is the FIRST positive candle after a flip
+        if hist_prev <= 0 and hist_cur > 0:
+            # This is a flip event: negative/zero -> positive
+            logger.debug(
+                "FLIP_DETECTED (new): %s %s hist_prev=%.6f hist_cur=%.6f",
+                symbol, tf, hist_prev, hist_cur
+            )
+            # Mark as processed and return True
+            self._flip_state[state_key] = {"processed": True, "timestamp": now}
+            return True
+        
+        # Histogram is still positive but previous was also positive (or we already processed this flip)
+        # Check if we already sent a signal for this flip sequence
+        if current_state.get("processed"):
+            time_since = now - current_state.get("timestamp", now)
+            if time_since < SIGNAL_DEDUP_WINDOW:
+                logger.debug(
+                    "FLIP_DUPLICATE_BLOCKED: %s %s (already signaled %.1f sec ago, within window=%.0f sec)",
+                    symbol, tf, time_since, SIGNAL_DEDUP_WINDOW
+                )
+                return False
+            else:
+                # Signal expired; allow new signal
+                self._flip_state[state_key] = {"processed": True, "timestamp": now}
+                return True
+        
+        # No previous flip signal tracked; allow it
+        self._flip_state[state_key] = {"processed": True, "timestamp": now}
+        return True
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
         """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
@@ -778,42 +802,6 @@ class Scanner:
             logger.debug("Error checking candle age: %s", e)
             return False
 
-    def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
-        """
-        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
-        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
-        Caches the signal timestamp to prevent re-triggers across scan cycles.
-        """
-        if SIGNAL_DEDUP_WINDOW <= 0:
-            # Deduplication disabled
-            return True
-        
-        if candle_open_time is None:
-            logger.debug("Cannot dedupe signal: candle_open_time is None")
-            return True
-        
-        try:
-            cache_key = (symbol, tf, int(candle_open_time))
-            
-            if cache_key in self._signal_cache:
-                last_signal_time = self._signal_cache[cache_key]
-                time_since_last = now - last_signal_time
-                
-                if time_since_last < SIGNAL_DEDUP_WINDOW:
-                    logger.debug(
-                        "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
-                        symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
-                    )
-                    return False
-            
-            # Signal is new or cache expired; update cache
-            self._signal_cache[cache_key] = now
-            logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
-            return True
-        except Exception as e:
-            logger.debug("Error in dedupe check: %s", e)
-            return True
-
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
@@ -886,35 +874,30 @@ class Scanner:
                             )
 
                             if hist and flip:
+                                # NEW: Use the improved flip signal check to prevent duplicate signals
+                                hist_cur = hist[-1] if hist else None
+                                hist_prev = hist[-2] if len(hist) >= 2 else None
+                                
+                                should_signal = self._should_generate_flip_signal(sym, root, hist_cur, hist_prev, now)
+                                
+                                if not should_signal:
+                                    logger.info("SIGNAL REJECTED (flip already signaled in window): %s %s @ %s", sym, root, price)
+                                    continue
+
                                 vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                    if last_candles and last_candles[-1].get("start_at") is not None:
-                                        store_start = int(last_candles[-1].get("start_at"))
-                                        tf_sec = self._tf_to_seconds(root)
-                                        now_int = int(now + 2)
-                                        # Deduce the true timestamp of the newly opened candle, even if WS is lagging
-                                        if now_int - store_start >= tf_sec:
-                                            missed_candles = (now_int - store_start) // tf_sec
-                                            start_at = store_start + (missed_candles * tf_sec)
-                                        else:
-                                            start_at = store_start
+                                    if last_candles:
+                                        start_at = last_candles[-1].get("start_at")
                                 except Exception:
                                     start_at = None
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now)
                                 
-                                # Check if this signal was already generated in recent past (deduplication)
-                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now)
-
                                 if not candle_age_ok:
                                     logger.info("SIGNAL REJECTED (candle too old): %s %s @ %s", sym, root, price)
-                                    continue
-                                
-                                if not is_new_signal:
-                                    logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)

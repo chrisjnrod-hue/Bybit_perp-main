@@ -23,50 +23,65 @@ from .scanner_core import (
 )
 from .scanner_telegram import TelegramSummary
 from .telegram import send_message
-from .config import (
-    EXCLUDE_STABLECOINS, CONCURRENCY, KLINE_SEED_LIMIT,
-    ROOT_TFS, MTF_TFS, ROOT_SCAN_INTERVAL, TRADE_ENABLED,
-    MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
-    MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
-    REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
-    FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE,
-    PRIORITIZE_SLOT_ORDER
-)
+# Import the config module object and read attributes via getattr to avoid import-time failures
+from . import config as cfg
 
 logger = get_logger("scanner.scan")
+
+# Read config values with safe defaults
+EXCLUDE_STABLECOINS = getattr(cfg, "EXCLUDE_STABLECOINS", [])
+CONCURRENCY = getattr(cfg, "CONCURRENCY", 4)
+KLINE_SEED_LIMIT = getattr(cfg, "KLINE_SEED_LIMIT", 100)
+ROOT_TFS = getattr(cfg, "ROOT_TFS", ["5", "15", "60", "240"])
+MTF_TFS = getattr(cfg, "MTF_TFS", ["5", "15", "60", "240", "D"])
+ROOT_SCAN_INTERVAL = getattr(cfg, "ROOT_SCAN_INTERVAL", 0)
+TRADE_ENABLED = getattr(cfg, "TRADE_ENABLED", False)
+MTF_SLOPE_LOOKBACK = getattr(cfg, "MTF_SLOPE_LOOKBACK", 3)
+ROOT_FILTER = getattr(cfg, "ROOT_FILTER", False)
+ROOT_TOP_N = getattr(cfg, "ROOT_TOP_N", None)
+MAX_OPEN_TRADES = getattr(cfg, "MAX_OPEN_TRADES", 5)
+USE_WS = getattr(cfg, "USE_WS", False)
+MAX_CONCURRENT_REQUESTS = getattr(cfg, "MAX_CONCURRENT_REQUESTS", 8)
+REQUEST_BATCH_SIZE = getattr(cfg, "REQUEST_BATCH_SIZE", 32)
+REQUEST_BATCH_DELAY = getattr(cfg, "REQUEST_BATCH_DELAY", 0.1)
+REST_POLL_INTERVAL = getattr(cfg, "REST_POLL_INTERVAL", 10)
+VOLUME_FILTER_ENABLED = getattr(cfg, "VOLUME_FILTER_ENABLED", False)
+VOLUME_MIN_CHANGE_PCT = getattr(cfg, "VOLUME_MIN_CHANGE_PCT", 0.15)
+TECHNICAL_RATING = getattr(cfg, "TECHNICAL_RATING", {})
+FLIP_CANDLE_AGE_MAX_SEC = getattr(cfg, "FLIP_CANDLE_AGE_MAX_SEC", 120)
+SIGNAL_DEDUP_WINDOW = getattr(cfg, "SIGNAL_DEDUP_WINDOW", 30)
+TRADE_RATING_MIN = getattr(cfg, "TRADE_RATING_MIN", 0)
+TRADE_RATING_PRIORITIZE = getattr(cfg, "TRADE_RATING_PRIORITIZE", False)
+# Optional config items with env fallback
+TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
+try:
+    MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", str(getattr(cfg, "MARKET_CAP_MIN", 0)) or 0))
+except Exception:
+    MARKET_CAP_MIN = 0.0
+try:
+    TV_RATING_WEIGHT = float(os.getenv("TV_RATING_WEIGHT", "0.3"))
+    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))
+except Exception:
+    TV_RATING_WEIGHT = getattr(cfg, "TV_RATING_WEIGHT", 0.3)
+PRIORITIZE_SLOT_ORDER = [p.strip() for p in (getattr(cfg, "PRIORITIZE_SLOT_ORDER", os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(","))) if p.strip()]
 
 SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# Compatibility fallbacks for optional config values (some deployments may not export them)
-TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
-try:
-    MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
-except Exception:
-    MARKET_CAP_MIN = 0.0
-
-try:
-    TRADE_RATING_MIN_VAL = float(os.getenv("TRADE_RATING_MIN", str(TRADE_RATING_MIN)))
-except (ValueError, TypeError):
-    TRADE_RATING_MIN_VAL = TRADE_RATING_MIN
-
-try:
-    TV_RATING_WEIGHT = float(os.getenv("TV_RATING_WEIGHT", "0.3"))
-    TV_RATING_WEIGHT = max(0.0, min(1.0, TV_RATING_WEIGHT))
-except (ValueError, TypeError):
-    TV_RATING_WEIGHT = 0.3
-
-PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
-
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 
+# Telegram summary dispatch window (in seconds)
 TELEGRAM_DISPATCH_WINDOW = 5
+
 
 class ScannerScan:
     def __init__(self, client: BybitClient, rate_limiter: TokenBucket):
         self.rate_limiter = rate_limiter
         self.client = client
+        self.trade_manager = None  # not owned here (kept in wrapper)
+        self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
+        self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
         self._stop = False
@@ -78,25 +93,22 @@ class ScannerScan:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
 
-        self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
-        self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
-
         # Track which ROOT_TF candles have opened in the current cycle
         self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
-        # Dedup cache: keys = (symbol, tf, candle_open_time) -> last_signal_time
+        # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
         self._signal_cache: Dict[Tuple[str, str, int], float] = {}
 
-        # Telegram summary state
+        # Initialize Telegram state manager
         self.telegram = TelegramSummary()
 
         logger.info(
-            "scanner scan initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
-            "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
+            "TRADE_RATING_MIN=%s TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
             "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
-            TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
+            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
             TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
@@ -545,6 +557,7 @@ class ScannerScan:
                 logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
+            # Normalize nested shapes
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], (dict, list)):
                     if isinstance(data["data"], dict):
@@ -580,6 +593,9 @@ class ScannerScan:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
                 logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                prev = self._24h_volumes[symbol].get("previous", 0)
+                curr = self._24h_volumes[symbol].get("current", 0)
+                logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
                 return vol
             else:
                 logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
@@ -663,7 +679,7 @@ class ScannerScan:
         return opens
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
-        """Re-evaluate symbols waiting for their last negative TF to flip."""
+        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
         newly_aligned: List[Dict[str, Any]] = []
         if not self._mtf_monitoring:
             return newly_aligned
@@ -728,7 +744,7 @@ class ScannerScan:
         """
         Check if a candle is fresh enough for trading.
         Returns True if:
-        - FLIP_CANDLE_AGE_MAX_SEC is 0 (disabled), or
+        - FLIP_CANDLE_AGE_MAX_SEC is 0 (disabled, any age OK), or
         - candle age is within acceptable window
         """
         if FLIP_CANDLE_AGE_MAX_SEC <= 0:
@@ -750,16 +766,18 @@ class ScannerScan:
 
     def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
         """
-        Check if (symbol, tf, candle_open_time) has already generated a signal recently.
-        Returns True if NEW (not cached within SIGNAL_DEDUP_WINDOW), False if duplicate.
+        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
+        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
+        Caches the signal timestamp to prevent re-triggers across scan cycles.
         """
         if SIGNAL_DEDUP_WINDOW <= 0:
+            # Deduplication disabled
             return True
-
+        
         if candle_open_time is None:
             logger.debug("Cannot dedupe signal: candle_open_time is None")
             return True
-
+        
         try:
             cache_key = (symbol, tf, int(candle_open_time))
             
@@ -774,7 +792,7 @@ class ScannerScan:
                     )
                     return False
             
-            # Signal is new or expired; update cache
+            # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
             return True
@@ -829,7 +847,7 @@ class ScannerScan:
 
                         self._last_price_cache[sym] = price
 
-                        # Ensure 24h volume is updated
+                        # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
                         now = time.time()
@@ -854,7 +872,7 @@ class ScannerScan:
                             )
 
                             if hist and flip:
-                                # Use a canonical current candle start (UTC-aligned) instead of stored kline start (which may lag)
+                                vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
                                     # Prefer deterministic computed start time
@@ -862,12 +880,10 @@ class ScannerScan:
                                 except Exception:
                                     start_at = None
 
-                                vol_change = self.compute_24h_volume_change(sym)
-
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now)
                                 
-                                # Check dedupe against canonical candle start
+                                # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now)
 
                                 if not candle_age_ok:
@@ -880,7 +896,7 @@ class ScannerScan:
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
                                 
-                                # Pre-compute MTF alignment so immediate blocks never show N/A
+                                # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
                                 sig_item = {
@@ -918,7 +934,9 @@ class ScannerScan:
 
                 # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
+                evaluated_aligned = []
                 if newly_aligned:
+                    # Allow execution for monitored signals that are now fully aligned
                     await self._emit_event("root_signals_ready", {"root_signals": newly_aligned, "allow_open_trades": True})
 
                 now_ts = time.time()
@@ -933,7 +951,7 @@ class ScannerScan:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate new candidates for trade execution by emitting them to trade evaluator via event/callback
+                # Evaluate new candidates for trade manager execution
                 if root_signals:
                     await self._emit_event("root_signals_ready", {"root_signals": root_signals, "allow_open_trades": is_full_push})
 

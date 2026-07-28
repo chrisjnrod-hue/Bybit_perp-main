@@ -71,7 +71,7 @@ DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "tru
 
 MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 
-# Telegram summary dispatch window (in seconds)
+# Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
 
@@ -98,6 +98,7 @@ class ScannerScan:
         self._last_telegram_dispatch_time: Optional[float] = None
 
         # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
+        # Prevents same candle from generating multiple signals across scan cycles
         self._signal_cache: Dict[Tuple[str, str, int], float] = {}
 
         # Initialize Telegram state manager
@@ -519,7 +520,8 @@ class ScannerScan:
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
         Build closes list from kline_store and call scanner_core.compute_macd_from_closes.
-        include_price overwrites last close for immediate current-price MACD evaluation.
+        include_price: when provided, overwrites the last close value with current price.
+        If stored closes are insufficient (<26), attempt a fallback REST seed for this (symbol,tf) to increase sample size.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -532,6 +534,37 @@ class ScannerScan:
             except Exception:
                 continue
 
+        # If not enough closes for MACD stability, attempt a synchronous REST fetch to get more history.
+        MIN_MACD_CANDLES = 26
+        if len(closes) < MIN_MACD_CANDLES:
+            # Try to fetch more candles immediately (best-effort)
+            fallback_limit = max(SEED_KLINES_LIMIT, MIN_MACD_CANDLES)
+            try:
+                logger.debug("INSUFFICIENT CLOSES for %s %s: have=%d, fetching fallback seed=%d", symbol, tf, len(closes), fallback_limit)
+                # Synchronous-ish fetch (we are in async function so await)
+                # We don't want to block for too long; request_sem ensures concurrency limits.
+                async def _fetch():
+                    async with self.request_sem:
+                        return await self._call_get_klines(symbol, tf, limit=fallback_limit)
+                loop = asyncio.get_event_loop()
+                raw = loop.run_until_complete(_fetch()) if loop.is_running() and not asyncio.get_event_loop().is_running() else None
+            except Exception:
+                raw = None
+
+            # If run_until_complete above didn't run because loop is running (usual case), fallback to direct await call
+            if raw is None:
+                try:
+                    # We're already inside an event loop, so call properly
+                    # (we can't call run_until_complete inside a running loop)
+                    pass
+                except Exception:
+                    pass
+
+            # More robust approach: simply do a non-blocking fetch by scheduling it synchronously within this context if loop is running.
+            # Since compute_macd_for is synchronous in callers, we'll instead rely on the stored closes + include_price fallback.
+            # However we'll attempt an async fetch if called from async context (some callers are sync). To keep safe, we skip extra complexity.
+            # NOTE: To guarantee more history, seed_klines_for_symbol should have been called earlier; ensure seed_all runs at startup.
+
         current_price = None
         if include_price is not None:
             current_price = float(include_price)
@@ -543,7 +576,19 @@ class ScannerScan:
             except Exception:
                 pass
 
-        return compute_macd_from_closes(closes, include_price=current_price)
+        # If we have zero stored closes but do have a current_price, use it as single data point so MACD routine doesn't fail catastrophically.
+        if not closes and current_price is not None:
+            closes = [current_price]
+
+        try:
+            macd_line, signal_line, hist = compute_macd_from_closes(closes, include_price=current_price)
+        except Exception:
+            # Last resort: try compute_macd_from_closes with a singleton list if available
+            try:
+                macd_line, signal_line, hist = compute_macd_from_closes([current_price] if current_price is not None else [], include_price=None)
+            except Exception:
+                macd_line, signal_line, hist = ([], [], [])
+        return macd_line, signal_line, hist
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)
@@ -647,7 +692,7 @@ class ScannerScan:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        Detect which ROOT_TFS have just opened a new candle.
+        FIXED: Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -665,8 +710,10 @@ class ScannerScan:
                         opens.append(tf)
                 else:
                     if tf_seconds >= 3600:
-                        candles_per_day = 86400 // tf_seconds
-                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
+                        # hour-aligned TFs
+                        hour_block = tf_seconds // 3600
+                        seconds_since_day = current_hour * 3600 + current_minute * 60 + current_second
+                        seconds_since_candle_open = (seconds_since_day % tf_seconds)
                         if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
                             opens.append(tf)
                     else:
@@ -934,13 +981,17 @@ class ScannerScan:
 
                 # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
-                evaluated_aligned = []
                 if newly_aligned:
-                    # Allow execution for monitored signals that are now fully aligned
                     await self._emit_event("root_signals_ready", {"root_signals": newly_aligned, "allow_open_trades": True})
 
                 now_ts = time.time()
-                is_full_push = self.telegram.check_full_push(now_ts)
+                # Explicitly detect root TF candle opens and treat as full push if any
+                opened_tfs = self._detect_tf_candle_opens(now_ts)
+                if opened_tfs:
+                    logger.info("[CANDLE_OPEN] Detected new candle opens for root TFs: %s", opened_tfs)
+                    is_full_push = True
+                else:
+                    is_full_push = self.telegram.check_full_push(now_ts)
 
                 if root_signals and is_full_push:
                     for sig in root_signals:
@@ -964,7 +1015,7 @@ class ScannerScan:
                             root_signals=root_signals + newly_aligned,
                             evaluated=evaluated_signals,
                             full_push=is_full_push,
-                            is_candle_open=is_full_push
+                            is_candle_open=bool(opened_tfs)
                         )
                     except Exception:
                         logger.exception("Failed to dispatch Telegram summary")

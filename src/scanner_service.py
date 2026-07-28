@@ -1,6 +1,5 @@
 # scanner_service.py
 # Top-level wrapper that composes the scan and trade modules and exposes Scanner
-import time
 import asyncio
 from typing import Optional
 
@@ -40,7 +39,6 @@ class Scanner:
         )
 
         # Wire events: scan will call back to this Scanner when it has signals
-        # Use simple callback registration
         self.scan.register_callback(self._on_event)
 
         # Task bookkeeping for run/stop compatibility
@@ -50,8 +48,8 @@ class Scanner:
 
     async def _on_event(self, event: str, payload):
         """
-        Handle events emitted by scan module. We expect at least 'root_signals_ready'
-        with payload: {"root_signals": [...], "allow_open_trades": bool}
+        Handle events emitted by scan module. Expect 'root_signals_ready' with payload:
+            {"root_signals": [...], "allow_open_trades": bool}
         """
         try:
             if event == "root_signals_ready":
@@ -63,7 +61,7 @@ class Scanner:
                     self.trade_eval.send_message_fn = send_message
 
                 evaluated = await self.trade_eval.handle_root_signals(root_signals, allow_open_trades=allow_open_trades)
-                # emit evaluated back to scan as event
+                # emit evaluated back to scan as event (scan may listen)
                 await self.scan._emit_event("candidates_evaluated_result", evaluated)
         except Exception:
             logger.exception("Error handling event from scan module")
@@ -85,5 +83,3 @@ class Scanner:
         logger.info("Stopping scanner wrapper...")
         # delegate to scan module stop machinery
         self.scan.stop()
-
-# Backwards compatibility: `from .scanner_service import Scanner` still works.

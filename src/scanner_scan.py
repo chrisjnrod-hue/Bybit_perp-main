@@ -6,7 +6,7 @@ import time
 import json
 import math
 import inspect
-from typing import Dict, List, Any, Optional, Callable, Tuple, Iterable, Coroutine
+from typing import Dict, List, Any, Optional, Callable, Tuple, Iterable
 from collections import defaultdict
 
 from .logger import get_logger
@@ -30,7 +30,7 @@ from .config import (
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
     FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE,
-    MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
+    PRIORITIZE_SLOT_ORDER
 )
 
 logger = get_logger("scanner.scan")
@@ -39,8 +39,12 @@ SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# TRADE_NO_NEG_VOL is not necessarily exported from config; compute locally (backwards compat)
+# Compatibility fallbacks for optional config values (some deployments may not export them)
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
+try:
+    MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
+except Exception:
+    MARKET_CAP_MIN = 0.0
 
 try:
     TRADE_RATING_MIN_VAL = float(os.getenv("TRADE_RATING_MIN", str(TRADE_RATING_MIN)))
@@ -914,12 +918,8 @@ class ScannerScan:
 
                 # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
-                evaluated_aligned = []
                 if newly_aligned:
-                    # When fully aligned, allow open
                     await self._emit_event("root_signals_ready", {"root_signals": newly_aligned, "allow_open_trades": True})
-                    # The trade evaluator will emit candidates_evaluated_result which we could process if desired
-                    # For the immediate Telegram summary we will gather later
 
                 now_ts = time.time()
                 is_full_push = self.telegram.check_full_push(now_ts)
@@ -938,7 +938,6 @@ class ScannerScan:
                     await self._emit_event("root_signals_ready", {"root_signals": root_signals, "allow_open_trades": is_full_push})
 
                 # Dispatch Telegram summary messages
-                # We'll attempt to gather candidates_evaluated_result via callback, but for now send summary from available data
                 evaluated_signals = []  # can be populated by listening to 'candidates_evaluated_result' event if desired
 
                 if hasattr(self.telegram, "send_summary"):

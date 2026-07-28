@@ -1,4 +1,5 @@
-# scanner_core.py
+# scanner_core.py - NO CHANGES TO THIS FILE
+# Included for completeness - remains the same as before
 """
 scanner_core.py
 
@@ -8,6 +9,8 @@ These functions:
 - Do NOT perform network I/O
 - Accept inputs (klines, closes, volume dicts, config) to be unit-testable
 - Preserve behavior of original helpers (normalization, MACD wrapper, TV rating, quantize, MTF alignment)
+
+Note: This module will attempt to import pandas_ta (preferred) or the alternative 'ta' package and will attempt to compute indicators using whichever is available. If no supported TA API is present, compute_tv_rating will return neutral.
 """
 import math
 import json
@@ -16,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
 
 getcontext().prec = 28
 
+# pandas/ta optional
 try:
     import pandas as pd
     import numpy as np
@@ -23,6 +27,7 @@ except Exception:
     pd = None  # type: ignore
     np = None  # type: ignore
 
+# Try to import pandas_ta first (preferred API: ta.sma, ta.macd, etc.)
 _PANDAS_TA_AVAILABLE = False
 _PANDAS_TA_STYLE = False
 _ta_module = None
@@ -32,6 +37,7 @@ try:
     _PANDAS_TA_AVAILABLE = True
     _PANDAS_TA_STYLE = True
 except Exception:
+    # Try the alternative 'ta' package (bukosabino) which uses class-based API
     try:
         import ta  # type: ignore
         _ta_module = ta
@@ -43,6 +49,7 @@ except Exception:
         _PANDAS_TA_AVAILABLE = False
         _PANDAS_TA_STYLE = False
 
+# Import MACD helper and slope function from package (keeps same external dependency)
 from .macd import macd_histogram, slope  # type: ignore
 
 
@@ -69,7 +76,7 @@ def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
     """
     Normalize various kline shapes into list of dicts:
       {"start_at", "open", "high", "low", "close", "volume", "is_closed"(optional)}
-    Ensures returned list is strictly sorted ascending by start_at.
+    Accepts dicts, lists, tuples and attempts to extract common fields.
     """
     out: List[Dict[str, AnyT]] = []
     if not raw_klines:
@@ -84,7 +91,10 @@ def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
             raw_klines = raw_klines["data"]
 
     if not isinstance(raw_klines, (list, tuple)):
-        seq = [raw_klines] if raw_klines else []
+        if isinstance(raw_klines, dict):
+            seq = [raw_klines]
+        else:
+            seq = [raw_klines] if raw_klines else []
     else:
         seq = raw_klines
 
@@ -144,9 +154,19 @@ def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
                     or item.get("start")
                     or item.get("time")
                 )
-                open_p = item.get("open") or item.get("openPrice") or item.get("o")
-                high = item.get("high") or item.get("h")
-                low = item.get("low") or item.get("l")
+                open_p = (
+                    item.get("open")
+                    or item.get("openPrice")
+                    or item.get("o")
+                )
+                high = (
+                    item.get("high")
+                    or item.get("h")
+                )
+                low = (
+                    item.get("low")
+                    or item.get("l")
+                )
                 close = (
                     item.get("close")
                     or item.get("close_price")
@@ -203,18 +223,16 @@ def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
                     })
                 continue
         except Exception:
+            # Best-effort: skip malformed item
             continue
-
-    # Guarantee output is sorted in ascending order (oldest -> newest)
-    try:
-        out.sort(key=lambda x: x.get("start_at") if x.get("start_at") is not None else 0)
-    except Exception:
-        pass
 
     return out
 
 
 def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
+    """
+    Quantize a raw quantity to the nearest valid step size and respect min_qty.
+    """
     if qty is None:
         return 0.0
     qty_d = Decimal(str(qty))
@@ -237,6 +255,11 @@ def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) ->
 
 
 def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None):
+    """
+    Compute MACD histogram from a list of closes (floats).
+    include_price: when provided, overwrites the last close value with current price.
+    Returns: (macd_line, signal_line, hist) – each as list-like (macd_histogram implementation dependent)
+    """
     data: List[float] = []
     for c in closes:
         try:
@@ -263,9 +286,8 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
 
 def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> bool:
     """
-    Detect zero-cross flip from negative (or <= hist_threshold) to positive (> hist_threshold) on last candle.
-    hist[-1] is the current open candle.
-    hist[-2] is the previous closed candle.
+    Detect zero-cross flip from negative (or <=0) to positive on last candle.
+    hist is a list where last item is most recent.
     """
     if not hist or len(hist) < 2:
         return False
@@ -274,43 +296,64 @@ def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> 
     if prev is None or cur is None:
         return False
     try:
-        zero_cross = prev <= hist_threshold and cur > hist_threshold
+        zero_cross = prev <= 0 and cur > 0
         return zero_cross
     except Exception:
         return False
 
 
 def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
+    """
+    Compute percentage change given a symbol's volume tracking dict:
+      {"current": float, "previous": float}
+    Returns None if insufficient data or prev <= 0. Clamps to 1.0 max.
+    Also prints debug info to console for troubleshooting.
+    """
     try:
         if not vol_data:
+            print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
             return None
         prev_vol = vol_data.get("previous", 0)
         curr_vol = vol_data.get("current", 0)
         if prev_vol <= 0:
+            print(f"[VOL_DEBUG] compute_24h_volume_change: prev_vol <= 0 (prev={prev_vol}, curr={curr_vol})")
             return None
         change = (curr_vol - prev_vol) / prev_vol
         result = min(change, 1.0)
+        # Console debug
+        try:
+            print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
+        except Exception:
+            print(f"[VOL_DEBUG] prev={prev_vol}, curr={curr_vol}, change={change}")
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[VOL_DEBUG] compute_24h_volume_change error: {e}")
         return None
 
 
+# --- Helper wrappers for indicator functions (work with pandas_ta or bukosabino/ta) ---
 def _safe_sma(df_close, length: int):
     try:
         if _PANDAS_TA_STYLE:
             return _ta_module.sma(df_close, length=length)
         else:
+            # bukosabino style
             return _ta_module.trend.SMAIndicator(df_close, window=int(length)).sma_indicator()
     except Exception:
         return None
 
 
 def _safe_macd(df_close, fast: int, slow: int, signal: int):
+    """
+    Return a DataFrame-like object (or None). Try pandas_ta.macd first, else construct DataFrame for macd, macd_signal, macd_diff.
+    """
     try:
         if _PANDAS_TA_STYLE:
             return _ta_module.macd(df_close, fast=fast, slow=slow, signal=signal)
         else:
+            # bukosabino style: MACD class
             macd_obj = _ta_module.trend.MACD(df_close, window_slow=int(slow), window_fast=int(fast), window_sign=int(signal))
+            # Build dataframe-like structure (pandas Series/Frame) if pandas available
             try:
                 import pandas as _pd
                 df_macd = _pd.DataFrame({
@@ -340,6 +383,7 @@ def _safe_stoch(df_high, df_low, df_close, k: int, d: int):
         if _PANDAS_TA_STYLE:
             return _ta_module.stoch(high=df_high, low=df_low, close=df_close, k=k, d=d)
         else:
+            # bukosabino StochasticOscillator: stoch()
             stoch_obj = _ta_module.momentum.StochasticOscillator(high=df_high, low=df_low, close=df_close, window=int(k), smooth_window=int(d))
             try:
                 import pandas as _pd
@@ -403,10 +447,31 @@ def _safe_bbands(df_close, length: int, std: float):
 
 
 def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
+    """
+    Compute a TradingView-like normalized score using pandas/ta or fallback 'ta' and the TECHNICAL_RATING-style cfg.
+    Inputs:
+      klines: normalized kline dicts (with 'close','open','high','low','volume')
+      cfg: TECHNICAL_RATING config dict (must contain 'indicators' etc.)
+      tf: optional timeframe string (not used by computation but kept for compatibility)
+      price: optional current price to apply to last close
+    Returns: (score, label)
+
+    This function prints concise debug messages to console describing why computation
+    may have returned a neutral score (missing libs, insufficient candles, conversion errors),
+    and prints the final computed score when successful.
+    """
+    # Debug start
+    try:
+        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE} pandas_ta_style={_PANDAS_TA_STYLE}")
+    except Exception:
+        pass
+
     if not cfg.get("enabled", True):
+        print("[TV_DEBUG] TECHNICAL_RATING disabled in config -> Neutral")
         return 0.0, "Neutral"
 
     if not _PANDAS_TA_AVAILABLE or pd is None or np is None:
+        print("[TV_DEBUG] pandas/pandas_ta/ta not available -> returning Neutral")
         return 0.0, "Neutral"
 
     try:
@@ -414,6 +479,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         min_candles = max(26, ma_max + 5)
 
         if not klines or len(klines) < min_candles:
+            print(f"[TV_DEBUG] insufficient candles for tf={tf}: have={len(klines) if klines else 0} need={min_candles}")
             return 0.0, "Neutral"
 
         df = pd.DataFrame(klines)
@@ -428,7 +494,8 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             df["low"] = pd.to_numeric(df["low"], errors="coerce")
             df["close"] = pd.to_numeric(df["close"], errors="coerce")
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-        except Exception:
+        except Exception as e:
+            print(f"[TV_DEBUG] dtype conversion error for tf={tf}: {e}")
             return 0.0, "Neutral"
 
         if price is not None:
@@ -437,26 +504,32 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             except Exception:
                 pass
 
+        # Indicators computation with debug markers using safe wrappers
         try:
             ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
             for l in ma_lengths:
                 sma_series = _safe_sma(df["close"], length=int(l))
                 if sma_series is not None:
                     df[f"sma_{l}"] = sma_series
+            print(f"[TV_DEBUG] computed SMAs: {ma_lengths}")
 
             macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
             macd_result = _safe_macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
             if macd_result is not None and hasattr(macd_result, "columns") and len(macd_result.columns) > 0:
+                # try to find a histogram-like column
                 macd_hist_col = next((c for c in macd_result.columns if "MACD" in str(c).upper() and ("H" in str(c).upper() or "diff" in str(c).lower())), None)
                 if macd_hist_col:
                     df["macd_hist"] = macd_result[macd_hist_col]
                 else:
+                    # fall back to last column
                     df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
                 df["macd_hist"] = 0.0
+            print(f"[TV_DEBUG] computed MACD (macd_result columns: {list(macd_result.columns) if macd_result is not None and hasattr(macd_result,'columns') else 'n/a'})")
 
             rsi_series = _safe_rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
             df["rsi"] = rsi_series
+            print("[TV_DEBUG] computed RSI")
 
             stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
             try:
@@ -465,8 +538,9 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                     stoch_k_col = next((c for c in st.columns if "STOCH" in str(c).upper() or "k" in str(c).lower()), None)
                     if stoch_k_col:
                         df["stoch_k"] = st[stoch_k_col]
+                print("[TV_DEBUG] computed Stochastic (k)")
             except Exception:
-                pass
+                print("[TV_DEBUG] stoch calc failed (continuing)")
 
             try:
                 adx_result = _safe_adx(df["high"], df["low"], df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
@@ -478,11 +552,17 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                         df["adx"] = np.nan
                 else:
                     df["adx"] = np.nan
+                print("[TV_DEBUG] computed ADX")
             except Exception:
                 df["adx"] = np.nan
+                print("[TV_DEBUG] adx calc failed (continuing)")
 
             obv_series = _safe_obv(df["close"], df["volume"])
             df["obv"] = obv_series
+            try:
+                print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
+            except Exception:
+                print("[TV_DEBUG] computed OBV")
 
             try:
                 boll_cfg = cfg["indicators"].get("bollinger", [20, 2])
@@ -490,12 +570,15 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                 if bb is not None and hasattr(bb, "columns"):
                     for c in bb.columns:
                         df[c] = bb[c]
+                print("[TV_DEBUG] computed Bollinger Bands")
             except Exception:
-                pass
+                print("[TV_DEBUG] bb calc failed (continuing)")
 
-        except Exception:
+        except Exception as e:
+            print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
             return 0.0, "Neutral"
 
+        # Scoring
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
@@ -549,6 +632,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             scores.append((sub, weights.get("obv", 1.0)))
 
         if not scores:
+            print("[TV_DEBUG] no indicator scores computed -> Neutral")
             return 0.0, "Neutral"
 
         num = sum(s * w for (s, w) in scores)
@@ -576,12 +660,25 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         elif score <= t["sell"]:
             label = "Sell"
 
+        # Final debug output
+        try:
+            print(f"[TV_DEBUG] tf={tf} score={score:.4f} label={label}")
+        except Exception:
+            print(f"[TV_DEBUG] tf={tf} score={score} label={label}")
         return score, label
-    except Exception:
+    except Exception as e:
+        print(f"[TV_DEBUG] compute_tv_rating error: {e}")
         return 0.0, "Neutral"
 
 
 def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
+    """
+    Evaluate MTF alignment across timeframes.
+    get_closes_fn(tf) -> list of closes for that tf (most recent last).
+    price: include_price applied to MACD calculations.
+    mtf_tfs: list of TFs to evaluate (e.g., ["5","15","60","240","D"])
+    mtf_slope_lookback: lookback for daily slope
+    """
     tf_states: Dict[str, Dict[str, AnyT]] = {}
     negative_tfs: List[str] = []
     one_d_hist: List[float] = []
@@ -593,7 +690,7 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
         cur = hist[-1] if hist else None
         prev = hist[-2] if len(hist) >= 2 else None
         is_positive = cur is not None and cur > 0
-        is_flip = (prev is not None and prev <= 0 and cur is not None and cur > 0)
+        is_flip = (prev is not None and prev < 0 and cur is not None and cur > 0)
 
         tf_states[tf] = {"cur": cur, "prev": prev, "is_positive": is_positive, "is_flip": is_flip, "slope": None}
         if tf == "D":

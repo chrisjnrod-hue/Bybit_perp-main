@@ -1,19 +1,35 @@
 # scanner_trade.py
 # Trade evaluation, scoring and trade opening logic (moved out of the large scanner module).
+import os
 import math
 import time
 import asyncio
 from typing import Dict, Any, List, Optional, Callable
 
 from .logger import get_logger
-from .config import (
-    TRADE_ENABLED, TRADE_NO_NEG_VOL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT,
-    TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE, ROOT_FILTER, MAX_OPEN_TRADES,
-    PRIORITIZE_SLOT_ORDER, ROOT_TFS, TV_RATING_WEIGHT
-)
+from . import config as cfg
 from .telegram import send_message
 
 logger = get_logger("scanner.trade")
+
+# Read config values with safe defaults to avoid import-time errors
+TRADE_ENABLED = getattr(cfg, "TRADE_ENABLED", False)
+VOLUME_FILTER_ENABLED = getattr(cfg, "VOLUME_FILTER_ENABLED", False)
+VOLUME_MIN_CHANGE_PCT = getattr(cfg, "VOLUME_MIN_CHANGE_PCT", 0.15)
+TRADE_RATING_PRIORITIZE = getattr(cfg, "TRADE_RATING_PRIORITIZE", False)
+ROOT_FILTER = getattr(cfg, "ROOT_FILTER", False)
+MAX_OPEN_TRADES = getattr(cfg, "MAX_OPEN_TRADES", 5)
+PRIORITIZE_SLOT_ORDER = getattr(cfg, "PRIORITIZE_SLOT_ORDER", os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(","))
+ROOT_TFS = getattr(cfg, "ROOT_TFS", ["5", "15", "60", "240"])
+TV_RATING_WEIGHT = getattr(cfg, "TV_RATING_WEIGHT", float(os.getenv("TV_RATING_WEIGHT", "0.3")))
+TRADE_RATING_MIN = getattr(cfg, "TRADE_RATING_MIN", float(os.getenv("TRADE_RATING_MIN", "0")))
+
+# Compatibility fallbacks
+TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
+try:
+    MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", str(getattr(cfg, "MARKET_CAP_MIN", 0)) or 0))
+except Exception:
+    MARKET_CAP_MIN = 0.0
 
 class TradeEvaluator:
     """
@@ -94,18 +110,40 @@ class TradeEvaluator:
             if mtf_status in ("aligned", "daily_rising"):
                 # TV rating filter
                 try:
-                    min_val = float(TRADE_RATING_MIN)
+                    min_val = float(os.getenv("TRADE_RATING_MIN", str(TRADE_RATING_MIN)))
                 except Exception:
-                    try:
-                        min_val = float(TRADE_RATING_MIN)
-                    except Exception:
-                        min_val = 0.0
-                if TRADE_RATING_MIN and tv_score < TRADE_RATING_MIN:
+                    min_val = 0.0
+                if min_val > 0.0 and tv_score < min_val:
                     entry["accept"] = False
                     entry["reason"] = f"tv_rating_below_threshold_{tv_score:.4f}"
-                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
+                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, min_val)
                     evaluated.append(entry)
                     continue
+
+                if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
+                    try:
+                        symbol_info = await self.client.get_symbol_info(sym)
+                        marketcap = None
+                        if isinstance(symbol_info, dict):
+                            for key in ("market_cap", "marketCap", "market_cap_usd", "marketcap"):
+                                if key in symbol_info and symbol_info.get(key) is not None:
+                                    try:
+                                        marketcap = float(symbol_info.get(key))
+                                        break
+                                    except Exception:
+                                        try:
+                                            marketcap = float(str(symbol_info.get(key)).replace(',', ''))
+                                            break
+                                        except Exception:
+                                            marketcap = None
+                        if marketcap is not None and marketcap < MARKET_CAP_MIN:
+                            entry["accept"] = False
+                            entry["reason"] = "market_cap_filtered"
+                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
+                            evaluated.append(entry)
+                            continue
+                    except Exception:
+                        logger.exception("Market cap check failed for %s", sym)
 
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
@@ -133,19 +171,20 @@ class TradeEvaluator:
 
             evaluated.append(entry)
 
-        # Prioritize by TV rating if enabled
         candidates = to_open
+
+        # ---- PRIORITIZE BY TV RATING ----
         if TRADE_RATING_PRIORITIZE and candidates:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
             logger.info("Sorted %d candidates by TV rating (highest first)", len(candidates))
 
-        # Slot and root filtering logic: (kept similar structure to prior)
+        # Slot/root selection
         if ROOT_FILTER:
-            grouped = {}
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
                 grouped.setdefault(c["root"], []).append(c)
 
-            selected = []
+            selected: List[Dict[str, Any]] = []
             order_list = PRIORITIZE_SLOT_ORDER if PRIORITIZE_SLOT_ORDER else ROOT_TFS
             remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
 
@@ -168,8 +207,8 @@ class TradeEvaluator:
         else:
             if PRIORITIZE_SLOT_ORDER:
                 remaining_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
-                selected = []
-                grouped = {}
+                selected: List[Dict[str, Any]] = []
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
                 for c in candidates:
                     grouped.setdefault(c["root"], []).append(c)
                 for rt in PRIORITIZE_SLOT_ORDER:
@@ -189,7 +228,6 @@ class TradeEvaluator:
             else:
                 candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
 
-        # If opens suppressed, mark and return
         if not allow_open_trades:
             for c in candidates:
                 c["open_suppressed"] = True
@@ -200,7 +238,6 @@ class TradeEvaluator:
                     eval_present["reason"] = "open_suppressed"
             return evaluated
 
-        # Open trades (or simulate)
         for c in candidates:
             if not self.trade_manager.can_open():
                 logger.info("Max open trades reached – halting further opens.")

@@ -517,21 +517,30 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
+
+        Fix: intelligently append or replace the last close with include_price so we do
+        not accidentally overwrite a closed candle (which caused flip detection to shift).
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
+        last_kline_start: Optional[int] = None
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
+                    last_kline_start = c.get("start_at") if last_kline_start is None else c.get("start_at")
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
                 continue
 
+        # Determine current price (best-effort)
         current_price = None
         if include_price is not None:
-            current_price = float(include_price)
+            try:
+                current_price = float(include_price)
+            except Exception:
+                current_price = None
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
                 ws_last = self.client.get_ws_latest_kline(symbol, tf)
@@ -540,7 +549,48 @@ class Scanner:
             except Exception:
                 pass
 
-        return compute_macd_from_closes(closes, include_price=current_price)
+        # If we have a current price, decide whether to replace the last close (if it is the open candle)
+        # or append a new close value representing the ongoing candle. This avoids overwriting a closed
+        # candle and thus shifting the histogram by one candle.
+        if current_price is not None:
+            try:
+                tf_seconds = self._tf_to_seconds(tf)
+                now = time.time()
+                # calculate current candle start (integer seconds)
+                current_candle_start = int((now // tf_seconds) * tf_seconds)
+                last_start = None
+                if data:
+                    # Try to get the start_at of the last stored kline if available
+                    try:
+                        last_item = data[-1]
+                        if isinstance(last_item, dict):
+                            last_start = last_item.get("start_at")
+                            if last_start is not None:
+                                last_start = int(last_start)
+                    except Exception:
+                        last_start = None
+
+                # If the last stored kline appears to be the current candle, replace its close,
+                # otherwise append the current price as an extra (ongoing) candle.
+                if last_start is not None and last_start == current_candle_start:
+                    if closes:
+                        closes[-1] = current_price
+                    else:
+                        closes.append(current_price)
+                else:
+                    closes.append(current_price)
+            except Exception:
+                # On any error, fall back to the original safe behavior: append the current price
+                try:
+                    closes.append(current_price)
+                except Exception:
+                    pass
+
+            # We've already incorporated current_price into closes, so call compute_macd_from_closes without include_price
+            return compute_macd_from_closes(closes, include_price=None)
+
+        # No current price; default behavior
+        return compute_macd_from_closes(closes, include_price=None)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)

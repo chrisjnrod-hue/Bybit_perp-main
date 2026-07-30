@@ -523,12 +523,10 @@ class Scanner:
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
-        last_kline_start: Optional[int] = None
         for c in data:
             try:
                 if isinstance(c, dict) and c.get("close") is not None:
                     closes.append(float(c.get("close")))
-                    last_kline_start = c.get("start_at") if last_kline_start is None else c.get("start_at")
                 elif isinstance(c, (int, float)):
                     closes.append(float(c))
             except Exception:
@@ -590,7 +588,7 @@ class Scanner:
             return compute_macd_from_closes(closes, include_price=None)
 
         # No current price; default behavior
-        return compute_macd_from_closes(closes, include_price=None)
+        return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)
@@ -674,35 +672,24 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
-        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
+        Detect which ROOT_TFS have just opened a new candle by computing the canonical
+        current_candle_start for each TF and comparing against our last seen start.
+        If a new candle start is observed, update self._last_tf_candle_open_times[tf]
+        and return the TF in the list.
         """
         opens = []
-        now_struct = time.gmtime(now)
-        current_hour = now_struct.tm_hour
-        current_minute = now_struct.tm_min
-        current_second = now_struct.tm_sec
-        
         for tf in ROOT_TFS:
             try:
                 tf_seconds = self._tf_to_seconds(tf)
-                
-                if tf in ("D", "W"):
-                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
-                        opens.append(tf)
-                else:
-                    if tf_seconds >= 3600:
-                        candles_per_day = 86400 // tf_seconds
-                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-                    else:
-                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
+                # compute canonical candle start timestamp for 'now'
+                current_candle_start = int((int(now) // tf_seconds) * tf_seconds)
+                last_seen = int(self._last_tf_candle_open_times.get(tf) or 0)
+                if current_candle_start > last_seen:
+                    # new candle start
+                    self._last_tf_candle_open_times[tf] = current_candle_start
+                    opens.append(tf)
             except Exception:
                 logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
-        
         return opens
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
@@ -852,6 +839,38 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
+                # Prefetch klines for any ROOT_TFS that just opened a new candle so kline_store has the current-open candle
+                now_prefetch = time.time()
+                new_root_opens = self._detect_tf_candle_opens(now_prefetch)
+
+                if new_root_opens:
+                    logger.info("[ROOT_OPEN_PREFETCH] New root TF opens detected: %s - prefetching klines", new_root_opens)
+                    # Prefetch latest small set of klines for each symbol & tf to ensure kline_store last item matches current candle
+                    async def prefetch_for_symbol(sym: str):
+                        for tf in new_root_opens:
+                            try:
+                                async with self.request_sem:
+                                    raw = await self._call_get_klines(sym, tf, limit=min(SEED_KLINES_LIMIT, 10))
+                                if raw:
+                                    normalized = normalize_klines(raw, tf)
+                                    if normalized:
+                                        try:
+                                            klines_sorted = sorted(normalized, key=lambda x: x.get("start_at") or 0)
+                                        except Exception:
+                                            klines_sorted = normalized
+                                        self.kline_store.setdefault(sym, {})[tf] = klines_sorted
+                            except Exception:
+                                logger.debug("Prefetch klines failed for %s %s", sym, tf, exc_info=True)
+
+                    # Do the prefetch in batches to obey request batching limits
+                    for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
+                        batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
+                        tasks = [asyncio.create_task(prefetch_for_symbol(s)) for s in batch]
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        if i + REQUEST_BATCH_SIZE < len(self.symbols):
+                            await asyncio.sleep(REQUEST_BATCH_DELAY)
+
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
@@ -900,13 +919,25 @@ class Scanner:
 
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
+
+                                # Compute canonical current candle start for this root TF
+                                tf_seconds = self._tf_to_seconds(root)
+                                current_candle_start = int((int(now) // tf_seconds) * tf_seconds)
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
                                     if last_candles:
-                                        start_at = last_candles[-1].get("start_at")
+                                        last_start = last_candles[-1].get("start_at")
+                                        if last_start is not None and int(last_start) == current_candle_start:
+                                            # last stored kline matches current candle
+                                            start_at = int(last_start)
+                                        else:
+                                            # use canonical candle start (we may have prefetched or will append price)
+                                            start_at = current_candle_start
+                                    else:
+                                        start_at = current_candle_start
                                 except Exception:
-                                    start_at = None
+                                    start_at = current_candle_start
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now)

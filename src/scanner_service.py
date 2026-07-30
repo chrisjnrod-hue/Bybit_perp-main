@@ -517,9 +517,6 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-
-        Fix: intelligently append or replace the last close with include_price so we do
-        not accidentally overwrite a closed candle (which caused flip detection to shift).
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -532,13 +529,9 @@ class Scanner:
             except Exception:
                 continue
 
-        # Determine current price (best-effort)
         current_price = None
         if include_price is not None:
-            try:
-                current_price = float(include_price)
-            except Exception:
-                current_price = None
+            current_price = float(include_price)
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
                 ws_last = self.client.get_ws_latest_kline(symbol, tf)
@@ -547,47 +540,6 @@ class Scanner:
             except Exception:
                 pass
 
-        # If we have a current price, decide whether to replace the last close (if it is the open candle)
-        # or append a new close value representing the ongoing candle. This avoids overwriting a closed
-        # candle and thus shifting the histogram by one candle.
-        if current_price is not None:
-            try:
-                tf_seconds = self._tf_to_seconds(tf)
-                now = time.time()
-                # calculate current candle start (integer seconds)
-                current_candle_start = int((now // tf_seconds) * tf_seconds)
-                last_start = None
-                if data:
-                    # Try to get the start_at of the last stored kline if available
-                    try:
-                        last_item = data[-1]
-                        if isinstance(last_item, dict):
-                            last_start = last_item.get("start_at")
-                            if last_start is not None:
-                                last_start = int(last_start)
-                    except Exception:
-                        last_start = None
-
-                # If the last stored kline appears to be the current candle, replace its close,
-                # otherwise append the current price as an extra (ongoing) candle.
-                if last_start is not None and last_start == current_candle_start:
-                    if closes:
-                        closes[-1] = current_price
-                    else:
-                        closes.append(current_price)
-                else:
-                    closes.append(current_price)
-            except Exception:
-                # On any error, fall back to the original safe behavior: append the current price
-                try:
-                    closes.append(current_price)
-                except Exception:
-                    pass
-
-            # We've already incorporated current_price into closes, so call compute_macd_from_closes without include_price
-            return compute_macd_from_closes(closes, include_price=None)
-
-        # No current price; default behavior
         return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
@@ -672,24 +624,35 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        Detect which ROOT_TFS have just opened a new candle by computing the canonical
-        current_candle_start for each TF and comparing against our last seen start.
-        If a new candle start is observed, update self._last_tf_candle_open_times[tf]
-        and return the TF in the list.
+        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
+        now_struct = time.gmtime(now)
+        current_hour = now_struct.tm_hour
+        current_minute = now_struct.tm_min
+        current_second = now_struct.tm_sec
+        
         for tf in ROOT_TFS:
             try:
                 tf_seconds = self._tf_to_seconds(tf)
-                # compute canonical candle start timestamp for 'now'
-                current_candle_start = int((int(now) // tf_seconds) * tf_seconds)
-                last_seen = int(self._last_tf_candle_open_times.get(tf) or 0)
-                if current_candle_start > last_seen:
-                    # new candle start
-                    self._last_tf_candle_open_times[tf] = current_candle_start
-                    opens.append(tf)
+                
+                if tf in ("D", "W"):
+                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
+                        opens.append(tf)
+                else:
+                    if tf_seconds >= 3600:
+                        candles_per_day = 86400 // tf_seconds
+                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
+                    else:
+                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
             except Exception:
                 logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
+        
         return opens
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
@@ -839,37 +802,22 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
-                # Prefetch klines for any ROOT_TFS that just opened a new candle so kline_store has the current-open candle
-                now_prefetch = time.time()
-                new_root_opens = self._detect_tf_candle_opens(now_prefetch)
+                # ---- FIXED: Detect new root TF candle opens (1h, 4h, 1d) and perform fresh kline seeding & caching ----
+                now = time.time()
+                opened_tfs = self._detect_tf_candle_opens(now)
+                is_new_root_candle = False
+                for tf in opened_tfs:
+                    tf_sec = self._tf_to_seconds(tf)
+                    current_candle_start = int(now // tf_sec) * tf_sec
+                    if self._last_tf_candle_open_times.get(tf, 0) < current_candle_start:
+                        self._last_tf_candle_open_times[tf] = current_candle_start
+                        is_new_root_candle = True
+                        logger.info("[CANDLE_OPEN_SCAN] New candle opened for root TF %s at time %d. Triggering fresh kline seeding and caching...", tf, current_candle_start)
 
-                if new_root_opens:
-                    logger.info("[ROOT_OPEN_PREFETCH] New root TF opens detected: %s - prefetching klines", new_root_opens)
-                    # Prefetch latest small set of klines for each symbol & tf to ensure kline_store last item matches current candle
-                    async def prefetch_for_symbol(sym: str):
-                        for tf in new_root_opens:
-                            try:
-                                async with self.request_sem:
-                                    raw = await self._call_get_klines(sym, tf, limit=min(SEED_KLINES_LIMIT, 10))
-                                if raw:
-                                    normalized = normalize_klines(raw, tf)
-                                    if normalized:
-                                        try:
-                                            klines_sorted = sorted(normalized, key=lambda x: x.get("start_at") or 0)
-                                        except Exception:
-                                            klines_sorted = normalized
-                                        self.kline_store.setdefault(sym, {})[tf] = klines_sorted
-                            except Exception:
-                                logger.debug("Prefetch klines failed for %s %s", sym, tf, exc_info=True)
-
-                    # Do the prefetch in batches to obey request batching limits
-                    for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
-                        batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
-                        tasks = [asyncio.create_task(prefetch_for_symbol(s)) for s in batch]
-                        if tasks:
-                            await asyncio.gather(*tasks, return_exceptions=True)
-                        if i + REQUEST_BATCH_SIZE < len(self.symbols):
-                            await asyncio.sleep(REQUEST_BATCH_DELAY)
+                if is_new_root_candle and self.symbols:
+                    logger.info("[CANDLE_OPEN_SCAN] Executing fresh seed_all() to ensure subsequent root scans are as fresh as initial deploy scan...")
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_SCAN] Fresh seeding and kline caching complete.")
 
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
@@ -896,7 +844,7 @@ class Scanner:
                         # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
-                        now = time.time()
+                        now_time = time.time()
 
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
@@ -919,31 +867,19 @@ class Scanner:
 
                             if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
-
-                                # Compute canonical current candle start for this root TF
-                                tf_seconds = self._tf_to_seconds(root)
-                                current_candle_start = int((int(now) // tf_seconds) * tf_seconds)
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
                                     if last_candles:
-                                        last_start = last_candles[-1].get("start_at")
-                                        if last_start is not None and int(last_start) == current_candle_start:
-                                            # last stored kline matches current candle
-                                            start_at = int(last_start)
-                                        else:
-                                            # use canonical candle start (we may have prefetched or will append price)
-                                            start_at = current_candle_start
-                                    else:
-                                        start_at = current_candle_start
+                                        start_at = last_candles[-1].get("start_at")
                                 except Exception:
-                                    start_at = current_candle_start
+                                    start_at = None
 
                                 # Check if candle is fresh enough for trading
-                                candle_age_ok = self._is_candle_age_acceptable(start_at, now)
+                                candle_age_ok = self._is_candle_age_acceptable(start_at, now_time)
                                 
                                 # Check if this signal was already generated in recent past (deduplication)
-                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now)
+                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_time)
 
                                 if not candle_age_ok:
                                     logger.info("SIGNAL REJECTED (candle too old): %s %s @ %s", sym, root, price)
@@ -972,7 +908,7 @@ class Scanner:
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
-                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now - start_at if start_at else -1)
+                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_time - start_at if start_at else -1)
                                 
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)

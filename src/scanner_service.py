@@ -513,6 +513,15 @@ class Scanner:
     def _quantize_qty(self, qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
         return quantize_qty(qty, step, min_qty)
 
+    def _get_current_candle_start(self, tf: str, now: float) -> int:
+        tf_sec = self._tf_to_seconds(tf)
+        if tf == "D":
+            return int(now // 86400) * 86400
+        elif tf == "W":
+            return int(now // 604800) * 604800
+        else:
+            return int(now // tf_sec) * tf_sec
+
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
@@ -624,7 +633,7 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -802,22 +811,27 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
-                # ---- FIXED: Detect new root TF candle opens (1h, 4h, 1d) and perform fresh kline seeding & caching ----
+                # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
                 now = time.time()
-                opened_tfs = self._detect_tf_candle_opens(now)
-                is_new_root_candle = False
-                for tf in opened_tfs:
-                    tf_sec = self._tf_to_seconds(tf)
-                    current_candle_start = int(now // tf_sec) * tf_sec
-                    if self._last_tf_candle_open_times.get(tf, 0) < current_candle_start:
-                        self._last_tf_candle_open_times[tf] = current_candle_start
-                        is_new_root_candle = True
-                        logger.info("[CANDLE_OPEN_SCAN] New candle opened for root TF %s at time %d. Triggering fresh kline seeding and caching...", tf, current_candle_start)
+                refreshed_tfs = []
+                for root in ROOT_TFS:
+                    current_start = self._get_current_candle_start(root, now)
+                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    
+                    if current_start > last_start:
+                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
+                        self._last_tf_candle_open_times[root] = float(current_start)
+                        refreshed_tfs.append(root)
 
-                if is_new_root_candle and self.symbols:
-                    logger.info("[CANDLE_OPEN_SCAN] Executing fresh seed_all() to ensure subsequent root scans are as fresh as initial deploy scan...")
+                if refreshed_tfs:
+                    logger.info(
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                        refreshed_tfs
+                    )
                     await self.seed_all()
-                    logger.info("[CANDLE_OPEN_SCAN] Fresh seeding and kline caching complete.")
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
@@ -844,7 +858,7 @@ class Scanner:
                         # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
-                        now_time = time.time()
+                        now_check = time.time()
 
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
@@ -876,10 +890,10 @@ class Scanner:
                                     start_at = None
 
                                 # Check if candle is fresh enough for trading
-                                candle_age_ok = self._is_candle_age_acceptable(start_at, now_time)
+                                candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
                                 
                                 # Check if this signal was already generated in recent past (deduplication)
-                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_time)
+                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
 
                                 if not candle_age_ok:
                                     logger.info("SIGNAL REJECTED (candle too old): %s %s @ %s", sym, root, price)
@@ -908,7 +922,7 @@ class Scanner:
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
-                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_time - start_at if start_at else -1)
+                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
@@ -980,8 +994,8 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                now = time.time()
-                now_struct = time.gmtime(now)
+                now_sleep = time.time()
+                now_struct = time.gmtime(now_sleep)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
@@ -1135,7 +1149,6 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                # lst is already sorted by TV rating from earlier sort
                 top = lst[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
@@ -1159,7 +1172,6 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    # lst is already sorted by TV rating from earlier sort
                     top = lst[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)

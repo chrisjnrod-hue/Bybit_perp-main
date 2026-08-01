@@ -894,10 +894,6 @@ class Scanner:
                                 
                                 # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
-
-                                if not candle_age_ok:
-                                    logger.info("SIGNAL REJECTED (candle too old): %s %s @ %s", sym, root, price)
-                                    continue
                                 
                                 if not is_new_signal:
                                     logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
@@ -917,12 +913,16 @@ class Scanner:
                                     "start_at": start_at,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label,
+                                    "candle_age_ok": candle_age_ok,
                                     "mtf_status": mtf_align.get("status", "N/A"),
                                     "negative_tfs": mtf_align.get("negative_tfs", []),
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
-                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                if not candle_age_ok:
+                                    logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                else:
+                                    logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
@@ -1023,6 +1023,11 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
+            start_at = item.get("start_at")
+
+            candle_age_ok = item.get("candle_age_ok")
+            if candle_age_ok is None:
+                candle_age_ok = self._is_candle_age_acceptable(start_at, time.time())
 
             hist = item.get("hist", [])
             if not hist:
@@ -1058,6 +1063,14 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
+                # ---- CANDLE AGE FILTER: Reject/block trade open if candle too old, but allow Telegram push ----
+                if not candle_age_ok:
+                    entry["accept"] = False
+                    entry["reason"] = "candle_too_old"
+                    logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC (candle too old): %s root=%s", sym, root)
+                    evaluated.append(entry)
+                    continue
+
                 # ---- TV RATING FILTER: Reject if below TRADE_RATING_MIN ----
                 if TRADE_RATING_MIN_VAL > 0.0 and tv_score < TRADE_RATING_MIN_VAL:
                     entry["accept"] = False

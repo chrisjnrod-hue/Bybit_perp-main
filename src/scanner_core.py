@@ -1,5 +1,4 @@
-# scanner_core.py - NO CHANGES TO THIS FILE
-# Included for completeness - remains the same as before
+# scanner_core.py
 """
 scanner_core.py
 
@@ -70,6 +69,40 @@ def tf_to_seconds(tf: str) -> int:
         return int(s) * 60
     except Exception:
         return 60
+
+
+def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: float) -> bool:
+    """
+    Check if a candle is fresh enough for trading.
+    Returns True if:
+    - max_age_sec is 0 or negative (disabled, any age OK), or
+    - candle age is within acceptable window
+    Automatically normalizes millisecond timestamps to seconds if necessary.
+    """
+    if max_age_sec <= 0:
+        return True
+    
+    if start_at is None:
+        return False
+    
+    try:
+        st = int(start_at)
+        # Automatically normalize milliseconds to seconds if necessary
+        if st > 10**11:
+            st = st // 1000
+        
+        candle_age_sec = now - st
+        
+        # Allow up to 5 seconds of negative age for minor clock skew
+        if candle_age_sec < -5:
+            return True
+        
+        if candle_age_sec > max_age_sec:
+            return False
+            
+        return True
+    except Exception:
+        return False
 
 
 def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:

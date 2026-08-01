@@ -734,10 +734,6 @@ class Scanner:
         """
         return is_candle_age_acceptable(start_at, max_age_sec=FLIP_CANDLE_AGE_MAX_SEC)
         
-        if start_at is None:
-            logger.debug("Cannot check candle age: start_at is None")
-            return False
-        
         try:
             candle_age_sec = now - int(start_at)
             if candle_age_sec > FLIP_CANDLE_AGE_MAX_SEC:

@@ -33,6 +33,7 @@ from .scanner_core import (
     tf_to_seconds,
     normalize_klines,
     quantize_qty,
+    is_candle_age_acceptable,
     compute_macd_from_closes,
     detect_flip_current_open,
     compute_24h_volume_change_from,
@@ -724,17 +725,14 @@ class Scanner:
         for sym in to_remove:
             self._mtf_monitoring.pop(sym, None)
 
-        return newly_aligned
+        return newly_align
 
-    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
+        def _is_candle_age_acceptable(self, start_at: int) -> bool:
         """
-        Check if a candle is fresh enough for trading.
-        Returns True if:
-        - FLIP_CANDLE_AGE_MAX_SEC is 0 (disabled, any age OK), or
-        - candle age is within acceptable window
+        Validates whether the candle age is within the allowed FLIP_CANDLE_AGE_MAX_SEC limit.
+        Delegates to scanner_core to safely handle millisecond/second timestamp normalization.
         """
-        if FLIP_CANDLE_AGE_MAX_SEC <= 0:
-            return True
+        return is_candle_age_acceptable(start_at, max_age_sec=FLIP_CANDLE_AGE_MAX_SEC)
         
         if start_at is None:
             logger.debug("Cannot check candle age: start_at is None")

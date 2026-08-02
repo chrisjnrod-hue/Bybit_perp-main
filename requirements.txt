@@ -1,10 +1,10 @@
 # core dependencies pinned for Python 3.11 (wheels available)[cite: 2]
-aiohttp==3.8.4[cite: 2]
-websockets==11.0.3[cite: 2]
-python-dotenv==1.0.0[cite: 2]
+aiohttp==3.8.4
+websockets==11.0.3
+python-dotenv==1.0.0
 httpx>=0.24.0
 
-# Technical Analysis & Data Processing[cite: 2]
-pandas>=2.0.0[cite: 2]
-numpy>=1.24.0[cite: 2]
-ta>=0.10.2[cite: 2]
+# Technical Analysis & Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+ta>=0.10.2

@@ -38,6 +38,7 @@ from .scanner_core import (
     compute_24h_volume_change_from,
     compute_tv_rating_from,
     compute_mtf_alignment,
+    is_candle_age_acceptable,
 )
 
 from .scanner_telegram import TelegramSummary
@@ -728,27 +729,9 @@ class Scanner:
 
     def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
         """
-        Check if a candle is fresh enough for trading.
-        Returns True if:
-        - FLIP_CANDLE_AGE_MAX_SEC is 0 (disabled, any age OK), or
-        - candle age is within acceptable window
+        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
         """
-        if FLIP_CANDLE_AGE_MAX_SEC <= 0:
-            return True
-        
-        if start_at is None:
-            logger.debug("Cannot check candle age: start_at is None")
-            return False
-        
-        try:
-            candle_age_sec = now - int(start_at)
-            if candle_age_sec > FLIP_CANDLE_AGE_MAX_SEC:
-                logger.debug("Candle too old for trading: age=%.0f sec (max=%.0f)", candle_age_sec, FLIP_CANDLE_AGE_MAX_SEC)
-                return False
-            return True
-        except Exception as e:
-            logger.debug("Error checking candle age: %s", e)
-            return False
+        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
 
     def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
         """

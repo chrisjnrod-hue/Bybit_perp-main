@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from typing import Dict, List, Optional
+import httpx
 
 logger = logging.getLogger("TradeManager")
 
@@ -40,13 +41,50 @@ class TradeManager:
         except Exception as e:
             logger.error(f"Failed to save trade state file: {e}")
 
+    async def send_telegram_alert(self, message: str):
+        """Pushes trade management and execution alerts to Telegram."""
+        token = self.config.get("TELEGRAM_BOT_TOKEN")
+        chat_id = self.config.get("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            return
+        
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, timeout=10.0)
+                if response.status_code != 200:
+                    logger.error(f"Telegram API error: {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram alert: {e}")
+
     def compute_qty_from_balance(self, balance_usdt: float) -> float:
-        """Computes position notional quantity based on account balance and max open trades."""
+        """Computes position notional quantity based on account balance divided by available trading slots."""
         max_open_trades = self.config.get("MAX_OPEN_TRADES", 5)
         if max_open_trades <= 0:
             return 0.0
         notional = balance_usdt / max_open_trades
         return notional
+
+    async def check_market_cap(self, symbol: str) -> bool:
+        """Filters symbol by minimum market cap to ensure adequate liquidity before entering trade."""
+        min_cap = self.config.get("MIN_MARKET_CAP", 50000000) # Default 50M threshold
+        try:
+            if hasattr(self.exchange, "get_symbol_info"):
+                market_info = await self.exchange.get_symbol_info(symbol)
+                market_cap = float(market_info.get("marketCap", 0))
+                if market_cap > 0 and market_cap < min_cap:
+                    logger.warning(f"Market cap check failed for {symbol}: {market_cap} < min required {min_cap}")
+                    await self.send_telegram_alert(f"⚠️ *Trade Filtered Out*\nSymbol: `{symbol}`\nReason: Market cap below liquidity threshold.")
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"Error checking market cap for {symbol}: {e}")
+            return True # Fail-open if exchange API lacks direct marketCap endpoint
 
     async def check_spread(self, symbol: str) -> bool:
         """Validates that the current bid-ask spread is within the allowed threshold."""
@@ -99,10 +137,13 @@ class TradeManager:
             logger.error(f"Failed to set leverage for {symbol}: {e}")
 
     async def open_trade(self, symbol: str, side: str, signal_price: float, balance_usdt: float) -> bool:
-        """Runs pre-execution checks and opens a live position."""
+        """Runs pre-execution checks (market cap, spread, slippage, leverage, capital allocation) and opens position."""
         max_open = self.config.get("MAX_OPEN_TRADES", 5)
         if len(self.open_trades) >= max_open:
             logger.warning(f"Max open trades limit reached ({max_open}). Skipping trade for {symbol}.")
+            return False
+
+        if not await self.check_market_cap(symbol):
             return False
 
         if not await self.check_spread(symbol):
@@ -118,6 +159,9 @@ class TradeManager:
             logger.error(f"Invalid computed notional size for {symbol}")
             return False
 
+        tp_pct = self.config.get("TP_PERCENT", 2.0)
+        sl_pct = self.config.get("SL_PERCENT", 1.0)
+
         try:
             order = await self.exchange.create_order(
                 symbol=symbol,
@@ -127,29 +171,53 @@ class TradeManager:
             )
             entry_price = float(order.get("avgPrice", signal_price))
             
+            # Calculate initial SL and TP absolute price levels
+            if side.upper() == "BUY":
+                initial_sl = entry_price * (1 - sl_pct / 100)
+                initial_tp = entry_price * (1 + tp_pct / 100)
+            else:
+                initial_sl = entry_price * (1 + sl_pct / 100)
+                initial_tp = entry_price * (1 - tp_pct / 100)
+
+            # Set exchange-level Stop-Loss and Take-Profit if supported
+            if hasattr(self.exchange, "set_position_sl_tp"):
+                await self.exchange.set_position_sl_tp(symbol, stop_loss=initial_sl, take_profit=initial_tp)
+
             trade_record = {
                 "symbol": symbol,
                 "side": side,
                 "entry_price": entry_price,
                 "notional": notional,
-                "tp_pct": self.config.get("TP_PERCENT", 2.0),
-                "sl_pct": self.config.get("SL_PERCENT", 1.0),
-                "breakeven_triggered": False
+                "current_sl": initial_sl,
+                "current_tp": initial_tp,
+                "tp_pct": tp_pct,
+                "sl_pct": sl_pct,
+                "breakeven_triggered": False,
+                "highest_price": entry_price # Used for tracking higher lows/highs trailing SL
             }
             
             self.open_trades.append(trade_record)
             self.save_state()
+            
             logger.info(f"Successfully opened trade for {symbol} at entry {entry_price}")
+            await self.send_telegram_alert(
+                f"🟢 *Trade Opened*\n"
+                f"Symbol: `{symbol}`\n"
+                f"Side: `{side}`\n"
+                f"Entry Price: `{entry_price}`\n"
+                f"Notional: `${notional:.2f}`\n"
+                f"Initial SL: `{initial_sl}` | TP: `{initial_tp}`"
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to execute order for {symbol}: {e}")
             return False
 
     async def monitor_trades_loop(self):
-        """Background polling loop to actively monitor open positions for TP, SL, and Breakeven."""
-        tp_pct = self.config.get("TP_PERCENT", 2.0)
-        sl_pct = self.config.get("SL_PERCENT", 1.0)
+        """Background polling loop to actively monitor open positions for TP, SL, Breakeven, and Higher Lows trailing."""
         be_trigger = self.config.get("BREAKEVEN_TRIGGER_PERCENT", 0.5)
+        be_higher_lows = self.config.get("BREAKEVEN_HIGHER_LOWS", True)
+        sl_pct = self.config.get("SL_PERCENT", 1.0)
 
         while True:
             try:
@@ -165,25 +233,83 @@ class TradeManager:
 
                     if side.upper() == "BUY":
                         pnl_pct = ((current_price - entry) / entry) * 100
-                        hit_tp = current_price >= entry * (1 + tp_pct / 100)
-                        hit_sl = current_price <= entry * (1 - sl_pct / 100)
+                        hit_tp = current_price >= trade["current_tp"]
+                        hit_sl = current_price <= trade["current_sl"]
+                        
+                        # Track highest price for trailing higher lows
+                        if current_price > trade.get("highest_price", entry):
+                            trade["highest_price"] = current_price
+                            
                     else:
                         pnl_pct = ((entry - current_price) / entry) * 100
-                        hit_tp = current_price <= entry * (1 - tp_pct / 100)
-                        hit_sl = current_price >= entry * (1 + sl_pct / 100)
+                        hit_tp = current_price <= trade["current_tp"]
+                        hit_sl = current_price >= trade["current_sl"]
+                        
+                        # Track lowest price for short trailing lows
+                        if current_price < trade.get("highest_price", entry):
+                            trade["highest_price"] = current_price
 
+                    # Check TP/SL fulfillment
                     if hit_tp or hit_sl:
-                        close_reason = "TP" if hit_tp else "SL"
+                        close_reason = "Take Profit (TP)" if hit_tp else "Stop Loss (SL)"
                         logger.info(f"Closing trade {symbol} due to {close_reason} at price {current_price}")
-                        await self.exchange.close_position(symbol)
+                        
+                        try:
+                            await self.exchange.close_position(symbol)
+                        except Exception as e:
+                            logger.error(f"Error executing position close for {symbol}: {e}")
+
                         self.open_trades.remove(trade)
                         self.save_state()
+                        
+                        await self.send_telegram_alert(
+                            f"🔴 *Trade Closed ({close_reason})*\n"
+                            f"Symbol: `{symbol}`\n"
+                            f"Exit Price: `{current_price}`\n"
+                            f"Final PnL: `{pnl_pct:.2f}%`"
+                        )
                         continue
 
+                    # Breakeven and Higher Lows management
                     if not trade.get("breakeven_triggered", False) and pnl_pct >= be_trigger:
-                        logger.info(f"Triggering breakeven for {symbol} at {current_price} (PnL: {pnl_pct:.2f}%)")
                         trade["breakeven_triggered"] = True
+                        
+                        # Move SL to entry (Breakeven)
+                        if side.upper() == "BUY":
+                            new_sl = entry * (1 + 0.0005) # slight buffer above entry fee
+                        else:
+                            new_sl = entry * (1 - 0.0005)
+
+                        trade["current_sl"] = new_sl
+                        if hasattr(self.exchange, "update_stop_loss"):
+                            await self.exchange.update_stop_loss(symbol, new_sl)
+                            
                         self.save_state()
+                        logger.info(f"Triggered breakeven SL for {symbol} at price {new_sl}")
+                        await self.send_telegram_alert(
+                            f"🛡️ *Breakeven Triggered*\n"
+                            f"Symbol: `{symbol}`\n"
+                            f"Stop-Loss moved to entry: `{new_sl}`"
+                        )
+
+                    elif trade.get("breakeven_triggered", False) and be_higher_lows:
+                        # Automatically trail SL to new higher lows (for BUY) or lower highs (for SELL)
+                        if side.upper() == "BUY":
+                            potential_sl = trade["highest_price"] * (1 - sl_pct / 100)
+                            if potential_sl > trade["current_sl"]:
+                                trade["current_sl"] = potential_sl
+                                if hasattr(self.exchange, "update_stop_loss"):
+                                    await self.exchange.update_stop_loss(symbol, potential_sl)
+                                self.save_state()
+                                logger.info(f"Trailed higher-low SL for {symbol} to {potential_sl}")
+                        else:
+                            potential_sl = trade["highest_price"] * (1 + sl_pct / 100)
+                            if potential_sl < trade["current_sl"]:
+                                trade["current_sl"] = potential_sl
+                                if hasattr(self.exchange, "update_stop_loss"):
+                                    await self.exchange.update_stop_loss(symbol, potential_sl)
+                                self.save_state()
+                                logger.info(f"Trailed lower-high SL for {symbol} to {potential_sl}")
 
             except Exception as e:
                 logger.error(f"Error in monitor_trades_loop: {e}")

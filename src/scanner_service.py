@@ -77,20 +77,37 @@ class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-        self.trade_manager = TradeManager(self.exchange, self.config)
+        
+        # Merged config dictionary for TradeManager (retains all environment parameters)
+        self.config = {
+            "STATE_FILE": os.getenv("STATE_FILE", "open_trades.json"),
+            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
+            "MAX_OPEN_TRADES": int(os.getenv("MAX_OPEN_TRADES", 5)),
+            "MIN_MARKET_CAP": float(os.getenv("MIN_MARKET_CAP", 50000000)),
+            "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", 0.1)),
+            "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", 0.2)),
+            "LEVERAGE": int(os.getenv("LEVERAGE", 10)),
+            "TP_PERCENT": float(os.getenv("TP_PERCENT", 2.0)),
+            "SL_PERCENT": float(os.getenv("SL_PERCENT", 1.0)),
+            "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", 0.5)),
+            "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "true").lower() in ("true", "1", "yes")
+        }
+        
+        self.trade_manager = TradeManager(self.client, self.config)
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         self.symbols: List[str] = []
-        self._stop = False
-        self._task: Optional[asyncio.Task] = None
-        self._rest_poller_task: Optional[asyncio.Task] = None
-        self._callbacks: List[Callable[[str, Any], Any]] = []
-        self._24h_volumes: Dict[str, Dict[str, float]] = {}
-        self._last_price_cache: Dict[str, float] = {}
-        self._last_price_time: Dict[str, float] = {}
-        self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
-        self._symbol_check_count = 0
+        self.stop = False
+        self.task: Optional[asyncio.Task] = None
+        self.rest_poller_task: Optional[asyncio.Task] = None
+        self.callbacks: List[Callable[[str, Any], Any]] = []
+        self.24h_volumes: Dict[str, Dict[str, float]] = {}
+        self.last_price_cache: Dict[str, float] = {}
+        self.last_price_time: Dict[str, float] = {}
+        self.mtf_monitoring: Dict[str, Dict[str, Any]] = {}
+        self.symbol_check_count = 0
         
         # Track which ROOT_TF candles have opened in the current cycle
         self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}

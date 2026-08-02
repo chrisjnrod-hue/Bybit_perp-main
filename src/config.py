@@ -80,6 +80,11 @@ BREAKEVEN_PERCENT = safe_float_env("BREAKEVEN_PERCENT", 0.5)
 BREAKEVEN_TRIGGER_PERCENT = safe_float_env("BREAKEVEN_TRIGGER_PERCENT", 1.0)
 BREAKEVEN_HL = safe_bool_env("BREAKEVEN_HL", True)
 
+# ---- Execution & Risk Filters (Leverage, Slippage, Spread) ----
+LEVERAGE = safe_int_env("LEVERAGE", 10)
+MAX_SLIPPAGE = safe_float_env("MAX_SLIPPAGE", 0.2)
+MAX_SPREAD_PERCENT = safe_float_env("MAX_SPREAD_PERCENT", 0.1)
+
 # Position sizing
 POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "auto")
 FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)

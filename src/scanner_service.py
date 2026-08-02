@@ -103,7 +103,7 @@ class Scanner:
         self.task: Optional[asyncio.Task] = None
         self.rest_poller_task: Optional[asyncio.Task] = None
         self.callbacks: List[Callable[[str, Any], Any]] = []
-        self.24h_volumes: Dict[str, Dict[str, float]] = {}
+        self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self.last_price_cache: Dict[str, float] = {}
         self.last_price_time: Dict[str, float] = {}
         self.mtf_monitoring: Dict[str, Dict[str, Any]] = {}

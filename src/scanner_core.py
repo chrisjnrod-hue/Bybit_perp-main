@@ -93,9 +93,9 @@ def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: f
         
         candle_age_sec = now - st
         
-        # Allow up to 5 seconds of negative age for minor clock skew
+        # Reject major future skew beyond -5 seconds; allow minor skew between -5 and 0 seconds
         if candle_age_sec < -5:
-            return True
+            return False
         
         if candle_age_sec > max_age_sec:
             return False

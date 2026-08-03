@@ -1,4 +1,3 @@
-# scanner_core.py
 """
 scanner_core.py
 
@@ -69,40 +68,6 @@ def tf_to_seconds(tf: str) -> int:
         return int(s) * 60
     except Exception:
         return 60
-
-
-def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: float) -> bool:
-    """
-    Check if a candle is fresh enough for trading.
-    Returns True if:
-    - max_age_sec is 0 or negative (disabled, any age OK), or
-    - candle age is within acceptable window
-    Automatically normalizes millisecond timestamps to seconds if necessary.
-    """
-    if max_age_sec <= 0:
-        return True
-    
-    if start_at is None:
-        return False
-    
-    try:
-        st = int(start_at)
-        # Automatically normalize milliseconds to seconds if necessary
-        if st > 10**11:
-            st = st // 1000
-        
-        candle_age_sec = now - st
-        
-        # Reject major future skew beyond -5 seconds; allow minor skew between -5 and 0 seconds
-        if candle_age_sec < -5:
-            return False
-        
-        if candle_age_sec > max_age_sec:
-            return False
-            
-        return True
-    except Exception:
-        return False
 
 
 def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
@@ -291,7 +256,7 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
     """
     Compute MACD histogram from a list of closes (floats).
     include_price: when provided, overwrites the last close value with current price.
-    Returns: (macd_line, signal_line, hist) – each as list-like (macd_histogram implementation dependent)
+    Returns: (macd_line, signal_line, hist) â€” each as list-like (macd_histogram implementation dependent)
     """
     data: List[float] = []
     for c in closes:

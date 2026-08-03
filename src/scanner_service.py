@@ -501,6 +501,12 @@ class Scanner:
     def _tf_to_seconds(self, tf: str) -> int:
         return tf_to_seconds(tf)
 
+    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
+        """
+        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
+        """
+        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
+
     def _normalize_klines(self, raw_klines: Any, tf: str):
         return normalize_klines(raw_klines, tf)
 

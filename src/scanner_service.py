@@ -790,24 +790,38 @@ class Scanner:
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
 
-        while not self._stop:
+        while not self.stop:
             loop_count += 1
-
-            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
-
+            logger.info(f"[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #{loop_count}...")
             start = time.time()
             try:
                 if not self.symbols:
-                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
-                    await self.discover_symbols()
-                    if self.symbols:
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
-                        await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
-                    else:
-                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
-                        await asyncio.sleep(10)
+                    logger.info("[DIAGNOSTIC] root_scan_loop: Symbols list is empty. Calling discover_symbols()...")
+                    try:
+                        await asyncio.wait_for(self.discover_symbols(), timeout=15.0)
+                        logger.info(f"[DIAGNOSTIC] root_scan_loop: discover_symbols completed. Found {len(self.symbols)} symbols.")
+                    except asyncio.TimeoutError:
+                        logger.error("[DIAGNOSTIC] discover_symbols timed out after 15 seconds!")
+                        await asyncio.sleep(5)
                         continue
+                    except Exception as e:
+                        logger.error(f"[DIAGNOSTIC] discover_symbols failed with error: {e}")
+                        await asyncio.sleep(5)
+                        continue
+
+                if self.symbols:
+                    logger.info("[DIAGNOSTIC] root_scan_loop: Starting seed_all()...")
+                    try:
+                        await asyncio.wait_for(self.seed_all(), timeout=30.0)
+                        logger.info("[DIAGNOSTIC] root_scan_loop: seed_all completed successfully.")
+                    except asyncio.TimeoutError:
+                        logger.error("[DIAGNOSTIC] seed_all timed out after 30 seconds!")
+                        await asyncio.sleep(5)
+                        continue
+                else:
+                    logger.warning("[DIAGNOSTIC] root_scan_loop: Symbols still empty after discovery attempt.")
+                    await asyncio.sleep(10)
+                    continue
 
                 await self._ensure_rest_poller()
 

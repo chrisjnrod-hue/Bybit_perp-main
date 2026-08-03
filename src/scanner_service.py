@@ -551,7 +551,7 @@ class Scanner:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
-                logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
                 return None
 
             # Normalize nested shapes

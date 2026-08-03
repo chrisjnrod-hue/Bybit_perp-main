@@ -551,7 +551,7 @@ class Scanner:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                logger.debug("[VOLUME_UPDATE] %s: ticker returned empty", symbol)
                 return None
 
             # Normalize nested shapes
@@ -589,7 +589,7 @@ class Scanner:
                 else:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", vol)
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
                 prev = self._24h_volumes[symbol].get("previous", 0)
                 curr = self._24h_volumes[symbol].get("current", 0)
                 logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
@@ -624,7 +624,7 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        FIXED: Detect which ROOT_TF have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -916,6 +916,7 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
+            start_at = item.get("start_at")  # <-- extract start_at here
 
             hist = item.get("hist", [])
             if not hist:
@@ -948,9 +949,12 @@ class Scanner:
                 "reason": "pending",
                 "tv_label": tv_label,
                 "tv_score": tv_score,
+                "start_at": start_at,
             }
 
+            # Only consider opening trades when alignment is OK
             if mtf_status in ("aligned", "daily_rising"):
+                # TV rating gate
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"
@@ -958,14 +962,15 @@ class Scanner:
                     evaluated.append(entry)
                     continue
 
-                # Check if the candle is too old (flipped too late after candle open)
-            if not self._is_candle_age_acceptable(start_at, time.time()):
-                entry["accept"] = False
-                entry["reason"] = "candle_too_old"
-                logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s", sym, root, start_at)
-                evaluated.append(entry)
-                continue
+                # Candle age gate: reject if flip happened on an old candle
+                if not self._is_candle_age_acceptable(start_at, time.time()):
+                    entry["accept"] = False
+                    entry["reason"] = "candle_too_old"
+                    logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s (max=%s)", sym, root, start_at, FLIP_CANDLE_AGE_MAX_SEC)
+                    evaluated.append(entry)
+                    continue
 
+                # Optional market cap gate (async)
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
                         symbol_info = await self.client.get_symbol_info(sym)
@@ -991,6 +996,7 @@ class Scanner:
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
 
+                # Volume gating
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
                         entry["accept"] = False

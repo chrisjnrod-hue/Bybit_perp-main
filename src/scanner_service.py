@@ -958,6 +958,14 @@ class Scanner:
                     evaluated.append(entry)
                     continue
 
+                # Check if the candle is too old (flipped too late after candle open)
+            if not self._is_candle_age_acceptable(start_at, time.time()):
+                entry["accept"] = False
+                entry["reason"] = "candle_too_old"
+                logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s", sym, root, start_at)
+                evaluated.append(entry)
+                continue
+
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
                         symbol_info = await self.client.get_symbol_info(sym)

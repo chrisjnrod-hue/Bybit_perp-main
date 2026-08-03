@@ -985,7 +985,7 @@ class Scanner:
                         if marketcap is not None and marketcap < MARKET_CAP_MIN:
                             entry["accept"] = False
                             entry["reason"] = "market_cap_filtered"
-                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, MARKET_CAP_MIN)
+                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
                             evaluated.append(entry)
                             continue
                     except Exception:

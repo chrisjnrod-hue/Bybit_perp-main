@@ -70,6 +70,20 @@ def tf_to_seconds(tf: str) -> int:
         return 60
 
 
+def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: int) -> bool:
+    """
+    Check if the candle's start time is fresh enough compared to current time.
+    """
+    if start_at is None:
+        return True
+    try:
+        start_sec = float(start_at) / 1000.0 if start_at > 10000000000 else float(start_at)
+        age = now - start_sec
+        return age <= max_age_sec
+    except Exception:
+        return True
+
+
 def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
     """
     Normalize various kline shapes into list of dicts:

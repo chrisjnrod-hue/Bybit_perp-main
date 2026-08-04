@@ -25,7 +25,7 @@ from .config import (
     MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
-    FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE
+    FLIP_CANDLE_AGE_MAX_SEC
 )
 from .telegram import send_message
 
@@ -100,9 +100,9 @@ class Scanner:
         self.telegram = TelegramSummary()
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s FLIP_CANDLE_AGE_MAX_SEC=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
-            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
+            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, FLIP_CANDLE_AGE_MAX_SEC, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -501,12 +501,6 @@ class Scanner:
     def _tf_to_seconds(self, tf: str) -> int:
         return tf_to_seconds(tf)
 
-    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
-        """
-        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
-        """
-        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
-
     def _normalize_klines(self, raw_klines: Any, tf: str):
         return normalize_klines(raw_klines, tf)
 
@@ -551,7 +545,7 @@ class Scanner:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
-                logger.debug("[VOLUME_UPDATE] %s: ticker returned empty", symbol)
+                logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
             # Normalize nested shapes
@@ -589,7 +583,7 @@ class Scanner:
                 else:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", vol)
                 prev = self._24h_volumes[symbol].get("previous", 0)
                 curr = self._24h_volumes[symbol].get("current", 0)
                 logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
@@ -624,7 +618,7 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TF have just opened a new candle.
+        FIXED: Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -796,6 +790,25 @@ class Scanner:
                                 except Exception:
                                     start_at = None
 
+                                # Compute age for debug logging (handle ms vs s)
+                                age_for_log = None
+                                try:
+                                    if start_at is not None:
+                                        start_int = int(start_at)
+                                        if start_int > 10000000000:
+                                            start_sec = float(start_int) / 1000.0
+                                        else:
+                                            start_sec = float(start_int)
+                                        age_for_log = time.time() - start_sec
+                                except Exception:
+                                    age_for_log = None
+
+                                # Evaluate age gate for debug output
+                                try:
+                                    age_ok = is_candle_age_acceptable(start_at, time.time(), FLIP_CANDLE_AGE_MAX_SEC)
+                                except Exception:
+                                    age_ok = True
+
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
                                 
                                 # Pre-compute MTF alignment so immediate blocks never show N/A status
@@ -808,12 +821,19 @@ class Scanner:
                                     "hist": hist,
                                     "vol_change": vol_change,
                                     "start_at": start_at,
+                                    "start_age": age_for_log,
+                                    "start_age_ok": age_ok,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label,
                                     "mtf_status": mtf_align.get("status", "N/A"),
                                     "negative_tfs": mtf_align.get("negative_tfs", []),
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
+
+                                # Debug log for flip age and decision gating
+                                logger.info("[SIGNAL_AGE] %s %s start_at=%s age=%.1f age_ok=%s max_allowed=%s tv_score=%s mtf=%s",
+                                            sym, root, start_at, age_for_log if age_for_log is not None else -1.0, age_ok, FLIP_CANDLE_AGE_MAX_SEC, tv_score, sig_item["mtf_status"])
+
                                 root_signals.append(sig_item)
                                 logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
                                 
@@ -916,7 +936,7 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
-            start_at = item.get("start_at")  # <-- extract start_at here
+            start_at = item.get("start_at")  # ensure we capture start_at for age checks
 
             hist = item.get("hist", [])
             if not hist:
@@ -952,9 +972,7 @@ class Scanner:
                 "start_at": start_at,
             }
 
-            # Only consider opening trades when alignment is OK
             if mtf_status in ("aligned", "daily_rising"):
-                # TV rating gate
                 if tv_score < TRADE_RATING_MIN:
                     entry["accept"] = False
                     entry["reason"] = "tv_rating_below_threshold"
@@ -963,14 +981,31 @@ class Scanner:
                     continue
 
                 # Candle age gate: reject if flip happened on an old candle
-                if not self._is_candle_age_acceptable(start_at, time.time()):
-                    entry["accept"] = False
-                    entry["reason"] = "candle_too_old"
-                    logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s (max=%s)", sym, root, start_at, FLIP_CANDLE_AGE_MAX_SEC)
-                    evaluated.append(entry)
-                    continue
+                try:
+                    if not is_candle_age_acceptable(start_at, time.time(), FLIP_CANDLE_AGE_MAX_SEC):
+                        # compute age for logging
+                        age_for_log = None
+                        try:
+                            if start_at is not None:
+                                s_int = int(start_at)
+                                if s_int > 10000000000:
+                                    s_sec = float(s_int) / 1000.0
+                                else:
+                                    s_sec = float(s_int)
+                                age_for_log = time.time() - s_sec
+                        except Exception:
+                            age_for_log = None
 
-                # Optional market cap gate (async)
+                        entry["accept"] = False
+                        entry["reason"] = "candle_too_old"
+                        logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s age=%.1f max_allowed=%s",
+                                    sym, root, start_at, age_for_log if age_for_log is not None else -1.0, FLIP_CANDLE_AGE_MAX_SEC)
+                        evaluated.append(entry)
+                        continue
+                except Exception:
+                    # If the check fails for some reason, don't block on an unexpected error
+                    logger.debug("Candle age check error for %s start_at=%s; continuing evaluation", sym, start_at)
+
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
                         symbol_info = await self.client.get_symbol_info(sym)
@@ -996,7 +1031,6 @@ class Scanner:
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
 
-                # Volume gating
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
                         entry["accept"] = False

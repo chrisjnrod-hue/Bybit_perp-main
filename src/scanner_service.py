@@ -7,7 +7,7 @@ import asyncio
 import time
 import json
 from collections import defaultdict
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Tuple
 import math
 import inspect
 from decimal import getcontext
@@ -25,7 +25,7 @@ from .config import (
     MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
-    FLIP_CANDLE_AGE_MAX_SEC
+    FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE
 )
 from .telegram import send_message
 
@@ -51,9 +51,9 @@ DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "tru
 
 # Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
 try:
-    TRADE_RATING_MIN = float(os.getenv("TRADE_RATING_MIN", "0.25"))
+    TRADE_RATING_MIN_VAL = float(os.getenv("TRADE_RATING_MIN", str(TRADE_RATING_MIN)))
 except (ValueError, TypeError):
-    TRADE_RATING_MIN = 0.25
+    TRADE_RATING_MIN_VAL = TRADE_RATING_MIN
 
 # TV rating weighting in combined score calculation (0.0 to 1.0, where 1.0 = 100% TV weight)
 try:
@@ -96,13 +96,20 @@ class Scanner:
         self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
+        # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
+        # Prevents same candle from generating multiple signals across scan cycles
+        self._signal_cache: Dict[Tuple[str, str, int], float] = {}
+
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s FLIP_CANDLE_AGE_MAX_SEC=%s PRIORITIZE=%s",
+            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
+            "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
-            TRADE_RATING_MIN, TV_RATING_WEIGHT, TRADE_NO_NEG_VOL, MARKET_CAP_MIN, FLIP_CANDLE_AGE_MAX_SEC, PRIORITIZE_SLOT_ORDER
+            TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -507,6 +514,15 @@ class Scanner:
     def _quantize_qty(self, qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
         return quantize_qty(qty, step, min_qty)
 
+    def _get_current_candle_start(self, tf: str, now: float) -> int:
+        tf_sec = self._tf_to_seconds(tf)
+        if tf == "D":
+            return int(now // 86400) * 86400
+        elif tf == "W":
+            return int(now // 604800) * 604800
+        else:
+            return int(now // tf_sec) * tf_sec
+
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
@@ -583,7 +599,7 @@ class Scanner:
                 else:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
-                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", vol)
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
                 prev = self._24h_volumes[symbol].get("previous", 0)
                 curr = self._24h_volumes[symbol].get("current", 0)
                 logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
@@ -618,7 +634,7 @@ class Scanner:
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
-        FIXED: Detect which ROOT_TFS have just opened a new candle.
+        Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
@@ -711,6 +727,48 @@ class Scanner:
 
         return newly_aligned
 
+    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
+        """
+        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
+        """
+        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
+
+    def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
+        """
+        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
+        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
+        Caches the signal timestamp to prevent re-triggers across scan cycles.
+        """
+        if SIGNAL_DEDUP_WINDOW <= 0:
+            # Deduplication disabled
+            return True
+        
+        if candle_open_time is None:
+            logger.debug("Cannot dedupe signal: candle_open_time is None")
+            return True
+        
+        try:
+            cache_key = (symbol, tf, int(candle_open_time))
+            
+            if cache_key in self._signal_cache:
+                last_signal_time = self._signal_cache[cache_key]
+                time_since_last = now - last_signal_time
+                
+                if time_since_last < SIGNAL_DEDUP_WINDOW:
+                    logger.debug(
+                        "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
+                        symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
+                    )
+                    return False
+            
+            # Signal is new or cache expired; update cache
+            self._signal_cache[cache_key] = now
+            logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
+            return True
+        except Exception as e:
+            logger.debug("Error in dedupe check: %s", e)
+            return True
+
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
@@ -736,6 +794,28 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
+                # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
+                now = time.time()
+                refreshed_tfs = []
+                for root in ROOT_TFS:
+                    current_start = self._get_current_candle_start(root, now)
+                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    
+                    if current_start > last_start:
+                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
+                        self._last_tf_candle_open_times[root] = float(current_start)
+                        refreshed_tfs.append(root)
+
+                if refreshed_tfs:
+                    logger.info(
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                        refreshed_tfs
+                    )
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                # -------------------------------------------------------------
+
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
@@ -760,6 +840,8 @@ class Scanner:
 
                         # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
+
+                        now_check = time.time()
 
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
@@ -790,6 +872,16 @@ class Scanner:
                                 except Exception:
                                     start_at = None
 
+                                # Check if candle is fresh enough for trading
+                                candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
+                                
+                                # Check if this signal was already generated in recent past (deduplication)
+                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
+                                
+                                if not is_new_signal:
+                                    logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
+                                    continue
+
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
                                 
                                 # Pre-compute MTF alignment so immediate blocks never show N/A status
@@ -804,12 +896,16 @@ class Scanner:
                                     "start_at": start_at,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label,
+                                    "candle_age_ok": candle_age_ok,
                                     "mtf_status": mtf_align.get("status", "N/A"),
                                     "negative_tfs": mtf_align.get("negative_tfs", []),
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
-                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f)", sym, root, price, tv_label, tv_score)
+                                if not candle_age_ok:
+                                    logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                else:
+                                    logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
@@ -881,8 +977,8 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
-                now = time.time()
-                now_struct = time.gmtime(now)
+                now_sleep = time.time()
+                now_struct = time.gmtime(now_sleep)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
 
@@ -910,7 +1006,11 @@ class Scanner:
             vol_change = item.get("vol_change")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
-            start_at = item.get("start_at")  # ensure we capture start_at for age checks
+            start_at = item.get("start_at")
+
+            candle_age_ok = item.get("candle_age_ok")
+            if candle_age_ok is None:
+                candle_age_ok = self._is_candle_age_acceptable(start_at, time.time())
 
             hist = item.get("hist", [])
             if not hist:
@@ -943,28 +1043,24 @@ class Scanner:
                 "reason": "pending",
                 "tv_label": tv_label,
                 "tv_score": tv_score,
-                "start_at": start_at,
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                if tv_score < TRADE_RATING_MIN:
+                # ---- CANDLE AGE FILTER: Reject/block trade open if candle too old, but allow Telegram push ----
+                if not candle_age_ok:
                     entry["accept"] = False
-                    entry["reason"] = "tv_rating_below_threshold"
-                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN)
+                    entry["reason"] = "candle_too_old"
+                    logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC (candle too old): %s root=%s", sym, root)
                     evaluated.append(entry)
                     continue
 
-                # Candle age gate: reject if flip happened on an old candle
-                try:
-                    if not is_candle_age_acceptable(start_at, time.time(), FLIP_CANDLE_AGE_MAX_SEC):
-                        entry["accept"] = False
-                        entry["reason"] = "candle_too_old"
-                        logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC: %s root=%s start_at=%s (max=%s)", sym, root, start_at, FLIP_CANDLE_AGE_MAX_SEC)
-                        evaluated.append(entry)
-                        continue
-                except Exception:
-                    # If the check fails for some reason, be conservative and allow evaluation to continue
-                    logger.debug("Candle age check failed for %s (start_at=%s), continuing evaluation", sym, start_at)
+                # ---- TV RATING FILTER: Reject if below TRADE_RATING_MIN ----
+                if TRADE_RATING_MIN_VAL > 0.0 and tv_score < TRADE_RATING_MIN_VAL:
+                    entry["accept"] = False
+                    entry["reason"] = f"tv_rating_below_threshold_{tv_score:.4f}"
+                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN_VAL)
+                    evaluated.append(entry)
+                    continue
 
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
@@ -1029,6 +1125,11 @@ class Scanner:
 
         candidates = to_open
 
+        # ---- PRIORITIZE BY TV RATING ----
+        if TRADE_RATING_PRIORITIZE and candidates:
+            candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
+            logger.info("Sorted %d candidates by TV rating (highest first)", len(candidates))
+
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
@@ -1044,13 +1145,13 @@ class Scanner:
                 lst = grouped.get(rt, [])
                 if not lst:
                     continue
-                top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                top = lst[:remaining_slots]
                 selected.extend(top)
                 remaining_slots -= len(top)
 
             if remaining_slots > 0:
                 remaining_candidates = [c for c in candidates if c not in selected]
-                remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                remaining_sorted = remaining_candidates[:remaining_slots]
                 selected.extend(remaining_sorted)
 
             candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
@@ -1067,12 +1168,12 @@ class Scanner:
                     lst = grouped.get(rt, [])
                     if not lst:
                         continue
-                    top = sorted(lst, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                    top = lst[:remaining_slots]
                     selected.extend(top)
                     remaining_slots -= len(top)
                 if remaining_slots > 0:
                     remaining_candidates = [c for c in candidates if c not in selected]
-                    remaining_sorted = sorted(remaining_candidates, key=lambda r: self._compute_combined_score(r), reverse=True)[:remaining_slots]
+                    remaining_sorted = remaining_candidates[:remaining_slots]
                     selected.extend(remaining_sorted)
                 candidates = sorted(selected, key=lambda r: self._compute_combined_score(r), reverse=True)
             else:

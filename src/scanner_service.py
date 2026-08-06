@@ -990,28 +990,40 @@ class Scanner:
             elapsed = time.time() - start
 
             if ROOT_SCAN_INTERVAL:
+                # Fixed interval: sleep only the remaining time
                 to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
                 logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
                 await asyncio.sleep(to_sleep)
             else:
+                # ROOT_SCAN_INTERVAL = 0: Align to next 5-minute boundary AT THE DOT
                 now_sleep = time.time()
                 now_struct = time.gmtime(now_sleep)
                 current_minute = now_struct.tm_min
                 current_second = now_struct.tm_sec
+                current_hour = now_struct.tm_hour
 
-                next_5m_minute = ((current_minute // 5) + 1) * 5
-
-                if next_5m_minute >= 60:
-                    to_sleep = (60 - current_minute) * 60 - current_second
+                # Calculate seconds until next 5-minute boundary
+                minutes_past = current_minute % 5
+                if minutes_past == 0 and current_second < 2:
+                    # Already at/very near 5-min boundary, go to next one
+                    to_sleep = 300 - current_second
                 else:
-                    to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
-
-                to_sleep = max(1, min(300, to_sleep))
+                    # Seconds remaining in current 5-min period + buffer to hit next boundary exactly
+                    seconds_in_current_5min = minutes_past * 60 + current_second
+                    to_sleep = 300 - seconds_in_current_5min
                 
-                logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
-                           to_sleep, current_minute, current_second, next_5m_minute % 60)
+                to_sleep = max(1, min(300, to_sleep))
+                next_boundary_minute = ((current_minute // 5) + 1) * 5
+                if next_boundary_minute >= 60:
+                    next_boundary_minute = next_boundary_minute % 60
+                
+                logger.info(
+                    "[DIAGNOSTIC] Aligning to next 5m boundary: sleeping %.1f seconds (current=%02d:%02d:%02d, next=:%02d:00)",
+                    to_sleep, current_hour, current_minute, current_second, next_boundary_minute
+                )
                 await asyncio.sleep(to_sleep)
 
+    
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []

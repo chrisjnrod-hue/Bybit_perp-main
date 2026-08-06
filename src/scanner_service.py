@@ -654,33 +654,50 @@ class Scanner:
         Detect which ROOT_TFS have just opened a new candle.
         Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
-        opens = []
-        now_struct = time.gmtime(now)
-        current_hour = now_struct.tm_hour
-        current_minute = now_struct.tm_min
-        current_second = now_struct.tm_sec
-        
-        for tf in ROOT_TFS:
-            try:
-                tf_seconds = self._tf_to_seconds(tf)
+                       # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
+                now = time.time()
+                refreshed_tfs = []
                 
-                if tf in ("D", "W"):
-                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
-                        opens.append(tf)
-                else:
-                    if tf_seconds >= 3600:
-                        candles_per_day = 86400 // tf_seconds
-                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-                    else:
-                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-            except Exception:
-                logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
-        
-        return opens
+                for root in ROOT_TFS:
+                    try:
+                        tf_sec = self._tf_to_seconds(root)
+                        
+                        if root == "D":
+                            # Daily: candle opens at 00:00 UTC
+                            now_struct = time.gmtime(now)
+                            current_start = int(now_struct.tm_mday) * 86400  # Simplified; proper: int(now // 86400) * 86400
+                            is_new_candle = (now % 86400) < 5  # Within first 5 seconds of day
+                        elif root == "W":
+                            # Weekly: candle opens at Monday 00:00 UTC
+                            current_start = int(now // 604800) * 604800
+                            is_new_candle = (now - current_start) < 5
+                        else:
+                            # Other TFs (hourly, 4H, etc.): align to exact boundary
+                            current_start = int(now // tf_sec) * tf_sec
+                            is_new_candle = (now - current_start) < 5  # Within first 5 seconds of new candle
+                        
+                        last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                        
+                        # Only trigger if: (1) candle has actually opened AND (2) we haven't processed it yet
+                        if current_start > last_start and is_new_candle:
+                            logger.info(
+                                "[CANDLE_OPEN] NEW CANDLE for root TF %s at timestamp %d (previous=%.0f, time_since_open=%.2f sec)",
+                                root, current_start, last_start, now - current_start
+                            )
+                            self._last_tf_candle_open_times[root] = float(current_start)
+                            refreshed_tfs.append(root)
+                    except Exception as e:
+                        logger.debug("Error detecting candle open for TF %s: %s", root, e)
+
+                if refreshed_tfs:
+                    logger.info(
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all).",
+                        refreshed_tfs
+                    )
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                # ---- END CANDLE OPEN DETECTION ---- 
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
         """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""

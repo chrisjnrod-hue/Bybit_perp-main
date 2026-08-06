@@ -72,12 +72,29 @@ MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 # Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
+# Default config dictionary for TradeManager
+DEFAULT_TRADE_MANAGER_CONFIG = {
+    "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
+    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
+    "MIN_MARKET_CAP": float(os.getenv("MIN_MARKET_CAP", "50000000")),
+    "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
+    "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
+    "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
+    "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
+    "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
+    "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
+    "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1").strip().lower() in ("1", "true", "yes", "y"),
+}
+
 
 class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-        self.trade_manager = TradeManager()
+        # FIX: Pass both exchange_client and config to TradeManager
+        self.trade_manager = TradeManager(exchange_client=self.client, config=DEFAULT_TRADE_MANAGER_CONFIG)
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
@@ -1213,9 +1230,14 @@ class Scanner:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-            symbol_info = await self.client.get_symbol_info(sym)
-            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
-            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+            
+            try:
+                symbol_info = await self.client.get_symbol_info(sym)
+            except Exception:
+                symbol_info = {}
+            
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance if balance else 0.0, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step") if symbol_info else None, symbol_info.get("min_qty") if symbol_info else None)
             if qty <= 0 or math.isclose(qty, 0.0):
                 c["accept"] = False
                 c["reason"] = "zero_qty"
@@ -1230,7 +1252,7 @@ class Scanner:
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
                     order = await self.client.create_order(sym, side, qty)
-                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    await self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
                         eval["accept"] = True
@@ -1250,7 +1272,7 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
-                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
+                await self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True

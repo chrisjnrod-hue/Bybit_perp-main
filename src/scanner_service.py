@@ -1,4 +1,4 @@
-# scanner_service.py
+# scanner_service (45).py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 
@@ -691,44 +691,45 @@ class Scanner:
             logger.debug("Error in dedupe check: %s", e)
             return True
 
-    async def _wait_until_next_scan_boundary(self):
+    async def _wait_until_next_scan_boundary(self) -> float:
         """
-        Wait until the next scan boundary (clock-aligned).
-        
+        Wait until the next scan boundary (clock-aligned) and return the boundary timestamp.
+
         - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
-        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (00, 05, 10, ..., 55 minutes).
+        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (multiples of 300s: 00, 05, 10, ...).
+        
+        Returns:
+            float: the epoch timestamp (seconds) of the boundary we woke for.
         """
         now = time.time()
-        
+
         if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
-            # Align to multiples of ROOT_SCAN_INTERVAL from epoch
+            # Align to multiples of ROOT_SCAN_INTERVAL from epoch (exact)
             next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
             to_sleep = next_boundary - now
             logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.2f sec to align to boundary",
-                ROOT_SCAN_INTERVAL, to_sleep
+                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.3f sec to align to boundary (ts=%d)",
+                ROOT_SCAN_INTERVAL, to_sleep, int(next_boundary)
             )
+            if to_sleep > 0:
+                await asyncio.sleep(to_sleep)
+            return float(next_boundary)
         else:
-            # ROOT_SCAN_INTERVAL = 0 or not set: align to next 5-minute boundary
-            now_struct = time.gmtime(now)
-            current_minute = now_struct.tm_min
-            current_second = now_struct.tm_sec
-            
-            next_5m_minute = ((current_minute // 5) + 1) * 5
-            
-            if next_5m_minute >= 60:
-                to_sleep = (60 - current_minute) * 60 - current_second
-            else:
-                to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
-            
-            to_sleep = max(1, min(300, to_sleep))
-            
+            # ROOT_SCAN_INTERVAL = 0: align to next 5-minute boundary (multiples of 300 seconds)
+            FIVE_MIN = 300
+            next_boundary = ((int(now) // FIVE_MIN) + 1) * FIVE_MIN
+            to_sleep = next_boundary - now
+            # Ensure non-negative sleep
+            to_sleep = max(0.0, to_sleep)
+            # Log target in human readable terms
+            next_struct = time.gmtime(next_boundary)
             logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m candle (current=%02d:%02d, target=:%02d:00, sleep=%.1f sec)",
-                current_minute, current_second, next_5m_minute % 60, to_sleep
+                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m boundary at %02d:%02d:%02d UTC (sleeping %.3f sec)",
+                next_struct.tm_hour, next_struct.tm_min, next_struct.tm_sec, to_sleep
             )
-        
-        await asyncio.sleep(to_sleep)
+            if to_sleep > 0:
+                await asyncio.sleep(to_sleep)
+            return float(next_boundary)
 
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
@@ -738,9 +739,10 @@ class Scanner:
             loop_count += 1
 
             # ===== SYNC TO NEXT SCAN BOUNDARY (BEFORE ANY WORK) =====
-            await self._wait_until_next_scan_boundary()
+            # _wait_until_next_scan_boundary now returns the exact boundary timestamp we aligned to.
+            boundary_ts = await self._wait_until_next_scan_boundary()
 
-            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d at boundary_ts=%d", loop_count, int(boundary_ts))
 
             start = time.time()
             try:
@@ -759,7 +761,7 @@ class Scanner:
                 await self._ensure_rest_poller()
 
                 # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
-                now = time.time()
+                now = float(boundary_ts)  # use exact boundary timestamp for open detection
                 refreshed_tfs = []
                 for root in ROOT_TFS:
                     current_start = self._get_current_candle_start(root, now)
@@ -894,7 +896,8 @@ class Scanner:
                     # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
-                now_ts = time.time()
+                # Use the exact boundary timestamp for Telegram full-push decision so pushes are tied to the aligned boundary
+                now_ts = float(boundary_ts)
                 is_full_push = self.telegram.check_full_push(now_ts)
 
                 if root_signals and is_full_push:

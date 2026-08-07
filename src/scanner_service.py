@@ -649,38 +649,290 @@ class Scanner:
             return closes
         return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
-    def _detect_tf_candle_opens(self, now: float) -> List[str]:
+    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
         """
-        Detect which ROOT_TFS have just opened a new candle.
-        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
+        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
         """
-        opens = []
-        now_struct = time.gmtime(now)
-        current_hour = now_struct.tm_hour
-        current_minute = now_struct.tm_min
-        current_second = now_struct.tm_sec
+        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
+
+    def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
+        """
+        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
+        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
+        Caches the signal timestamp to prevent re-triggers across scan cycles.
+        """
+        if SIGNAL_DEDUP_WINDOW <= 0:
+            # Deduplication disabled
+            return True
         
-        for tf in ROOT_TFS:
-            try:
-                tf_seconds = self._tf_to_seconds(tf)
+        if candle_open_time is None:
+            logger.debug("Cannot dedupe signal: candle_open_time is None")
+            return True
+        
+        try:
+            cache_key = (symbol, tf, int(candle_open_time))
+            
+            if cache_key in self._signal_cache:
+                last_signal_time = self._signal_cache[cache_key]
+                time_since_last = now - last_signal_time
                 
-                if tf in ("D", "W"):
-                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
-                        opens.append(tf)
-                else:
-                    if tf_seconds >= 3600:
-                        candles_per_day = 86400 // tf_seconds
-                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-                    else:
-                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
-                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
-                            opens.append(tf)
-            except Exception:
-                logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
+                if time_since_last < SIGNAL_DEDUP_WINDOW:
+                    logger.debug(
+                        "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
+                        symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
+                    )
+                    return False
+            
+            # Signal is new or cache expired; update cache
+            self._signal_cache[cache_key] = now
+            logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
+            return True
+        except Exception as e:
+            logger.debug("Error in dedupe check: %s", e)
+            return True
+
+    async def _wait_until_next_scan_boundary(self):
+        """
+        Wait until the next scan boundary (clock-aligned).
         
-        return opens
+        - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
+        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (00, 05, 10, ..., 55 minutes).
+        """
+        now = time.time()
+        
+        if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
+            # Align to multiples of ROOT_SCAN_INTERVAL from epoch
+            next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
+            to_sleep = next_boundary - now
+            logger.info(
+                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.2f sec to align to boundary",
+                ROOT_SCAN_INTERVAL, to_sleep
+            )
+        else:
+            # ROOT_SCAN_INTERVAL = 0 or not set: align to next 5-minute boundary
+            now_struct = time.gmtime(now)
+            current_minute = now_struct.tm_min
+            current_second = now_struct.tm_sec
+            
+            next_5m_minute = ((current_minute // 5) + 1) * 5
+            
+            if next_5m_minute >= 60:
+                to_sleep = (60 - current_minute) * 60 - current_second
+            else:
+                to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
+            
+            to_sleep = max(1, min(300, to_sleep))
+            
+            logger.info(
+                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m candle (current=%02d:%02d, target=:%02d:00, sleep=%.1f sec)",
+                current_minute, current_second, next_5m_minute % 60, to_sleep
+            )
+        
+        await asyncio.sleep(to_sleep)
+
+    async def root_scan_loop(self):
+        logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        loop_count = 0
+
+        while not self._stop:
+            loop_count += 1
+
+            # ===== SYNC TO NEXT SCAN BOUNDARY (BEFORE ANY WORK) =====
+            await self._wait_until_next_scan_boundary()
+
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
+
+            start = time.time()
+            try:
+                if not self.symbols:
+                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
+                    await self.discover_symbols()
+                    if self.symbols:
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
+                        await self.seed_all()
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                    else:
+                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
+                        await asyncio.sleep(10)
+                        continue
+
+                await self._ensure_rest_poller()
+
+                # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
+                now = time.time()
+                refreshed_tfs = []
+                for root in ROOT_TFS:
+                    current_start = self._get_current_candle_start(root, now)
+                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    
+                    if current_start > last_start:
+                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
+                        self._last_tf_candle_open_times[root] = float(current_start)
+                        refreshed_tfs.append(root)
+
+                if refreshed_tfs:
+                    logger.info(
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                        refreshed_tfs
+                    )
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                # -------------------------------------------------------------
+
+                root_signals: List[Dict[str, Any]] = []
+                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
+
+                async def check_symbol(sym: str):
+                    try:
+                        async with self.request_sem:
+                            price = await self.client.get_latest_price(sym)
+
+                        if price is None:
+                            try:
+                                if ROOT_TFS and USE_WS and self.client.is_ws_connected():
+                                    ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
+                                    if ws_last and ws_last.get("close") is not None:
+                                        price = float(ws_last.get("close"))
+                            except Exception:
+                                price = None
+
+                        if price is None:
+                            return
+
+                        self._last_price_cache[sym] = price
+
+                        # Ensure 24h volume is fully updated prior to signal generation
+                        await self._update_24h_volume(sym)
+
+                        now_check = time.time()
+
+                        for root in ROOT_TFS:
+                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
+
+                            macd_line, sig, hist = self.compute_macd_for(
+                                sym,
+                                root,
+                                include_price=price,
+                                use_ws_current=True
+                            )
+
+                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+
+                            logger.info(
+                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
+                                sym,
+                                root,
+                                flip
+                            )
+
+                            if hist and flip:
+                                vol_change = self.compute_24h_volume_change(sym)
+                                start_at = None
+                                try:
+                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                    if last_candles:
+                                        start_at = last_candles[-1].get("start_at")
+                                except Exception:
+                                    start_at = None
+
+                                # Check if candle is fresh enough for trading
+                                candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
+                                
+                                # Check if this signal was already generated in recent past (deduplication)
+                                is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
+                                
+                                if not is_new_signal:
+                                    logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
+                                    continue
+
+                                tv_score, tv_label = self.compute_tv_rating(sym, root, price)
+                                
+                                # Pre-compute MTF alignment so immediate blocks never show N/A status
+                                mtf_align = self._compute_mtf_alignment(sym, price)
+
+                                sig_item = {
+                                    "symbol": sym,
+                                    "root": root,
+                                    "price": price,
+                                    "hist": hist,
+                                    "vol_change": vol_change,
+                                    "start_at": start_at,
+                                    "tv_score": tv_score,
+                                    "tv_label": tv_label,
+                                    "candle_age_ok": candle_age_ok,
+                                    "mtf_status": mtf_align.get("status", "N/A"),
+                                    "negative_tfs": mtf_align.get("negative_tfs", []),
+                                    "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
+                                }
+                                root_signals.append(sig_item)
+                                if not candle_age_ok:
+                                    logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                else:
+                                    logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                
+                    except Exception:
+                        logger.exception("Error checking symbol %s", sym)
+
+                checked_count = 0
+                for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
+                    if self._stop:
+                        break
+                    batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
+                    tasks = [asyncio.create_task(check_symbol(s)) for s in batch]
+                    await asyncio.gather(*tasks)
+                    checked_count += len(batch)
+                    if i + REQUEST_BATCH_SIZE < len(self.symbols):
+                        await asyncio.sleep(REQUEST_BATCH_DELAY)
+
+                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
+
+                # Capture newly aligned monitored signals and evaluate them immediately
+                newly_aligned = await self._check_monitored_symbols()
+                evaluated_aligned = []
+                if newly_aligned:
+                    # Allow execution for monitored signals that are now fully aligned
+                    evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
+
+                now_ts = time.time()
+                is_full_push = self.telegram.check_full_push(now_ts)
+
+                if root_signals and is_full_push:
+                    for sig in root_signals:
+                        try:
+                            sym = sig["symbol"]
+                            if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
+                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                        except Exception:
+                            logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
+
+                # Evaluate new candidates for trade manager execution
+                evaluated_signals = []
+                if root_signals:
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
+
+                # Combine both new signals and resolved monitoring signals for the Telegram summary
+                if newly_aligned:
+                    root_signals.extend(newly_aligned)
+                    evaluated_signals.extend(evaluated_aligned)
+
+                # Dispatch Telegram summary messages
+                if hasattr(self.telegram, "send_summary"):
+                    try:
+                        await self.telegram.send_summary(
+                            root_signals=root_signals,
+                            evaluated=evaluated_signals,
+                            full_push=is_full_push,
+                            is_candle_open=is_full_push
+                        )
+                    except Exception:
+                        logger.exception("Failed to dispatch Telegram summary")
+
+                if is_full_push:
+                    self.telegram.mark_full_push_sent()
+
+            except Exception:
+                logger.exception("Error in root scan loop")
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
         """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
@@ -744,291 +996,6 @@ class Scanner:
 
         return newly_aligned
 
-    def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
-        """
-        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
-        """
-        return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
-
-    def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
-        """
-        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
-        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
-        Caches the signal timestamp to prevent re-triggers across scan cycles.
-        """
-        if SIGNAL_DEDUP_WINDOW <= 0:
-            # Deduplication disabled
-            return True
-        
-        if candle_open_time is None:
-            logger.debug("Cannot dedupe signal: candle_open_time is None")
-            return True
-        
-        try:
-            cache_key = (symbol, tf, int(candle_open_time))
-            
-            if cache_key in self._signal_cache:
-                last_signal_time = self._signal_cache[cache_key]
-                time_since_last = now - last_signal_time
-                
-                if time_since_last < SIGNAL_DEDUP_WINDOW:
-                    logger.debug(
-                        "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
-                        symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
-                    )
-                    return False
-            
-            # Signal is new or cache expired; update cache
-            self._signal_cache[cache_key] = now
-            logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
-            return True
-        except Exception as e:
-            logger.debug("Error in dedupe check: %s", e)
-            return True
-
-    async def root_scan_loop(self):
-    logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
-    loop_count = 0
-
-    while not self._stop:
-        loop_count += 1
-
-        # Sync start: wait until the next scan boundary BEFORE doing work
-        await self._wait_until_next_scan_boundary()
-
-        logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
-
-        start = time.time()
-        try:
-            if not self.symbols:
-                logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
-                await self.discover_symbols()
-                if self.symbols:
-                    logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
-                    await self.seed_all()
-                    logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
-                else:
-                    logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
-                    await asyncio.sleep(10)
-                    continue
-
-            await self._ensure_rest_poller()
-
-            # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
-            now = time.time()
-            refreshed_tfs = []
-            for root in ROOT_TFS:
-                current_start = self._get_current_candle_start(root, now)
-                last_start = self._last_tf_candle_open_times.get(root, 0.0)
-                
-                if current_start > last_start:
-                    logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
-                    self._last_tf_candle_open_times[root] = float(current_start)
-                    refreshed_tfs.append(root)
-
-            if refreshed_tfs:
-                logger.info(
-                    "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
-                    "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
-                    refreshed_tfs
-                )
-                await self.seed_all()
-                logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
-            # -------------------------------------------------------------
-
-            root_signals: List[Dict[str, Any]] = []
-            logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
-
-            async def check_symbol(sym: str):
-                try:
-                    async with self.request_sem:
-                        price = await self.client.get_latest_price(sym)
-
-                    if price is None:
-                        try:
-                            if ROOT_TFS and USE_WS and self.client.is_ws_connected():
-                                ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
-                                if ws_last and ws_last.get("close") is not None:
-                                    price = float(ws_last.get("close"))
-                        except Exception:
-                            price = None
-
-                    if price is None:
-                        return
-
-                    self._last_price_cache[sym] = price
-
-                    # Ensure 24h volume is fully updated prior to signal generation
-                    await self._update_24h_volume(sym)
-
-                    now_check = time.time()
-
-                    for root in ROOT_TFS:
-                        logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
-
-                        macd_line, sig, hist = self.compute_macd_for(
-                            sym,
-                            root,
-                            include_price=price,
-                            use_ws_current=True
-                        )
-
-                        flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
-
-                        logger.info(
-                            "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
-                            sym,
-                            root,
-                            flip
-                        )
-
-                        if hist and flip:
-                            vol_change = self.compute_24h_volume_change(sym)
-                            start_at = None
-                            try:
-                                last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                if last_candles:
-                                    start_at = last_candles[-1].get("start_at")
-                            except Exception:
-                                start_at = None
-
-                            # Check if candle is fresh enough for trading
-                            candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-                            
-                            # Check if this signal was already generated in recent past (deduplication)
-                            is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
-                            
-                            if not is_new_signal:
-                                logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
-                                continue
-
-                            tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                            
-                            # Pre-compute MTF alignment so immediate blocks never show N/A status
-                            mtf_align = self._compute_mtf_alignment(sym, price)
-
-                            sig_item = {
-                                "symbol": sym,
-                                "root": root,
-                                "price": price,
-                                "hist": hist,
-                                "vol_change": vol_change,
-                                "start_at": start_at,
-                                "tv_score": tv_score,
-                                "tv_label": tv_label,
-                                "candle_age_ok": candle_age_ok,
-                                "mtf_status": mtf_align.get("status", "N/A"),
-                                "negative_tfs": mtf_align.get("negative_tfs", []),
-                                "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
-                            }
-                            root_signals.append(sig_item)
-                            if not candle_age_ok:
-                                logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                            else:
-                                logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                            
-                except Exception:
-                    logger.exception("Error checking symbol %s", sym)
-
-            checked_count = 0
-            for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
-                if self._stop:
-                    break
-                batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
-                tasks = [asyncio.create_task(check_symbol(s)) for s in batch]
-                await asyncio.gather(*tasks)
-                checked_count += len(batch)
-                if i + REQUEST_BATCH_SIZE < len(self.symbols):
-                    await asyncio.sleep(REQUEST_BATCH_DELAY)
-
-            logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
-
-            # Capture newly aligned monitored signals and evaluate them immediately
-            newly_aligned = await self._check_monitored_symbols()
-            evaluated_aligned = []
-            if newly_aligned:
-                # Allow execution for monitored signals that are now fully aligned
-                evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
-
-            now_ts = time.time()
-            is_full_push = self.telegram.check_full_push(now_ts)
-
-            if root_signals and is_full_push:
-                for sig in root_signals:
-                    try:
-                        sym = sig["symbol"]
-                        if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                            await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
-                    except Exception:
-                        logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
-
-            # Evaluate new candidates for trade manager execution
-            evaluated_signals = []
-            if root_signals:
-                evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
-
-            # Combine both new signals and resolved monitoring signals for the Telegram summary
-            if newly_aligned:
-                root_signals.extend(newly_aligned)
-                evaluated_signals.extend(evaluated_aligned)
-
-            # Dispatch Telegram summary messages
-            if hasattr(self.telegram, "send_summary"):
-                try:
-                    await self.telegram.send_summary(
-                        root_signals=root_signals,
-                        evaluated=evaluated_signals,
-                        full_push=is_full_push,
-                        is_candle_open=is_full_push
-                    )
-                except Exception:
-                    logger.exception("Failed to dispatch Telegram summary")
-
-            if is_full_push:
-                self.telegram.mark_full_push_sent()
-
-        except Exception:
-            logger.exception("Error in root scan loop")
-
-    async def _wait_until_next_scan_boundary(self):
-        """
-        Wait until the next scan boundary (clock-aligned).
-        
-        - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
-        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (00, 05, 10, ..., 55 minutes).
-        """
-        now = time.time()
-        
-        if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
-            # Align to multiples of ROOT_SCAN_INTERVAL from epoch
-            next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
-            to_sleep = next_boundary - now
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.2f sec to align to boundary (next @ T+%.0f)",
-                ROOT_SCAN_INTERVAL, to_sleep, next_boundary - int(now // 60) * 60
-            )
-        else:
-            # ROOT_SCAN_INTERVAL = 0 or not set: align to next 5-minute boundary
-            now_struct = time.gmtime(now)
-            current_minute = now_struct.tm_min
-            current_second = now_struct.tm_sec
-            
-            next_5m_minute = ((current_minute // 5) + 1) * 5
-            
-            if next_5m_minute >= 60:
-                to_sleep = (60 - current_minute) * 60 - current_second
-            else:
-                to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
-            
-            to_sleep = max(1, min(300, to_sleep))
-            
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m candle (current=%02d:%02d, target=:%02d:00, sleep=%.1f sec)",
-                current_minute, current_second, next_5m_minute % 60, to_sleep
-            )
-        
-        await asyncio.sleep(to_sleep)
-    
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []

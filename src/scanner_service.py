@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional, Callable, Tuple
 import math
 import inspect
 from decimal import getcontext
+import functools
 
 getcontext().prec = 28
 
@@ -47,6 +48,12 @@ logger = get_logger("scanner")
 SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
+
+# Per-client-call timeout (seconds)
+try:
+    DEFAULT_CLIENT_CALL_TIMEOUT = float(os.getenv("CLIENT_CALL_TIMEOUT", "10.0"))
+except Exception:
+    DEFAULT_CLIENT_CALL_TIMEOUT = 10.0
 
 # Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
 try:
@@ -130,10 +137,10 @@ class Scanner:
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s CLIENT_CALL_TIMEOUT=%.1f",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT, DEFAULT_CLIENT_CALL_TIMEOUT
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -154,18 +161,46 @@ class Scanner:
                 logger.exception("Callback for event %s failed", event)
 
     async def _call_client_method(self, names: List[str], *args, **kwargs):
+        """
+        Safe caller for exchange client methods:
+          - If client method is an async function -> await it.
+          - If client method is synchronous (blocking) -> run in thread executor.
+          - Apply a timeout so a hung request doesn't stall the loop indefinitely.
+        """
+        loop = asyncio.get_running_loop()
         for name in names:
             try:
                 fn = getattr(self.client, name, None)
                 if not fn:
                     continue
-                res = fn(*args, **kwargs)
-                if inspect.isawaitable(res):
-                    res = await res
-                return res
+
+                # If it's an async function, await it with timeout
+                if inspect.iscoroutinefunction(fn):
+                    try:
+                        return await asyncio.wait_for(fn(*args, **kwargs), timeout=DEFAULT_CLIENT_CALL_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.debug("Client coroutine %s timed out", name)
+                        continue
+                    except Exception:
+                        logger.debug("Client coroutine %s raised", name, exc_info=True)
+                        continue
+
+                # If callable but synchronous, execute in default executor to avoid blocking the event loop
+                if callable(fn):
+                    call = functools.partial(fn, *args, **kwargs)
+                    try:
+                        return await asyncio.wait_for(loop.run_in_executor(None, call), timeout=DEFAULT_CLIENT_CALL_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.debug("Client sync method %s timed out in executor", name)
+                        continue
+                    except Exception:
+                        logger.debug("Client sync method %s raised in executor", name, exc_info=True)
+                        continue
+
             except Exception:
                 logger.debug("Client method %s failed", name, exc_info=True)
                 continue
+
         logger.debug("No client method among %s succeeded", names)
         return None
 
@@ -283,7 +318,9 @@ class Scanner:
 
             if USE_WS:
                 try:
-                    await self.client.start_kline_ws()
+                    # start_kline_ws may be coroutine or sync; use safe wrapper if present
+                    if hasattr(self.client, "start_kline_ws"):
+                        await self._call_client_method(["start_kline_ws", "startKlineWs", "start_kline_ws"],)
                 except Exception:
                     logger.exception("Failed to start client WS")
             else:
@@ -300,8 +337,8 @@ class Scanner:
                             async with sem:
                                 try:
                                     if hasattr(self.client, "sub_kline"):
-                                        await self.client.sub_kline(s, t)
-                                        logger.debug("[WS_SUB] Successfully subscribed to %s %t", s, t)
+                                        await self._call_client_method(["sub_kline", "subKline", "sub_kline_for_symbol"], s, t)
+                                        logger.debug("[WS_SUB] Successfully subscribed to %s %s", s, t)
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
@@ -326,12 +363,17 @@ class Scanner:
             logger.warning("SEED_KLINES_LIMIT is very low (%d); MACD requires >=26 for stability", SEED_KLINES_LIMIT)
 
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
+        logger.debug("seed_klines_for_symbol START %s (tfs=%s)", symbol, tfs)
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
 
                 async with self.request_sem:
-                    raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
+                    try:
+                        raw = await asyncio.wait_for(self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT), timeout=DEFAULT_CLIENT_CALL_TIMEOUT + 2.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Timed out fetching klines for %s %s", symbol, tf)
+                        continue
 
                 if not raw:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
@@ -419,18 +461,22 @@ class Scanner:
                 await self._emit_event("klines_seeded", {"symbol": symbol, "tf": tf, "count": len(klines_sorted)})
             except Exception:
                 logger.exception("Seed klines failed for %s %s", symbol, tf)
+        logger.debug("seed_klines_for_symbol DONE %s", symbol)
 
     async def seed_all(self):
         logger.info("[DIAGNOSTIC] seed_all: STARTING with %d symbols", len(self.symbols))
         async def worker(sym: str):
             async with self.concurrent_sem:
-                await self.seed_klines_for_symbol(sym)
+                try:
+                    await self.seed_klines_for_symbol(sym)
+                except Exception:
+                    logger.exception("seed_all worker failed for %s", sym)
 
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
             tasks = [asyncio.create_task(worker(s)) for s in batch]
             if tasks:
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks, return_exceptions=True)
             if i + REQUEST_BATCH_SIZE < len(self.symbols):
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
 
@@ -568,7 +614,19 @@ class Scanner:
             current_price = float(include_price)
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
-                ws_last = self.client.get_ws_latest_kline(symbol, tf)
+                ws_last = None
+                # try safe wrapper if the client implements an async or sync accessor
+                if inspect.iscoroutinefunction(getattr(self.client, "get_ws_latest_kline")):
+                    try:
+                        ws_last = asyncio.run(self._call_client_method(["get_ws_latest_kline"], symbol, tf))
+                    except Exception:
+                        ws_last = None
+                else:
+                    try:
+                        ws_last = getattr(self.client, "get_ws_latest_kline")(symbol, tf)
+                    except Exception:
+                        ws_last = None
+
                 if ws_last and ws_last.get("close") is not None:
                     current_price = float(ws_last.get("close"))
             except Exception:
@@ -818,12 +876,14 @@ class Scanner:
                 async def check_symbol(sym: str):
                     try:
                         async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
+                            price = await self._call_client_method(["get_latest_price", "getLatestPrice", "get_price", "getLatest"], sym)
 
                         if price is None:
                             try:
                                 if ROOT_TFS and USE_WS and self.client.is_ws_connected():
-                                    ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
+                                    ws_last = None
+                                    if hasattr(self.client, "get_ws_latest_kline"):
+                                        ws_last = await self._call_client_method(["get_ws_latest_kline", "getWsLatestKline"], sym, ROOT_TFS[0])
                                     if ws_last and ws_last.get("close") is not None:
                                         price = float(ws_last.get("close"))
                             except Exception:
@@ -939,8 +999,8 @@ class Scanner:
                     for sig in root_signals:
                         try:
                             sym = sig["symbol"]
-                            if USE_WS and hasattr(self.client, "subscribe_mtf_for_symbol"):
-                                await self.client.subscribe_mtf_for_symbol(sym, MTF_TFS)
+                            if USE_WS:
+                                await self._call_client_method(["subscribe_mtf_for_symbol", "subscribeMtfForSymbol", "sub_mtf", "subscribe_mtf"], sym, MTF_TFS)
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
@@ -993,7 +1053,7 @@ class Scanner:
                 if price is None:
                     try:
                         async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
+                            price = await self._call_client_method(["get_latest_price", "getLatestPrice", "get_price", "getLatest"], sym)
                         if price:
                             self._last_price_cache[sym] = price
                     except Exception:
@@ -1108,7 +1168,7 @@ class Scanner:
 
                 if MARKET_CAP_MIN and MARKET_CAP_MIN > 0:
                     try:
-                        symbol_info = await self.client.get_symbol_info(sym)
+                        symbol_info = await self._call_client_method(["get_symbol_info", "getSymbolInfo", "symbol_info"], sym)
                         marketcap = None
                         if isinstance(symbol_info, dict):
                             for key in ("market_cap", "marketCap", "market_cap_usd", "marketcap"):
@@ -1274,12 +1334,12 @@ class Scanner:
                 continue
 
             try:
-                balance = await self.client.get_balance("USDT")
+                balance = await self._call_client_method(["get_balance", "getBalance", "balance"], "USDT")
             except Exception:
                 balance = None
             
             try:
-                symbol_info = await self.client.get_symbol_info(sym)
+                symbol_info = await self._call_client_method(["get_symbol_info", "getSymbolInfo", "symbol_info"], sym)
             except Exception:
                 symbol_info = {}
             
@@ -1298,7 +1358,7 @@ class Scanner:
             reason_tag = c.get("reason", "signal")
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
-                    order = await self.client.create_order(sym, side, qty)
+                    order = await self._call_client_method(["create_order", "createOrder", "place_order"], sym, side, qty)
                     await self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
@@ -1349,7 +1409,8 @@ class Scanner:
             logger.info("Scanner run cancelled")
         finally:
             try:
-                await self.client.close()
+                # Use safe wrapper to close client (handles sync/async close)
+                await self._call_client_method(["close", "close_client", "shutdown", "disconnect"],)
             except Exception:
                 logger.exception("Error closing client")
 

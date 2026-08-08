@@ -142,6 +142,7 @@ class Scanner:
         self._callbacks.append(cb)
 
     async def _emit_event(self, event: str, payload: Any):
+        logger.info("[EMIT_EVENT] Emitting event '%s' payload_keys=%s", event, list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
         for cb in list(self._callbacks):
             try:
                 if inspect.iscoroutinefunction(cb):
@@ -274,6 +275,7 @@ class Scanner:
     async def discover_symbols(self) -> List[str]:
         try:
             logger.info("[DIAGNOSTIC] discover_symbols: STARTING")
+            logger.info("[DEBUG] discover_symbols called by scanner")
             syms = await self._get_symbols()
             if not syms:
                 logger.warning("[DIAGNOSTIC] discover_symbols: NO SYMBOLS FOUND!")
@@ -301,7 +303,7 @@ class Scanner:
                                 try:
                                     if hasattr(self.client, "sub_kline"):
                                         await self.client.sub_kline(s, t)
-                                        logger.debug("[WS_SUB] Successfully subscribed to %s %t", s, t)
+                                        logger.debug("[WS_SUB] Successfully subscribed to %s %s", s, t)
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
@@ -328,13 +330,13 @@ class Scanner:
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
         for tf in tfs:
             try:
-                logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
+                logger.info("[SEED_START] seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
 
                 async with self.request_sem:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
 
                 if not raw:
-                    logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
+                    logger.debug("[SEED] No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 
                 if DEBUG_SURGICAL_LOGS:
@@ -405,7 +407,7 @@ class Scanner:
                     except Exception:
                         txt = str(raw)
                     snippet_trunc = (txt[:500] + '...') if len(txt) > 500 else txt
-                    logger.debug("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
+                    logger.debug("[SEED] Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
                     continue
 
                 try:
@@ -423,11 +425,14 @@ class Scanner:
     async def seed_all(self):
         logger.info("[DIAGNOSTIC] seed_all: STARTING with %d symbols", len(self.symbols))
         async def worker(sym: str):
+            logger.debug("[SEED_WORKER] Starting seed worker for %s", sym)
             async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
+            logger.debug("[SEED_WORKER] Completed seed worker for %s", sym)
 
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
+            logger.debug("[SEED_BATCH] Processing batch %d..%d (size=%d)", i, i+len(batch)-1, len(batch))
             tasks = [asyncio.create_task(worker(s)) for s in batch]
             if tasks:
                 await asyncio.gather(*tasks)
@@ -448,6 +453,7 @@ class Scanner:
 
                 start = time.time()
                 if not self.symbols:
+                    logger.debug("[REST_POLLER] No symbols to poll; sleeping")
                     await asyncio.sleep(REST_POLL_INTERVAL)
                     continue
 
@@ -520,9 +526,11 @@ class Scanner:
                 except Exception:
                     pass
                 self._rest_poller_task = None
+            logger.debug("[REST_POLLER_CHECK] WS connected; no rest poller needed")
             return
 
         if self._rest_poller_task and not self._rest_poller_task.done():
+            logger.debug("[REST_POLLER_CHECK] Rest poller already running")
             return
 
         logger.info("[REST_POLLER_START] WS unavailable, starting REST poller as fallback")
@@ -934,6 +942,7 @@ class Scanner:
                 # Use the exact boundary timestamp for Telegram full-push decision so pushes are tied to the aligned boundary
                 now_ts = float(boundary_ts)
                 is_full_push = self.telegram.check_full_push(now_ts)
+                logger.debug("[TELEGRAM] is_full_push=%s now_ts=%d root_signals_count=%d newly_aligned=%d", is_full_push, int(now_ts), len(root_signals), len(newly_aligned))
 
                 if root_signals and is_full_push:
                     for sig in root_signals:
@@ -957,12 +966,14 @@ class Scanner:
                 # Dispatch Telegram summary messages
                 if hasattr(self.telegram, "send_summary"):
                     try:
+                        logger.debug("[TELEGRAM] about to call send_summary: root_signals=%d evaluated=%d full_push=%s is_candle_open=%s", len(root_signals), len(evaluated_signals), is_full_push, is_full_push)
                         await self.telegram.send_summary(
                             root_signals=root_signals,
                             evaluated=evaluated_signals,
                             full_push=is_full_push,
                             is_candle_open=is_full_push
                         )
+                        logger.debug("[TELEGRAM] send_summary returned")
                     except Exception:
                         logger.exception("Failed to dispatch Telegram summary")
 
@@ -1038,6 +1049,7 @@ class Scanner:
         return newly_aligned
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
+        logger.info("[HANDLE_ROOT_DEBUG] handle_root_signals called: len(root_signals)=%d allow_open_trades=%s", len(root_signals), allow_open_trades)
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
 
@@ -1298,6 +1310,7 @@ class Scanner:
             reason_tag = c.get("reason", "signal")
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
+                    logger.debug("[ORDER] Attempting real order for %s qty=%.6f", sym, qty)
                     order = await self.client.create_order(sym, side, qty)
                     await self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     eval = eval_map.get((sym, c["root"]))
@@ -1305,6 +1318,7 @@ class Scanner:
                         eval["accept"] = True
                         eval["reason"] = "opened"
                         eval["order"] = order
+                    logger.info("[SEND_MSG_DEBUG] About to send trade opened message for %s", sym)
                     await send_message(
                         f"✅ Trade Opened – {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
@@ -1319,12 +1333,14 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
+                logger.info("[SIMULATE_ORDER] Simulating open for %s qty=%.6f", sym, qty)
                 await self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True
                     eval["reason"] = "simulated"
                     eval["simulated"] = True
+                logger.info("[SEND_MSG_DEBUG] About to send simulated trade message for %s", sym)
                 await send_message(
                     f"🔔 Simulated Trade – {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
@@ -1343,6 +1359,7 @@ class Scanner:
 
     async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())
+        logger.info("[RUN_TASK] Scanner run() started; root_scan_loop task created")
         try:
             await self._task
         except asyncio.CancelledError:

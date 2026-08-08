@@ -1341,7 +1341,20 @@ class Scanner:
         combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)
         return combined
 
-    async def run(self):
+        async def run(self):
+        # Send small startup diagnostic message if Telegram configured
+        try:
+            test_msg = "Scanner starting up — sending Telegram startup test."
+            res = await send_message(test_msg)
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.warning("TELEGRAM STARTUP TEST skipped (missing token/chat).")
+            elif isinstance(res, dict) and not res.get("ok", True):
+                logger.warning("TELEGRAM STARTUP TEST failed: %s", res)
+            else:
+                logger.info("TELEGRAM STARTUP TEST sent successfully.")
+        except Exception:
+            logger.exception("Telegram startup test send failed")
+
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

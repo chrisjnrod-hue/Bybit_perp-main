@@ -35,6 +35,7 @@ from .scanner_core import (
     quantize_qty,
     compute_macd_from_closes,
     detect_flip_current_open,
+    compute_24h_volume_change_from,
     compute_tv_rating_from,
     compute_mtf_alignment,
     is_candle_age_acceptable,
@@ -87,12 +88,6 @@ DEFAULT_TRADE_MANAGER_CONFIG = {
     "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1").strip().lower() in ("1", "true", "yes", "y"),
 }
 
-# New: minimum 24h USDT volume to allow opening trades. 0 = disabled.
-try:
-    MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "0") or 0)
-except Exception:
-    MIN_24H_VOLUME_USDT = 0.0
-
 
 class Scanner:
     def __init__(self):
@@ -108,7 +103,7 @@ class Scanner:
         self._task: Optional[asyncio.Task] = None
         self._rest_poller_task: Optional[asyncio.Task] = None
         self._callbacks: List[Callable[[str, Any], Any]] = []
-        self._24h_volumes: Dict[str, Dict[str, Any]] = {}
+        self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
@@ -124,16 +119,14 @@ class Scanner:
 
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
-        self.telegram.set_tv_rating_weight(TV_RATING_WEIGHT)
-        self.telegram.set_trade_manager(self.trade_manager)
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -301,7 +294,7 @@ class Scanner:
                                 try:
                                     if hasattr(self.client, "sub_kline"):
                                         await self.client.sub_kline(s, t)
-                                        logger.debug("[WS_SUB] Successfully subscribed to %s %t", s, t)
+                                        logger.debug("[WS_SUB] Successfully subscribed to %s %s", s, t)
                                 except Exception:
                                     logger.exception("sub_kline error for %s %s", s, t)
                         tasks.append(asyncio.create_task(worker()))
@@ -580,7 +573,7 @@ class Scanner:
         return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume info — rely on exchange-provided fields (volume in quote/USDT and volume change pct if provided)."""
+        """Update and track 24h volume data - tries multiple client method names and keys for robustness."""
         try:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
@@ -597,68 +590,45 @@ class Scanner:
                     if isinstance(data["result"], dict):
                         data = data["result"]
 
-            vol_usdt = None
-            vol_change_frac = None
-
+            vol = None
             if isinstance(data, dict):
-                # Try various keys for 24h quote/USDT volume
-                for key in ("quoteVolume", "quote_vol", "quote_vol_usd", "quoteVolume24h", "quoteVol", "volume_usdt", "volume_usd", "turnover", "quote_volume"):
+                for key in ("volume", "vol", "turnover", "volume24h", "quote_vol", "volume_24h"):
                     if key in data and data.get(key) is not None:
                         try:
-                            vol_usdt = float(data.get(key))
+                            vol = float(data.get(key))
                             break
                         except Exception:
                             try:
-                                vol_usdt = float(str(data.get(key)).replace(',', ''))
+                                vol = float(str(data.get(key)).replace(',', ''))
                                 break
                             except Exception:
-                                vol_usdt = None
+                                vol = None
 
-                # Try to extract a volume-change / percent field from exchange if present.
-                for key in ("volumeChange", "volume_change", "vol_change", "volume_change_pct", "volume_pct", "percent", "change", "priceChangePercent", "priceChange", "percentChange"):
-                    if key in data and data.get(key) is not None:
-                        try:
-                            raw = float(data.get(key))
-                            # Normalize to fractional representation internally:
-                            # If the exchange returns a percent like 1.23 => convert to 0.0123
-                            if abs(raw) > 1.5:
-                                vol_change_frac = raw / 100.0
-                            else:
-                                vol_change_frac = raw
-                            break
-                        except Exception:
-                            try:
-                                raw = float(str(data.get(key)).replace(',', '').replace('%', ''))
-                                if abs(raw) > 1.5:
-                                    vol_change_frac = raw / 100.0
-                                else:
-                                    vol_change_frac = raw
-                                break
-                            except Exception:
-                                vol_change_frac = None
+            if vol is None and isinstance(data, (int, float, str)):
+                try:
+                    vol = float(data)
+                except Exception:
+                    vol = None
 
-            # Store the raw/exchange-provided values (normalized)
-            self._24h_volumes[symbol] = {
-                "volume_usdt": vol_usdt,
-                "volume_change": vol_change_frac
-            }
-
-            if vol_usdt is not None:
-                logger.debug("[VOLUME_UPDATE] %s: volume_usdt=%.0f change=%s", symbol, vol_usdt, str(vol_change_frac))
-                return vol_usdt
+            if vol is not None:
+                if symbol not in self._24h_volumes:
+                    self._24h_volumes[symbol] = {"current": vol, "previous": vol}
+                else:
+                    self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
+                    self._24h_volumes[symbol]["current"] = vol
+                logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
+                prev = self._24h_volumes[symbol].get("previous", 0)
+                curr = self._24h_volumes[symbol].get("current", 0)
+                logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
+                return vol
             else:
-                logger.debug("[VOLUME_UPDATE] %s: no volume field matched in ticker: %s", symbol, data if isinstance(data, dict) else str(data))
+                logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
         except Exception:
             logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """Return the normalized fractional volume change reported by the exchange (e.g. 0.012 = +1.2%)."""
-        try:
-            d = self._24h_volumes.get(symbol, {})
-            return d.get("volume_change")
-        except Exception:
-            return None
+        return compute_24h_volume_change_from(self._24h_volumes.get(symbol))
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
         klines = self.kline_store.get(symbol, {}).get(tf, [])
@@ -834,7 +804,7 @@ class Scanner:
 
                         self._last_price_cache[sym] = price
 
-                        # Ensure 24h volume is updated from exchange prior to signal generation
+                        # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
                         now_check = time.time()
@@ -859,11 +829,7 @@ class Scanner:
                             )
 
                             if hist and flip:
-                                # Pull exchange-provided volume info for this symbol
-                                vol_info = self._24h_volumes.get(sym, {})
-                                vol_change = vol_info.get("volume_change")
-                                vol_usdt = vol_info.get("volume_usdt")
-
+                                vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
@@ -892,8 +858,7 @@ class Scanner:
                                     "root": root,
                                     "price": price,
                                     "hist": hist,
-                                    "vol_change": vol_change,            # fractional form if present (e.g. 0.012 -> +1.2%)
-                                    "volume_usdt": vol_usdt,            # raw USDT quote volume if present
+                                    "vol_change": vol_change,
                                     "start_at": start_at,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label,
@@ -1007,16 +972,13 @@ class Scanner:
                 if status in ("aligned", "daily_rising"):
                     logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
-                    vol_info = self._24h_volumes.get(sym, {})
-                    vol_change = vol_info.get("volume_change")
-                    vol_usdt = vol_info.get("volume_usdt")
+                    vol_change = self.compute_24h_volume_change(sym)
                     resolved_item = {
                         "symbol": sym,
                         "root": info["root"],
                         "price": price,
                         "hist": [],
                         "vol_change": vol_change,
-                        "volume_usdt": vol_usdt,
                         "from_monitoring": True,
                         "mtf_status": status,
                         "negative_tfs": mtf_align.get("negative_tfs", []),
@@ -1037,7 +999,6 @@ class Scanner:
 
         return newly_aligned
 
-    
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
@@ -1047,7 +1008,6 @@ class Scanner:
             price = item["price"]
             root = item["root"]
             vol_change = item.get("vol_change")
-            vol_usdt = item.get("volume_usdt")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
             start_at = item.get("start_at")
@@ -1082,7 +1042,6 @@ class Scanner:
                 "negative_tfs": negative_tfs,
                 "one_d_slope": mtf_align.get("one_d_slope"),
                 "vol_change": vol_change,
-                "volume_usdt": vol_usdt,
                 "score": score,
                 "accept": False,
                 "reason": "pending",
@@ -1131,24 +1090,6 @@ class Scanner:
                             continue
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
-
-                # New: minimum 24h USDT volume filter
-                if MIN_24H_VOLUME_USDT and MIN_24H_VOLUME_USDT > 0:
-                    if vol_usdt is None:
-                        entry["accept"] = False
-                        entry["reason"] = "missing_24h_volume"
-                        logger.info("24h USDT volume info missing for %s; blocking due to MIN_24H_VOLUME_USDT=%s", sym, MIN_24H_VOLUME_USDT)
-                        evaluated.append(entry)
-                        continue
-                    try:
-                        if float(vol_usdt) < float(MIN_24H_VOLUME_USDT):
-                            entry["accept"] = False
-                            entry["reason"] = "min_24h_volume_filtered"
-                            logger.info("24h volume filter blocked %s: vol_usdt=%.0f < min=%s", sym, float(vol_usdt), MIN_24H_VOLUME_USDT)
-                            evaluated.append(entry)
-                            continue
-                    except Exception:
-                        logger.exception("Error evaluating 24h volume for %s", sym)
 
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
@@ -1262,7 +1203,6 @@ class Scanner:
             sym = c["symbol"]
             price = c["price"]
             vol_change = c.get("vol_change")
-            vol_usdt = c.get("volume_usdt")
 
             if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                 c["accept"] = False
@@ -1334,27 +1274,14 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated
-                
-   def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
+
+    def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
         mtf_score = candidate.get("score", 0.0)
         tv_score = candidate.get("tv_score", 0.0)
         combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)
         return combined
 
-        async def run(self):
-        # Send small startup diagnostic message if Telegram configured
-        try:
-            test_msg = "Scanner starting up — sending Telegram startup test."
-            res = await send_message(test_msg)
-            if isinstance(res, dict) and res.get("skipped"):
-                logger.warning("TELEGRAM STARTUP TEST skipped (missing token/chat).")
-            elif isinstance(res, dict) and not res.get("ok", True):
-                logger.warning("TELEGRAM STARTUP TEST failed: %s", res)
-            else:
-                logger.info("TELEGRAM STARTUP TEST sent successfully.")
-        except Exception:
-            logger.exception("Telegram startup test send failed")
-
+    async def run(self):
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

@@ -1,4 +1,4 @@
-# scanner_service.py
+# scanner_service (45).py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 
@@ -25,8 +25,7 @@ from .config import (
     MTF_SLOPE_LOOKBACK, ROOT_FILTER, ROOT_TOP_N, MAX_OPEN_TRADES, USE_WS,
     MAX_CONCURRENT_REQUESTS, REQUEST_BATCH_SIZE, REQUEST_BATCH_DELAY,
     REST_POLL_INTERVAL, VOLUME_FILTER_ENABLED, VOLUME_MIN_CHANGE_PCT, TECHNICAL_RATING,
-    FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE,
-    ROOT_SEED_LIMIT, TARGETED_SEED_ENABLED, TRADE_OPEN_MODE
+    FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW, TRADE_RATING_MIN, TRADE_RATING_PRIORITIZE
 )
 from .telegram import send_message
 
@@ -46,7 +45,6 @@ from .scanner_telegram import TelegramSummary
 
 logger = get_logger("scanner")
 
-# Backwards compatibility for environment override of SEED_KLINES_LIMIT if not provided in config import
 SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
@@ -64,6 +62,7 @@ try:
 except (ValueError, TypeError):
     TV_RATING_WEIGHT = 0.3
 
+# If TRADE_RATING_ALLOW is empty list -> allow any rating (backwards compatibility removed)
 TRADE_NO_NEG_VOL = os.getenv("TRADE_NO_NEG_VOL", "1").strip().lower() in ("1", "true", "yes", "y")
 MARKET_CAP_MIN = float(os.getenv("MARKET_CAP_MIN", "0") or 0)
 PRIORITIZE_SLOT_ORDER = [p.strip() for p in os.getenv("PRIORITIZE_SLOT_ORDER", "240,D,60").split(",") if p.strip()]
@@ -109,7 +108,7 @@ class Scanner:
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
-
+        
         # Track which ROOT_TF candles have opened in the current cycle
         self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
@@ -124,10 +123,10 @@ class Scanner:
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s TRADE_OPEN_MODE=%s TARGETED_SEED=%s ROOT_SEED_LIMIT=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, TRADE_OPEN_MODE, TARGETED_SEED_ENABLED, ROOT_SEED_LIMIT
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -331,6 +330,38 @@ class Scanner:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
 
+                if DEBUG_SURGICAL_LOGS:
+                    try:
+                        if isinstance(raw, dict):
+                            logger.info("[SURGICAL_LOG_0] API_KEYS %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
+                            for key in ["list", "result", "data"]:
+                                if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
+                                    first_item = raw[key][0]
+                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s",
+                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
+                                    break
+                        elif isinstance(raw, (list, tuple)):
+                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s",
+                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
+                    except Exception as e:
+                        logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
+
+                if DEBUG_SURGICAL_LOGS:
+                    try:
+                        if isinstance(raw, dict) and "list" in raw:
+                            sample_raw = raw["list"][:3] if isinstance(raw["list"], list) else raw["list"]
+                        elif isinstance(raw, dict) and "result" in raw:
+                            sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
+                        elif isinstance(raw, dict) and "data" in raw:
+                            sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
+                        elif isinstance(raw, list):
+                            sample_raw = raw[:3]
+                        else:
+                            sample_raw = str(raw)[:200]
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
+                    except Exception as e:
+                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, str(e)[:100])
+
                 normalized = normalize_klines(raw, tf)
 
                 valid = []
@@ -353,6 +384,13 @@ class Scanner:
                             })
                     except Exception:
                         continue
+
+                if DEBUG_SURGICAL_LOGS:
+                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d",
+                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
+                    if len(valid) == 0 and len(normalized) > 0:
+                        sample_norm = normalized[:2]
+                        logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
 
                 if not valid:
                     try:
@@ -390,63 +428,6 @@ class Scanner:
                 await asyncio.sleep(REQUEST_BATCH_DELAY)
 
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
-
-    # New: fast root-only seeding helpers (targeted seeding)
-    async def seed_root_for_symbol(self, symbol: str):
-        """Fast seed only for ROOT_TFS for a single symbol (uses ROOT_SEED_LIMIT)."""
-        try:
-            tfs = list(set(ROOT_TFS))
-            for tf in tfs:
-                try:
-                    async with self.request_sem:
-                        raw = await self._call_get_klines(symbol, tf, limit=ROOT_SEED_LIMIT)
-                    if not raw:
-                        continue
-                    normalized = normalize_klines(raw, tf)
-                    valid = []
-                    for c in normalized:
-                        try:
-                            if not isinstance(c, dict):
-                                continue
-                            close = c.get("close")
-                            start = c.get("start_at")
-                            if close is None:
-                                continue
-                            if isinstance(close, (int, float)) and math.isfinite(float(close)):
-                                valid.append({
-                                    "start_at": start,
-                                    "open": c.get("open"),
-                                    "high": c.get("high"),
-                                    "low": c.get("low"),
-                                    "close": float(close),
-                                    "volume": c.get("volume")
-                                })
-                        except Exception:
-                            continue
-                    if valid:
-                        try:
-                            klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
-                        except Exception:
-                            klines_sorted = valid
-                        self.kline_store.setdefault(symbol, {})[tf] = klines_sorted
-                except Exception:
-                    logger.debug("seed_root_for_symbol: failed for %s %s", symbol, tf, exc_info=True)
-        except Exception:
-            logger.exception("seed_root_for_symbol failed for %s", symbol)
-
-    async def seed_root_for_all(self):
-        """Fast, parallel seeding for ROOT_TFS for all symbols. Intended to be lightweight."""
-        if not self.symbols:
-            return
-        logger.info("[ROOT_SEED] Starting fast root-only seeding for %d symbols (limit=%d)", len(self.symbols), ROOT_SEED_LIMIT)
-        sem = asyncio.Semaphore(max(1, CONCURRENCY))
-        async def worker(s: str):
-            async with sem:
-                await self.seed_root_for_symbol(s)
-        tasks = [asyncio.create_task(worker(s)) for s in self.symbols]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("[ROOT_SEED] Completed root-only seeding")
 
     async def _rest_poller(self):
         """REST poller as fallback when WS is unavailable."""
@@ -683,25 +664,25 @@ class Scanner:
         if SIGNAL_DEDUP_WINDOW <= 0:
             # Deduplication disabled
             return True
-
+        
         if candle_open_time is None:
             logger.debug("Cannot dedupe signal: candle_open_time is None")
             return True
-
+        
         try:
             cache_key = (symbol, tf, int(candle_open_time))
-
+            
             if cache_key in self._signal_cache:
                 last_signal_time = self._signal_cache[cache_key]
                 time_since_last = now - last_signal_time
-
+                
                 if time_since_last < SIGNAL_DEDUP_WINDOW:
                     logger.debug(
                         "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
                         symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
                     )
                     return False
-
+            
             # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
@@ -716,7 +697,7 @@ class Scanner:
 
         - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
         - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (multiples of 300s: 00, 05, 10, ...).
-
+        
         Returns:
             float: the epoch timestamp (seconds) of the boundary we woke for.
         """
@@ -758,6 +739,7 @@ class Scanner:
             loop_count += 1
 
             # ===== SYNC TO NEXT SCAN BOUNDARY (BEFORE ANY WORK) =====
+            # _wait_until_next_scan_boundary now returns the exact boundary timestamp we aligned to.
             boundary_ts = await self._wait_until_next_scan_boundary()
 
             logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d at boundary_ts=%d", loop_count, int(boundary_ts))
@@ -769,18 +751,8 @@ class Scanner:
                     await self.discover_symbols()
                     if self.symbols:
                         logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
-                        # initial full seed in background to avoid blocking on startup
-                        try:
-                            asyncio.create_task(self.seed_all())
-                        except Exception:
-                            logger.exception("Failed to schedule initial seed_all()")
-                        # do a fast root-only seed before first run
-                        if TARGETED_SEED_ENABLED:
-                            try:
-                                await self.seed_root_for_all()
-                            except Exception:
-                                logger.exception("Initial fast root-only seeding failed")
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding initiated")
+                        await self.seed_all()
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
                     else:
                         logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
                         await asyncio.sleep(10)
@@ -794,7 +766,7 @@ class Scanner:
                 for root in ROOT_TFS:
                     current_start = self._get_current_candle_start(root, now)
                     last_start = self._last_tf_candle_open_times.get(root, 0.0)
-
+                    
                     if current_start > last_start:
                         logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
                         self._last_tf_candle_open_times[root] = float(current_start)
@@ -802,21 +774,12 @@ class Scanner:
 
                 if refreshed_tfs:
                     logger.info(
-                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. Triggering background full seed and doing fast root-only seed.",
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
                         refreshed_tfs
                     )
-                    # FIRE full seeding in background so the main scan path is not blocked
-                    try:
-                        asyncio.create_task(self.seed_all())
-                    except Exception:
-                        logger.exception("Failed to schedule background seed_all()")
-                    # Do a fast root-only seed synchronously (targeted) to ensure root-TF detection is quick.
-                    if TARGETED_SEED_ENABLED:
-                        try:
-                            await self.seed_root_for_all()
-                        except Exception:
-                            logger.exception("Fast root-only seeding failed")
-                    logger.info("[CANDLE_OPEN_REFRESH] Background full seed scheduled; root-only seed attempted.")
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
                 # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
@@ -877,16 +840,16 @@ class Scanner:
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-
+                                
                                 # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
-
+                                
                                 if not is_new_signal:
                                     logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-
+                                
                                 # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
@@ -909,7 +872,7 @@ class Scanner:
                                     logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 else:
                                     logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-
+                                
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
@@ -946,15 +909,10 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Decide whether we allow opens now depending on TRADE_OPEN_MODE:
-                allow_opens_now = is_full_push
-                if TRADE_OPEN_MODE == "immediate":
-                    allow_opens_now = True
-
                 # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=allow_opens_now)
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
                 # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
@@ -1040,55 +998,6 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         return newly_aligned
-
-    # New: on-demand MTF/TV fetch for candidate(s)
-    async def _fetch_mtf_and_tv_for(self, candidate: Dict[str, Any], need_tfs: List[str] = None):
-        """
-        Fetch MTF TF klines and TV rating for a single candidate and update candidate in-place.
-        This respects request_sem and is best-effort (does not throw on failures).
-        """
-        try:
-            sym = candidate["symbol"]
-            price = candidate.get("price")
-            tfs = need_tfs or list(set(MTF_TFS))
-            # fetch MTF TF klines concurrently (limited by request_sem)
-            async def _get_for_tf(tf):
-                try:
-                    async with self.request_sem:
-                        raw = await self._call_get_klines(sym, tf, limit=SEED_KLINES_LIMIT)
-                    normalized = normalize_klines(raw, tf) if raw else []
-                    self.kline_store.setdefault(sym, {})[tf] = normalized
-                    return tf, normalized
-                except Exception:
-                    logger.debug("MTF fetch failed for %s %s", sym, tf, exc_info=True)
-                    return tf, []
-            tasks = [asyncio.create_task(_get_for_tf(tf)) for tf in tfs]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            # compute tv rating and mtf alignment using updated kline_store
-            try:
-                tv_score, tv_label = self.compute_tv_rating(sym, candidate.get("root"), price)
-            except Exception:
-                tv_score, tv_label = 0.0, "Neutral"
-            try:
-                mtf_align = self._compute_mtf_alignment(sym, price)
-            except Exception:
-                mtf_align = {"status": "N/A", "tfs": {}, "negative_tfs": []}
-            candidate["tv_score"] = tv_score
-            candidate["tv_label"] = tv_label
-            candidate["mtf_status"] = mtf_align.get("status", "N/A")
-            candidate["negative_tfs"] = mtf_align.get("negative_tfs", [])
-            # recompute candidate base score (mtf_score + vol contribution) to be used for sorting
-            try:
-                vol_change = candidate.get("vol_change")
-                score = sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip"))
-                if vol_change is not None and vol_change > 0:
-                    score += min(vol_change, 1.0)
-                candidate["score"] = score
-            except Exception:
-                pass
-        except Exception:
-            logger.exception("fetch mtf/tv failed for %s", candidate.get("symbol"))
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
@@ -1225,7 +1134,6 @@ class Scanner:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
             logger.info("Sorted %d candidates by TV rating (highest first)", len(candidates))
 
-        # Selection & slot allocation (ROOT_FILTER / PRIORITIZE_SLOT_ORDER handling)
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for c in candidates:
@@ -1275,32 +1183,6 @@ class Scanner:
             else:
                 candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
 
-        # --- PRE-FETCH MTF/TV FOR CANDIDATES BASED ON TRADE_OPEN_MODE ---
-        available_slots = max(0, MAX_OPEN_TRADES - (len(self.trade_manager.open_trades) if hasattr(self.trade_manager, "open_trades") else 0))
-        if TRADE_OPEN_MODE == "immediate":
-            logger.debug("TRADE_OPEN_MODE=immediate: skipping MTF/TV prefetch - open on first-come filters")
-            # no prefetch
-            pass
-        elif TRADE_OPEN_MODE == "balanced" and candidates:
-            shortlist_n = max(1, min(len(candidates), (available_slots * 2) or 1))
-            shortlist = candidates[:shortlist_n]
-            logger.info("TRADE_OPEN_MODE=balanced: prefetching MTF/TV for top %d candidates", shortlist_n)
-            tasks = [asyncio.create_task(self._fetch_mtf_and_tv_for(c)) for c in shortlist]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            # merge updated shortlist back
-            for i, c in enumerate(candidates):
-                for s in shortlist:
-                    if s["symbol"] == c["symbol"] and s["root"] == c["root"]:
-                        candidates[i] = s
-            candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
-        elif TRADE_OPEN_MODE == "conservative" and candidates:
-            logger.info("TRADE_OPEN_MODE=conservative: fetching MTF/TV for all %d candidates before opening", len(candidates))
-            tasks = [asyncio.create_task(self._fetch_mtf_and_tv_for(c)) for c in candidates]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            candidates = sorted(candidates, key=lambda r: self._compute_combined_score(r), reverse=True)
-
         eval_map: Dict[tuple, Dict[str, Any]] = {(e["symbol"], e["root"]): e for e in evaluated}
 
         if not allow_open_trades:
@@ -1335,12 +1217,12 @@ class Scanner:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-
+            
             try:
                 symbol_info = await self.client.get_symbol_info(sym)
             except Exception:
                 symbol_info = {}
-
+            
             qty_raw = self.trade_manager.compute_qty_from_balance(balance if balance else 0.0, price, symbol_info)
             qty = self._quantize_qty(qty_raw, symbol_info.get("step") if symbol_info else None, symbol_info.get("min_qty") if symbol_info else None)
             if qty <= 0 or math.isclose(qty, 0.0):

@@ -7,6 +7,8 @@ import time
 from typing import Dict, List, Any, Optional, Tuple
 from .logger import get_logger
 from .telegram import send_message
+from .config import ROOT_TFS
+from .scanner_core import tf_to_seconds
 
 logger = get_logger("scanner_telegram")
 
@@ -51,21 +53,50 @@ class TelegramSummary:
         return self._first_deploy_push
 
     def check_full_push(self, now_ts: float) -> bool:
-        """Return True if this should be a full push (initial deploy or any root TF candle open)."""
+        """
+        Return True if this should be a full push (initial deploy OR any root TF candle open).
+        - Updates internal _last_full_push_ts for each root TF when we detect a new candle start.
+        """
         is_full_push = False
         if self._first_deploy_push:
             is_full_push = True
 
-        for rt in getattr(__import__(" .scanner_core", fromlist=["tf_to_seconds"]), "tf_to_seconds")(rt) if False else []:
-            # Placeholder to satisfy static analyzers; actual logic in Scanner.telegram.check_full_push call
-            pass
+        # Iterate configured root timeframes and detect any change in candle start
+        for rt in (ROOT_TFS or []):
+            try:
+                tf_seconds = tf_to_seconds(rt)
+                if not tf_seconds or tf_seconds <= 0:
+                    continue
+                candle_start = (int(now_ts) // tf_seconds) * tf_seconds
+                last = self._last_full_push_ts.get(rt)
+                if last != candle_start:
+                    # update and mark full push required
+                    self._last_full_push_ts[rt] = int(candle_start)
+                    is_full_push = True
+            except Exception:
+                # be permissive — don't block pushes on an internal error
+                continue
 
         return is_full_push
 
     def check_candle_open(self, now_ts: float) -> bool:
-        """Return True if any root TF candle just opened (and not the first deploy)."""
+        """
+        Return True if any root TF candle just opened (and not the first deploy).
+        This does NOT update last_full_push_ts — use check_full_push() to both detect and update.
+        """
         if self._first_deploy_push:
             return False
+        for rt in (ROOT_TFS or []):
+            try:
+                tf_seconds = tf_to_seconds(rt)
+                if not tf_seconds or tf_seconds <= 0:
+                    continue
+                candle_start = (int(now_ts) // tf_seconds) * tf_seconds
+                last = self._last_full_push_ts.get(rt)
+                if last is not None and last != candle_start:
+                    return True
+            except Exception:
+                continue
         return False
 
     def mark_full_push_sent(self):
@@ -74,8 +105,21 @@ class TelegramSummary:
             self._first_deploy_push = False
 
     def _get_smallest_root_candle_start(self, now_ts: float) -> Optional[float]:
-        """Get the current candle start for the smallest ROOT_TFS timeframe."""
-        return None
+        """Get the current candle start for the most granular configured ROOT_TFS timeframe."""
+        try:
+            if not ROOT_TFS:
+                return None
+            smallest_candle_start = None
+            for rt in ROOT_TFS:
+                tf_seconds = tf_to_seconds(rt)
+                if tf_seconds and tf_seconds > 0:
+                    candle_start = (int(now_ts) // tf_seconds) * tf_seconds
+                    # choose the most recent (largest numeric) candle_start across root TFs
+                    if smallest_candle_start is None or candle_start > smallest_candle_start:
+                        smallest_candle_start = candle_start
+            return smallest_candle_start
+        except Exception:
+            return None
 
     async def send_summary(
         self,
@@ -101,7 +145,10 @@ class TelegramSummary:
                     continue
 
         if full_push:
+            # Full push: clear per-interval dedupe and send full set
             self._sent_this_interval.clear()
+            self._last_candle_start = self._get_smallest_root_candle_start(now_ts)
+
             # recommended block
             try:
                 await self._send_recommended_block(evaluated, now_str)
@@ -122,7 +169,14 @@ class TelegramSummary:
 
             self.mark_full_push_sent()
         else:
-            # scan-interval mode
+            # scan-interval mode: send only delta/new signals
+            # Reset dedupe on candle boundary to allow new signals in new candle
+            current_candle_start = self._get_smallest_root_candle_start(now_ts)
+            if self._last_candle_start is not None and current_candle_start != self._last_candle_start:
+                logger.info("[SCAN_CANDLE_BOUNDARY] Candle transitioned, resetting interval dedupe")
+                self._sent_this_interval.clear()
+            self._last_candle_start = current_candle_start
+
             try:
                 await self._send_scan_interval_signals(root_signals, eval_map, now_str)
             except Exception:
@@ -166,7 +220,11 @@ class TelegramSummary:
                 lines.append(f"  - {sym} | {rt} | {price_str} | combined={combined:.2f} (mtf={score:.2f}, tv={tv_score:+.3f})")
 
         try:
-            await send_message("\n".join(lines))
+            res = await send_message("\n".join(lines))
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.warning("Telegram recommended block skipped (missing config)")
+            elif isinstance(res, dict) and not res.get("ok", True):
+                logger.warning("Telegram recommended block failed: %s", res)
         except Exception:
             logger.exception("send_message failed for recommended block")
 
@@ -180,12 +238,17 @@ class TelegramSummary:
         lines = [f"🔍 Bybit Perp Root Summary – {now_str}"]
         lines.append("Root Timeframe Counts:")
 
-        # We don't have direct ROOT_TFS here — show counts from tf_counts
-        if tf_counts:
-            for rt, cnt in sorted(tf_counts.items()):
+        # Show counts per configured ROOT_TFS in order with fallback count check
+        if ROOT_TFS:
+            for rt in ROOT_TFS:
+                cnt = tf_counts.get(rt, 0)
                 lines.append(f"  - {rt}: {cnt} signals")
         else:
-            lines.append("  - none")
+            if tf_counts:
+                for rt, cnt in sorted(tf_counts.items()):
+                    lines.append(f"  - {rt}: {cnt} signals")
+            else:
+                lines.append("  - none")
 
         lines.append("")
         lines.append("Signals (short list):")
@@ -201,7 +264,11 @@ class TelegramSummary:
                 lines.append(f"  - {sym} | {rt} | {price_str}")
 
         try:
-            await send_message("\n".join(lines))
+            res = await send_message("\n".join(lines))
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.warning("Telegram root summary block skipped (missing config)")
+            elif isinstance(res, dict) and not res.get("ok", True):
+                logger.warning("Telegram root summary block failed: %s", res)
         except Exception:
             logger.exception("send_message failed for root summary block")
 
@@ -269,7 +336,11 @@ class TelegramSummary:
                     f"24h Vol (USDT): {vol_usdt_str}  Δ: {vol_str}",
                 ])
 
-                await send_message("\n".join(block_lines))
+                res = await send_message("\n".join(block_lines))
+                if isinstance(res, dict) and res.get("skipped"):
+                    logger.warning("Telegram per-signal block skipped for %s (missing config)", sym)
+                elif isinstance(res, dict) and not res.get("ok", True):
+                    logger.warning("Telegram per-signal block failed for %s: %s", sym, res)
                 self._sent_this_interval.add((sym, rt))
                 logger.info("[FULLPUSH_SIGNAL_SENT] %s %s", sym, rt)
             except Exception:
@@ -353,7 +424,11 @@ class TelegramSummary:
                 ])
 
                 block = "\n".join(block_lines)
-                await send_message(block)
+                res = await send_message(block)
+                if isinstance(res, dict) and res.get("skipped"):
+                    logger.warning("Telegram scan-interval block skipped for %s (missing config)", sym)
+                elif isinstance(res, dict) and not res.get("ok", True):
+                    logger.warning("Telegram scan-interval block failed for %s: %s", sym, res)
 
                 self._sent_this_interval.add((sym, rt))
                 logger.info("[SCAN_NEW_SENT] %s %s", sym, rt)
@@ -412,7 +487,11 @@ class TelegramSummary:
             ])
 
             block = "\n".join(block_lines)
-            await send_message(block)
+            res = await send_message(block)
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.warning("Telegram single-signal block skipped for %s (missing config)", sym)
+            elif isinstance(res, dict) and not res.get("ok", True):
+                logger.warning("Telegram single-signal block failed for %s: %s", sym, res)
 
             self._sent_this_interval.add(key)
             logger.info("[SINGLE_SIGNAL_BLOCK_SENT] %s %s", sym, rt)

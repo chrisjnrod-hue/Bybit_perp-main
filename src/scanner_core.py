@@ -327,6 +327,35 @@ def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> 
         return False
 
 
+def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
+    """
+    Compute percentage change given a symbol's volume tracking dict:
+      {"current": float, "previous": float}
+    Returns None if insufficient data or prev <= 0. Clamps to 1.0 max.
+    Also prints debug info to console for troubleshooting.
+    """
+    try:
+        if not vol_data:
+            print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
+            return None
+        prev_vol = vol_data.get("previous", 0)
+        curr_vol = vol_data.get("current", 0)
+        if prev_vol <= 0:
+            print(f"[VOL_DEBUG] compute_24h_volume_change: prev_vol <= 0 (prev={prev_vol}, curr={curr_vol})")
+            return None
+        change = (curr_vol - prev_vol) / prev_vol
+        result = min(change, 1.0)
+        # Console debug
+        try:
+            print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
+        except Exception:
+            print(f"[VOL_DEBUG] prev={prev_vol}, curr={curr_vol}, change={change}")
+        return result
+    except Exception as e:
+        print(f"[VOL_DEBUG] compute_24h_volume_change error: {e}")
+        return None
+
+
 # --- Helper wrappers for indicator functions (work with pandas_ta or bukosabino/ta) ---
 def _safe_sma(df_close, length: int):
     try:

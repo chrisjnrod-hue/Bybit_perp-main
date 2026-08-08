@@ -600,7 +600,7 @@ class Scanner:
         return quantize_qty(qty, step, min_qty)
 
     def _get_current_candle_start(self, tf: str, now: float) -> int:
-        tf_sec = self._tf_to_seconds(tf)
+        tf_sec = scompute_macd_for(selfelf._tf_to_seconds(tf)
         if tf == "D":
             return int(now // 86400) * 86400
         elif tf == "W":
@@ -609,34 +609,49 @@ class Scanner:
             return int(now // tf_sec) * tf_sec
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
-        """
-        Build closes list from kline_store and call core.compute_macd_from_closes.
-        The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        """
-        data = self.kline_store.get(symbol, {}).get(tf, [])
-        closes: List[float] = []
-        for c in data:
-            try:
-                if isinstance(c, dict) and c.get("close") is not None:
-                    closes.append(float(c.get("close")))
-                elif isinstance(c, (int, float)):
-                    closes.append(float(c))
-            except Exception:
-                continue
+    """
+    Build closes list from kline_store and call core.compute_macd_from_closes.
+    Synchronous-friendly: DOES NOT await anything. If a WS helper is async it will be skipped;
+    prefer using cached values (kline_store or _last_price_cache) in that case.
+    """
+    data = self.kline_store.get(symbol, {}).get(tf, [])
+    closes: List[float] = []
+    for c in data:
+        try:
+            if isinstance(c, dict) and c.get("close") is not None:
+                closes.append(float(c.get("close")))
+            elif isinstance(c, (int, float)):
+                closes.append(float(c))
+        except Exception:
+            continue
 
-        current_price = None
-        if include_price is not None:
-            current_price = float(include_price)
-        elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
-            try:
-                ws_last = None
-                ws_last = await self._call_client_method(["get_ws_latest_kline", "getWsLatestKline"], symbol, tf)
-                if ws_last and ws_last.get("close") is not None:
-                    current_price = float(ws_last.get("close"))
-            except Exception:
-                pass
+    current_price = None
+    if include_price is not None:
+        current_price = float(include_price)
+    elif use_ws_current and USE_WS:
+        try:
+            # Prefer a synchronous accessor on the client if available
+            fn = getattr(self.client, "get_ws_latest_kline", None)
+            ws_last = None
+            if fn and not inspect.iscoroutinefunction(fn):
+                try:
+                    ws_last = fn(symbol, tf)
+                except Exception:
+                    ws_last = None
 
-        return compute_macd_from_closes(closes, include_price=current_price)
+            # If the client exposes other synchronous helpers, they can be tried here similarly.
+            if ws_last and isinstance(ws_last, dict) and ws_last.get("close") is not None:
+                current_price = float(ws_last.get("close"))
+            else:
+                # Fall back to last-price cache if available
+                lp = self._last_price_cache.get(symbol)
+                if lp is not None:
+                    current_price = float(lp)
+        except Exception:
+            # Be permissive on any failure — MACD will be computed from available closes
+            current_price = None
+
+    return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
         return detect_flip_current_open(hist, hist_threshold)

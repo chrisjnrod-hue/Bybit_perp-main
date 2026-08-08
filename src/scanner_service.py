@@ -45,15 +45,20 @@ from .scanner_telegram import TelegramSummary
 
 logger = get_logger("scanner")
 
-SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
+# Accept either KLINE_SEED_LIMIT or SEED_KLINES_LIMIT env var (backwards compat)
+SEED_KLINES_LIMIT = int(os.getenv("KLINE_SEED_LIMIT", os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT))))
+
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
 
-# Per-client-call timeout (seconds)
+# Per-client-call timeout (seconds) — increase if your host is slow
 try:
-    DEFAULT_CLIENT_CALL_TIMEOUT = float(os.getenv("CLIENT_CALL_TIMEOUT", "10.0"))
+    DEFAULT_CLIENT_CALL_TIMEOUT = float(os.getenv("CLIENT_CALL_TIMEOUT", "15.0"))
 except Exception:
-    DEFAULT_CLIENT_CALL_TIMEOUT = 10.0
+    DEFAULT_CLIENT_CALL_TIMEOUT = 15.0
+
+# Skip waiting for the first clock boundary (useful for debugging)
+SKIP_INITIAL_SCAN_WAIT = os.getenv("SKIP_INITIAL_SCAN_WAIT", "").strip().lower() in ("1", "true", "yes", "y")
 
 # Updated: Numeric TV rating threshold (replaces TRADE_RATING_ALLOW string-based filter)
 try:
@@ -134,13 +139,16 @@ class Scanner:
         self.telegram.set_tv_rating_weight(TV_RATING_WEIGHT)
         self.telegram.set_trade_manager(self.trade_manager)
 
+        # First-scan flag (used when SKIP_INITIAL_SCAN_WAIT is set)
+        self._first_scan = True
+
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s CLIENT_CALL_TIMEOUT=%.1f",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s CLIENT_CALL_TIMEOUT=%.1f SKIP_INITIAL_WAIT=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT, DEFAULT_CLIENT_CALL_TIMEOUT
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT, DEFAULT_CLIENT_CALL_TIMEOUT, SKIP_INITIAL_SCAN_WAIT
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -210,6 +218,12 @@ class Scanner:
         except Exception:
             logger.exception("Error fetching symbols from client")
             items = None
+
+        # Diagnostic: log raw response to help find parsing issues
+        try:
+            logger.debug("[SYMBOLS_RAW] get_symbols response type=%s sample=%s", type(items).__name__, (str(items)[:500] if items else "None"))
+        except Exception:
+            pass
 
         if not items:
             logger.info("No symbols returned from client")
@@ -320,7 +334,7 @@ class Scanner:
                 try:
                     # start_kline_ws may be coroutine or sync; use safe wrapper if present
                     if hasattr(self.client, "start_kline_ws"):
-                        await self._call_client_method(["start_kline_ws", "startKlineWs", "start_kline_ws"],)
+                        await self._call_client_method(["start_kline_ws", "startKlineWs", "start_kline_ws"])
                 except Exception:
                     logger.exception("Failed to start client WS")
             else:
@@ -355,7 +369,7 @@ class Scanner:
             return []
 
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
-        names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
+        names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline", "klines"]
         return await self._call_client_method(names, symbol, tf, limit)
 
     async def seed_klines_for_symbol(self, symbol: str):
@@ -370,7 +384,7 @@ class Scanner:
 
                 async with self.request_sem:
                     try:
-                        raw = await asyncio.wait_for(self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT), timeout=DEFAULT_CLIENT_CALL_TIMEOUT + 2.0)
+                        raw = await asyncio.wait_for(self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT), timeout=DEFAULT_CLIENT_CALL_TIMEOUT + 5.0)
                     except asyncio.TimeoutError:
                         logger.warning("Timed out fetching klines for %s %s", symbol, tf)
                         continue
@@ -468,6 +482,7 @@ class Scanner:
         async def worker(sym: str):
             async with self.concurrent_sem:
                 try:
+                    logger.debug("seed_all worker acquiring for %s", sym)
                     await self.seed_klines_for_symbol(sym)
                 except Exception:
                     logger.exception("seed_all worker failed for %s", sym)
@@ -615,18 +630,7 @@ class Scanner:
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
                 ws_last = None
-                # try safe wrapper if the client implements an async or sync accessor
-                if inspect.iscoroutinefunction(getattr(self.client, "get_ws_latest_kline")):
-                    try:
-                        ws_last = asyncio.run(self._call_client_method(["get_ws_latest_kline"], symbol, tf))
-                    except Exception:
-                        ws_last = None
-                else:
-                    try:
-                        ws_last = getattr(self.client, "get_ws_latest_kline")(symbol, tf)
-                    except Exception:
-                        ws_last = None
-
+                ws_last = await self._call_client_method(["get_ws_latest_kline", "getWsLatestKline"], symbol, tf)
                 if ws_last and ws_last.get("close") is not None:
                     current_price = float(ws_last.get("close"))
             except Exception:
@@ -791,6 +795,12 @@ class Scanner:
         """
         now = time.time()
 
+        # If user requested skipping initial sleep for debugging, return immediately once
+        if SKIP_INITIAL_SCAN_WAIT and self._first_scan:
+            self._first_scan = False
+            logger.info("[SCAN_BOUNDARY] SKIP_INITIAL_SCAN_WAIT set: skipping initial wait and returning now=%d", int(now))
+            return float(now)
+
         if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
             # Align to multiples of ROOT_SCAN_INTERVAL from epoch (exact)
             next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
@@ -876,7 +886,7 @@ class Scanner:
                 async def check_symbol(sym: str):
                     try:
                         async with self.request_sem:
-                            price = await self._call_client_method(["get_latest_price", "getLatestPrice", "get_price", "getLatest"], sym)
+                            price = await self._call_client_method(["get_latest_price", "getLatestPrice", "get_price", "getLatest", "ticker_price"], sym)
 
                         if price is None:
                             try:

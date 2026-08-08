@@ -1037,6 +1037,7 @@ class Scanner:
 
         return newly_aligned
 
+    
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
@@ -1134,7 +1135,6 @@ class Scanner:
                 # New: minimum 24h USDT volume filter
                 if MIN_24H_VOLUME_USDT and MIN_24H_VOLUME_USDT > 0:
                     if vol_usdt is None:
-                        # If the exchange didn't provide volume info, be conservative and block (or choose permissive by not blocking)
                         entry["accept"] = False
                         entry["reason"] = "missing_24h_volume"
                         logger.info("24h USDT volume info missing for %s; blocking due to MIN_24H_VOLUME_USDT=%s", sym, MIN_24H_VOLUME_USDT)
@@ -1334,8 +1334,8 @@ class Scanner:
             self._mtf_monitoring.pop(sym, None)
 
         return evaluated
-
-    def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
+                
+   def _compute_combined_score(self, candidate: Dict[str, Any]) -> float:
         mtf_score = candidate.get("score", 0.0)
         tv_score = candidate.get("tv_score", 0.0)
         combined = (mtf_score * (1.0 - TV_RATING_WEIGHT)) + (tv_score * TV_RATING_WEIGHT)

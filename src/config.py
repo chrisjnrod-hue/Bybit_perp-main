@@ -1,4 +1,4 @@
-# config.py - COMPLETE UPDATED VERSION
+# config.py
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
@@ -80,11 +80,6 @@ BREAKEVEN_PERCENT = safe_float_env("BREAKEVEN_PERCENT", 0.5)
 BREAKEVEN_TRIGGER_PERCENT = safe_float_env("BREAKEVEN_TRIGGER_PERCENT", 1.0)
 BREAKEVEN_HL = safe_bool_env("BREAKEVEN_HL", True)
 
-# ---- Execution & Risk Filters (Leverage, Slippage, Spread) ----
-LEVERAGE = safe_int_env("LEVERAGE", 10)
-MAX_SLIPPAGE = safe_float_env("MAX_SLIPPAGE", 0.2)
-MAX_SPREAD_PERCENT = safe_float_env("MAX_SPREAD_PERCENT", 0.1)
-
 # Position sizing
 POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "auto")
 FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
@@ -111,31 +106,6 @@ MTF_REQUIRE_RISING = safe_bool_env("MTF_REQUIRE_RISING", True)
 MTF_1D_ALLOW_NEGATIVE_RISING = safe_bool_env("MTF_1D_ALLOW_NEGATIVE_RISING", True)
 
 MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
-
-# ---- MACD Flip & Candle Age Filtering ----
-# Prevent mid-candle flips from opening trades.
-# FLIP_CANDLE_AGE_MAX_SEC: maximum age (seconds) of a candle where flip is considered "fresh"
-# When a flip is detected on a candle older than this threshold, the trade is blocked
-# Set to 0 to accept flips at any candle age (old behavior; not recommended)
-# Recommended: 300 (5 min), 600 (10 min), or 900 (15 min)
-FLIP_CANDLE_AGE_MAX_SEC = safe_int_env("FLIP_CANDLE_AGE_MAX_SEC", 300)
-
-# Signal deduplication: cache window to prevent the same candle from re-triggering a signal
-# Tracks (symbol, timeframe, candle_open_time) across scan cycles
-# Set to 0 to disable deduplication (not recommended; causes duplicate signals)
-SIGNAL_DEDUP_WINDOW = safe_int_env("SIGNAL_DEDUP_WINDOW", 60)
-
-# ---- TV Rating Trade Filters ----
-# Minimum TV rating score required to open a trade
-# Typical scale: 0.0 (Neutral), 0.25 (Buy), 0.6 (Strong Buy)
-# Set to 0.0 to disable (allow any aligned signal regardless of TV rating)
-# Recommended: 0.25 (Buy) or 0.4 (Conservative)
-TRADE_RATING_MIN = safe_float_env("TRADE_RATING_MIN", 0.25)
-
-# When True, sort candidates by TV rating (highest first) during slot allocation
-# This ensures the best-rated signals get priority when MAX_OPEN_TRADES is reached
-# Works with ROOT_FILTER=true, PRIORITIZE_SLOT_ORDER, or standalone mode
-TRADE_RATING_PRIORITIZE = safe_bool_env("TRADE_RATING_PRIORITIZE", True)
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""

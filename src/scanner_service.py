@@ -821,12 +821,6 @@ class Scanner:
 
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
 
-if hist and len(hist) >= 2:
-    print(f"[HIST_DIAG] {sym} {root}: len={len(hist)} | last_5={hist[-5:]} | prev={hist[-2]:.6f} cur={hist[-1]:.6f} | flip={flip}")
-else:
-    print(f"[HIST_DIAG] {sym} {root}: HIST TOO SHORT - len={len(hist) if hist else 0}")
-
-                    
                             logger.info(
                                 "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
                                 sym,

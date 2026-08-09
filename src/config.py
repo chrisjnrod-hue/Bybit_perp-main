@@ -1,4 +1,4 @@
-# config.py
+# config.py - COMPLETE UPDATED VERSION (with new environment variables)
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
@@ -59,8 +59,8 @@ ROOT_TFS = safe_csv_list("ROOT_TFS", ["60", "240", "D"])
 MTF_TFS = safe_csv_list("MTF_TFS", ["5", "15", "60", "240", "D"])
 
 # Intervals and seed sizes
-# NOTE: If ROOT_SCAN_INTERVAL is 0 (default here) the scanner will run on 5m-candle opens.
-ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 120)  # seconds; 0 => run at each 5m candle open
+# If ROOT_SCAN_INTERVAL is 0 (default) the scanner will run on 5m-candle opens.
+ROOT_SCAN_INTERVAL = safe_int_env("ROOT_SCAN_INTERVAL", 0)  # seconds; 0 => run at each 5m candle open
 KLINE_SEED_LIMIT = safe_int_env("KLINE_SEED_LIMIT", 50)
 
 # Concurrency / rate limiting (optimized for faster scans)
@@ -80,6 +80,11 @@ BREAKEVEN_PERCENT = safe_float_env("BREAKEVEN_PERCENT", 0.5)
 BREAKEVEN_TRIGGER_PERCENT = safe_float_env("BREAKEVEN_TRIGGER_PERCENT", 1.0)
 BREAKEVEN_HL = safe_bool_env("BREAKEVEN_HL", True)
 
+# ---- Execution & Risk Filters (Leverage, Slippage, Spread) ----
+LEVERAGE = safe_int_env("LEVERAGE", 10)
+MAX_SLIPPAGE = safe_float_env("MAX_SLIPPAGE", 0.2)
+MAX_SPREAD_PERCENT = safe_float_env("MAX_SPREAD_PERCENT", 0.1)
+
 # Position sizing
 POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "auto")
 FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
@@ -88,14 +93,23 @@ FIXED_QTY = safe_float_env("FIXED_QTY", 1.0)
 MACD_HIST_THRESHOLD = safe_float_env("MACD_HIST_THRESHOLD", 0.0)
 VOLUME_CHANGE_24H_THRESHOLD = safe_float_env("VOLUME_CHANGE_24H_THRESHOLD", 0.0)
 
-# ---- 24h Volume change filter (trade-open gate only, never rejects signals) ----
-# VOLUME_FILTER_ENABLED=true  → block trade opens when 24h vol change % is negative
-# VOLUME_FILTER_ENABLED=false → ignore volume, open trades freely (default: true)
+# ---- 24h Volume / Volume-change filters (trade-open gate only, never rejects signals) ----
+# VOLUME_FILTER_ENABLED=true  → apply volume-change gating for trade opens
+# VOLUME_FILTER_ENABLED=false → ignore volume-change when opening trades (default: true)
 VOLUME_FILTER_ENABLED = safe_bool_env("VOLUME_FILTER_ENABLED", True)
 
-# Minimum 24h volume change % required for a trade open (decimal; 0.0 = any positive change)
-# e.g. VOLUME_MIN_CHANGE_PCT=0.05 requires +5 % volume growth before opening
+# Minimum 24h volume change fraction required for a trade open (decimal; 0.0 = any)
+# e.g. VOLUME_MIN_CHANGE_PCT=0.05 requires +5% volume growth before opening
 VOLUME_MIN_CHANGE_PCT = safe_float_env("VOLUME_MIN_CHANGE_PCT", 0.0)
+
+# New: Minimum 24h USDT quote-volume required to allow opening trades. 0 disables the gate.
+MIN_24H_VOLUME_USDT = safe_float_env("MIN_24H_VOLUME_USDT", 0.0)
+
+# If True, block trade opens when 24h vol change is negative (even if VOLUME_FILTER_ENABLED is False)
+TRADE_NO_NEG_VOL = safe_bool_env("TRADE_NO_NEG_VOL", True)
+
+# Market cap filter (0 disables)
+MARKET_CAP_MIN = safe_float_env("MARKET_CAP_MIN", 0.0)
 
 # Filters toggles
 ROOT_FILTER = safe_bool_env("ROOT_FILTER", False)
@@ -107,18 +121,36 @@ MTF_1D_ALLOW_NEGATIVE_RISING = safe_bool_env("MTF_1D_ALLOW_NEGATIVE_RISING", Tru
 
 MTF_SLOPE_LOOKBACK = safe_int_env("MTF_SLOPE_LOOKBACK", 3)
 
-# Telegram
+# ---- MACD Flip & Candle Age Filtering ----
+# Prevent mid-candle flips from opening trades.
+FLIP_CANDLE_AGE_MAX_SEC = safe_int_env("FLIP_CANDLE_AGE_MAX_SEC", 300)
+
+# Signal deduplication window (seconds)
+SIGNAL_DEDUP_WINDOW = safe_int_env("SIGNAL_DEDUP_WINDOW", 60)
+
+# ---- TV Rating / prioritization ----
+# Minimum TV rating score required to open a trade
+TRADE_RATING_MIN = safe_float_env("TRADE_RATING_MIN", 0.25)
+
+# When True, sort candidates by TV rating (highest first) during slot allocation
+TRADE_RATING_PRIORITIZE = safe_bool_env("TRADE_RATING_PRIORITIZE", True)
+
+# TV rating weight used in combined score calculation (0.0..1.0), where 1.0 = 100% TV weight
+TV_RATING_WEIGHT = safe_float_env("TV_RATING_WEIGHT", 0.3)
+
+# Priority order for filling slots by timeframe (comma-separated list, e.g. "240,D,60")
+PRIORITIZE_SLOT_ORDER = safe_csv_list("PRIORITIZE_SLOT_ORDER", ["240", "D", "60"])
+
+# ---- Telegram ----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or ""
 
-# Logging
+# ---- Logging ----
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # -------------------------
 # TradingView-like Technical Rating config (local implementation)
 # -------------------------
-# This block provides default indicator parameters, weights and mapping thresholds
-# used by the local TradingView-like "Technical Rating" computation. Tune as needed.
 TECHNICAL_RATING = {
     "enabled": True,
     "ta_backend": "pandas_ta",  # "pandas_ta" recommended (pure Python)
@@ -134,7 +166,6 @@ TECHNICAL_RATING = {
         "cci_period": 20,
         "willr_period": 14,
     },
-    # Relative weights applied to the per-indicator normalized sub-score (higher => more influence)
     "weights": {
         "ma_pair": 1.0,
         "macd": 1.5,
@@ -146,22 +177,41 @@ TECHNICAL_RATING = {
         "willr": 0.4,
     },
     "tolerance": {
-        "ma_pair_pct": 0.002,  # 0.2% tolerance for MA equality
+        "ma_pair_pct": 0.002,
         "obv_slope_lookback": 5,
     },
     "adx": {"threshold": 25, "multiplier": 1.25},
-    # Normalized score thresholds -> label mapping (score in approx -1..1)
     "thresholds": {
         "strong_buy": 0.6,
         "buy": 0.25,
         "sell": -0.25,
         "strong_sell": -0.6
     },
-    # Multi-timeframe aggregation: "weighted" or "majority"
     "multi_timeframe_aggregation": "weighted",
-    # Benchmarking (disabled by default). Use tradingview-ta offline only for calibration.
     "benchmarking": {
         "fetch_tradingview_labels": False,
         "tradingview_rate_limit_sleep": 2
     }
 }
+
+# Backwards-compatible alias (some modules expect TRADE_RATING_MIN_VAL)
+TRADE_RATING_MIN_VAL = TRADE_RATING_MIN
+
+# Export list of keys
+__all__ = [
+    "MAINNET", "USE_WS", "BYBIT_API_KEY", "BYBIT_API_SECRET",
+    "EXCLUDE_STABLECOINS",
+    "ROOT_TFS", "MTF_TFS", "ROOT_SCAN_INTERVAL", "KLINE_SEED_LIMIT",
+    "RATE_LIMIT_RPS", "CONCURRENCY", "MAX_CONCURRENT_REQUESTS", "REQUEST_BATCH_SIZE", "REQUEST_BATCH_DELAY", "REST_POLL_INTERVAL",
+    "TRADE_ENABLED", "MAX_OPEN_TRADES", "TP_PERCENT", "SL_PERCENT",
+    "BREAKEVEN_PERCENT", "BREAKEVEN_TRIGGER_PERCENT", "BREAKEVEN_HL",
+    "LEVERAGE", "MAX_SLIPPAGE", "MAX_SPREAD_PERCENT",
+    "POSITION_SIZING_MODE", "FIXED_QTY",
+    "MACD_HIST_THRESHOLD", "VOLUME_CHANGE_24H_THRESHOLD",
+    "VOLUME_FILTER_ENABLED", "VOLUME_MIN_CHANGE_PCT", "MIN_24H_VOLUME_USDT", "TRADE_NO_NEG_VOL", "MARKET_CAP_MIN",
+    "ROOT_FILTER", "ROOT_TOP_N", "MTF_FILTER", "MTF_REQUIRE_RISING", "MTF_1D_ALLOW_NEGATIVE_RISING", "MTF_SLOPE_LOOKBACK",
+    "FLIP_CANDLE_AGE_MAX_SEC", "SIGNAL_DEDUP_WINDOW",
+    "TRADE_RATING_MIN", "TRADE_RATING_PRIORITIZE", "TV_RATING_WEIGHT", "PRIORITIZE_SLOT_ORDER",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "LOG_LEVEL",
+    "TECHNICAL_RATING"
+]

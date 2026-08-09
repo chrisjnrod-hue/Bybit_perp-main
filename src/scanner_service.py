@@ -878,8 +878,13 @@ class Scanner:
                                     if last_candles:
                                         start_at = last_candles[-1].get("start_at")
                                 except Exception:
-                                    start_at = None
-
+                                    start_at = None 
+                                    
+                           if hist and len(hist) >= 2:
+                                 print(f"[HIST_DIAG] {sym} {root}: len={len(hist)} | last_5={hist[-5:]} | prev={hist[-2]:.6f} cur={hist[-1]:.6f} | flip={flip}")
+                                else:
+                                 print(f"[HIST_DIAG] {sym} {root}: HIST TOO SHORT - len={len(hist) if hist else 0}")
+                                
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
                                 

@@ -73,14 +73,27 @@ def tf_to_seconds(tf: str) -> int:
 def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: int) -> bool:
     """
     Check if the candle's start time is fresh enough compared to current time.
+
+    Behavior:
+    - If max_age_sec <= 0: check is disabled -> return True (accept flips of any age).
+    - If start_at is None/unparseable: return True (conservative: allow).
+    - start_at may be seconds or milliseconds; detect and normalize.
+    - Return True if (now - start_sec) <= max_age_sec, else False.
     """
-    if start_at is None:
-        return True
     try:
-        start_sec = float(start_at) / 1000.0 if start_at > 10000000000 else float(start_at)
+        # If max_age_sec <= 0, treat as disabled (accept any age)
+        if max_age_sec is None or int(max_age_sec) <= 0:
+            return True
+
+        if start_at is None:
+            return True
+
+        # convert to float seconds (handle milliseconds)
+        start_sec = float(start_at) / 1000.0 if int(start_at) > 10000000000 else float(start_at)
         age = now - start_sec
-        return age <= max_age_sec
+        return age <= float(max_age_sec)
     except Exception:
+        # On any error be permissive (do not block signals)
         return True
 
 

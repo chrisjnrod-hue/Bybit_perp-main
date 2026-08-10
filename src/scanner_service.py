@@ -1358,10 +1358,14 @@ class Scanner:
         return combined
 
     async def run(self):
-        self._task = asyncio.create_task(self.root_scan_loop())
-        logger.info("[RUN_TASK] Scanner run() started; root_scan_loop task created")
         try:
+            self._task = asyncio.create_task(self.root_scan_loop())
+            logger.info("[RUN_TASK] Scanner run() started; root_scan_loop task created")
             await self._task
+        except Exception as e:
+            print(f"[FATAL_CRASH] Main loop crashed with error: {e}")
+            logger.error("[FATAL_CRASH] Main loop crashed with error: %s", e, exc_info=True)
+            raise
         except asyncio.CancelledError:
             logger.info("Scanner run cancelled")
         finally:

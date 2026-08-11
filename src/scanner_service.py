@@ -1,4 +1,3 @@
-# scanner_service (45).py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 
@@ -35,6 +34,7 @@ from .scanner_core import (
     quantize_qty,
     compute_macd_from_closes,
     detect_flip_current_open,
+    compute_24h_volume_change_from,
     compute_tv_rating_from,
     compute_mtf_alignment,
     is_candle_age_acceptable,
@@ -87,18 +87,12 @@ DEFAULT_TRADE_MANAGER_CONFIG = {
     "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1").strip().lower() in ("1", "true", "yes", "y"),
 }
 
-# New: minimum 24h USDT volume to allow opening trades. 0 = disabled.
-try:
-    MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "0") or 0)
-except Exception:
-    MIN_24H_VOLUME_USDT = 0.0
-
 
 class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-        # FIX: Pass both exchange_client and config to TradeManager
+        # Pass both exchange_client and config to TradeManager[cite: 5]
         self.trade_manager = TradeManager(exchange_client=self.client, config=DEFAULT_TRADE_MANAGER_CONFIG)
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
@@ -108,7 +102,7 @@ class Scanner:
         self._task: Optional[asyncio.Task] = None
         self._rest_poller_task: Optional[asyncio.Task] = None
         self._callbacks: List[Callable[[str, Any], Any]] = []
-        self._24h_volumes: Dict[str, Dict[str, Any]] = {}
+        self._24h_volumes: Dict[str, Dict[str, float]] = {}
         self._last_price_cache: Dict[str, float] = {}
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
@@ -119,21 +113,18 @@ class Scanner:
         self._last_telegram_dispatch_time: Optional[float] = None
 
         # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
-        # Prevents same candle from generating multiple signals across scan cycles
         self._signal_cache: Dict[Tuple[str, str, int], float] = {}
 
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
-        self.telegram.set_tv_rating_weight(TV_RATING_WEIGHT)
-        self.telegram.set_trade_manager(self.trade_manager)
 
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s MIN_24H_VOLUME_USDT=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, MIN_24H_VOLUME_USDT
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -142,7 +133,6 @@ class Scanner:
         self._callbacks.append(cb)
 
     async def _emit_event(self, event: str, payload: Any):
-        logger.info("[EMIT_EVENT] Emitting event '%s' payload_keys=%s", event, list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
         for cb in list(self._callbacks):
             try:
                 if inspect.iscoroutinefunction(cb):
@@ -275,7 +265,6 @@ class Scanner:
     async def discover_symbols(self) -> List[str]:
         try:
             logger.info("[DIAGNOSTIC] discover_symbols: STARTING")
-            logger.info("[DEBUG] discover_symbols called by scanner")
             syms = await self._get_symbols()
             if not syms:
                 logger.warning("[DIAGNOSTIC] discover_symbols: NO SYMBOLS FOUND!")
@@ -330,46 +319,14 @@ class Scanner:
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
         for tf in tfs:
             try:
-                logger.info("[SEED_START] seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
+                logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
 
                 async with self.request_sem:
                     raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
 
                 if not raw:
-                    logger.debug("[SEED] No klines returned for %s %s (raw empty)", symbol, tf)
+                    logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
                     continue
-
-                if DEBUG_SURGICAL_LOGS:
-                    try:
-                        if isinstance(raw, dict):
-                            logger.info("[SURGICAL_LOG_0] API_KEYS %s %s - Response dict keys: %s", symbol, tf, list(raw.keys()))
-                            for key in ["list", "result", "data"]:
-                                if key in raw and isinstance(raw[key], (list, tuple)) and raw[key]:
-                                    first_item = raw[key][0]
-                                    logger.info("[SURGICAL_LOG_0] FIRST_ITEM %s %s - Key '%s' contains: type=%s, value=%s",
-                                             symbol, tf, key, type(first_item).__name__, str(first_item)[:200])
-                                    break
-                        elif isinstance(raw, (list, tuple)):
-                            logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Response is list/tuple, first item: type=%s, value=%s",
-                                     symbol, tf, type(raw[0]).__name__ if raw else "empty", str(raw[0])[:200] if raw else "empty")
-                    except Exception as e:
-                        logger.info("[SURGICAL_LOG_0] API_RESPONSE %s %s - Failed to log structure: %s", symbol, tf, str(e)[:100])
-
-                if DEBUG_SURGICAL_LOGS:
-                    try:
-                        if isinstance(raw, dict) and "list" in raw:
-                            sample_raw = raw["list"][:3] if isinstance(raw["list"], list) else raw["list"]
-                        elif isinstance(raw, dict) and "result" in raw:
-                            sample_raw = raw["result"][:3] if isinstance(raw["result"], list) else raw["result"]
-                        elif isinstance(raw, dict) and "data" in raw:
-                            sample_raw = raw["data"][:3] if isinstance(raw["data"], list) else raw["data"]
-                        elif isinstance(raw, list):
-                            sample_raw = raw[:3]
-                        else:
-                            sample_raw = str(raw)[:200]
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: type=%s, sample=%s", symbol, tf, type(raw).__name__, sample_raw)
-                    except Exception as e:
-                        logger.info("[SURGICAL_LOG_1] RAW_RESPONSE %s %s: failed to log - %s", symbol, tf, str(e)[:100])
 
                 normalized = normalize_klines(raw, tf)
 
@@ -394,20 +351,7 @@ class Scanner:
                     except Exception:
                         continue
 
-                if DEBUG_SURGICAL_LOGS:
-                    logger.info("[SURGICAL_LOG_2] NORMALIZE %s %s: raw_count=%d, normalized_count=%d, valid_count=%d",
-                               symbol, tf, len(raw) if isinstance(raw, (list, tuple)) else 1, len(normalized), len(valid))
-                    if len(valid) == 0 and len(normalized) > 0:
-                        sample_norm = normalized[:2]
-                        logger.warning("[SURGICAL_LOG_2] FILTERED_OUT: first 2 normalized items: %s", sample_norm)
-
                 if not valid:
-                    try:
-                        txt = json.dumps(raw, default=str)
-                    except Exception:
-                        txt = str(raw)
-                    snippet_trunc = (txt[:500] + '...') if len(txt) > 500 else txt
-                    logger.debug("[SEED] Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
                     continue
 
                 try:
@@ -425,14 +369,11 @@ class Scanner:
     async def seed_all(self):
         logger.info("[DIAGNOSTIC] seed_all: STARTING with %d symbols", len(self.symbols))
         async def worker(sym: str):
-            logger.debug("[SEED_WORKER] Starting seed worker for %s", sym)
             async with self.concurrent_sem:
                 await self.seed_klines_for_symbol(sym)
-            logger.debug("[SEED_WORKER] Completed seed worker for %s", sym)
 
         for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
             batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
-            logger.debug("[SEED_BATCH] Processing batch %d..%d (size=%d)", i, i+len(batch)-1, len(batch))
             tasks = [asyncio.create_task(worker(s)) for s in batch]
             if tasks:
                 await asyncio.gather(*tasks)
@@ -448,12 +389,8 @@ class Scanner:
         try:
             while not self._stop and (not USE_WS or not self.client.is_ws_connected()):
                 poll_count += 1
-                if poll_count % 5 == 0:
-                    logger.info("[REST_POLLER] Active poll #%d, symbols=%d", poll_count, len(self.symbols))
-
                 start = time.time()
                 if not self.symbols:
-                    logger.debug("[REST_POLLER] No symbols to poll; sleeping")
                     await asyncio.sleep(REST_POLL_INTERVAL)
                     continue
 
@@ -506,7 +443,6 @@ class Scanner:
                 to_sleep = max(0, REST_POLL_INTERVAL - elapsed)
 
                 if USE_WS and self.client.is_ws_connected():
-                    logger.info("WS reconnected; stopping REST poller")
                     break
 
                 await asyncio.sleep(to_sleep)
@@ -526,17 +462,14 @@ class Scanner:
                 except Exception:
                     pass
                 self._rest_poller_task = None
-            logger.debug("[REST_POLLER_CHECK] WS connected; no rest poller needed")
             return
 
         if self._rest_poller_task and not self._rest_poller_task.done():
-            logger.debug("[REST_POLLER_CHECK] Rest poller already running")
             return
 
         logger.info("[REST_POLLER_START] WS unavailable, starting REST poller as fallback")
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
-    # Wrappers that use core helpers
     def _tf_to_seconds(self, tf: str) -> int:
         return tf_to_seconds(tf)
 
@@ -556,10 +489,6 @@ class Scanner:
             return int(now // tf_sec) * tf_sec
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
-        """
-        Build closes list from kline_store and call core.compute_macd_from_closes.
-        The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
         for c in data:
@@ -588,15 +517,12 @@ class Scanner:
         return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
-        """Update and track 24h volume info — rely on exchange-provided fields (volume in quote/USDT and volume change pct if provided)."""
         try:
             names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
             data = await self._call_client_method(names, symbol)
             if not data:
-                logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
-            # Normalize nested shapes
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], (dict, list)):
                     if isinstance(data["data"], dict):
@@ -605,68 +531,39 @@ class Scanner:
                     if isinstance(data["result"], dict):
                         data = data["result"]
 
-            vol_usdt = None
-            vol_change_frac = None
-
+            vol = None
             if isinstance(data, dict):
-                # Try various keys for 24h quote/USDT volume
-                for key in ("quoteVolume", "quote_vol", "quote_vol_usd", "quoteVolume24h", "quoteVol", "volume_usdt", "volume_usd", "turnover", "quote_volume"):
+                for key in ("volume", "vol", "turnover", "volume24h", "quote_vol", "volume_24h"):
                     if key in data and data.get(key) is not None:
                         try:
-                            vol_usdt = float(data.get(key))
+                            vol = float(data.get(key))
                             break
                         except Exception:
                             try:
-                                vol_usdt = float(str(data.get(key)).replace(',', ''))
+                                vol = float(str(data.get(key)).replace(',', ''))
                                 break
                             except Exception:
-                                vol_usdt = None
+                                vol = None
 
-                # Try to extract a volume-change / percent field from exchange if present.
-                for key in ("volumeChange", "volume_change", "vol_change", "volume_change_pct", "volume_pct", "percent", "change", "priceChangePercent", "priceChange", "percentChange"):
-                    if key in data and data.get(key) is not None:
-                        try:
-                            raw = float(data.get(key))
-                            # Normalize to fractional representation internally:
-                            # If the exchange returns a percent like 1.23 => convert to 0.0123
-                            if abs(raw) > 1.5:
-                                vol_change_frac = raw / 100.0
-                            else:
-                                vol_change_frac = raw
-                            break
-                        except Exception:
-                            try:
-                                raw = float(str(data.get(key)).replace(',', '').replace('%', ''))
-                                if abs(raw) > 1.5:
-                                    vol_change_frac = raw / 100.0
-                                else:
-                                    vol_change_frac = raw
-                                break
-                            except Exception:
-                                vol_change_frac = None
+            if vol is None and isinstance(data, (int, float, str)):
+                try:
+                    vol = float(data)
+                except Exception:
+                    vol = None
 
-            # Store the raw/exchange-provided values (normalized)
-            self._24h_volumes[symbol] = {
-                "volume_usdt": vol_usdt,
-                "volume_change": vol_change_frac
-            }
-
-            if vol_usdt is not None:
-                logger.debug("[VOLUME_UPDATE] %s: volume_usdt=%.0f change=%s", symbol, vol_usdt, str(vol_change_frac))
-                return vol_usdt
-            else:
-                logger.debug("[VOLUME_UPDATE] %s: no volume field matched in ticker: %s", symbol, data if isinstance(data, dict) else str(data))
+            if vol is not None:
+                if symbol not in self._24h_volumes:
+                    self._24h_volumes[symbol] = {"current": vol, "previous": vol}
+                else:
+                    self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
+                    self._24h_volumes[symbol]["current"] = vol
+                return vol
         except Exception:
             logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
-        """Return the normalized fractional volume change reported by the exchange (e.g. 0.012 = +1.2%)."""
-        try:
-            d = self._24h_volumes.get(symbol, {})
-            return d.get("volume_change")
-        except Exception:
-            return None
+        return compute_24h_volume_change_from(self._24h_volumes.get(symbol))
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
         klines = self.kline_store.get(symbol, {}).get(tf, [])
@@ -688,83 +585,40 @@ class Scanner:
         return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
     def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
-        """
-        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
-        """
         return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
 
     def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
-        """
-        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
-        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
-        Caches the signal timestamp to prevent re-triggers across scan cycles.
-        """
         if SIGNAL_DEDUP_WINDOW <= 0:
-            # Deduplication disabled
             return True
         
         if candle_open_time is None:
-            logger.debug("Cannot dedupe signal: candle_open_time is None")
             return True
         
         try:
             cache_key = (symbol, tf, int(candle_open_time))
-            
             if cache_key in self._signal_cache:
                 last_signal_time = self._signal_cache[cache_key]
-                time_since_last = now - last_signal_time
-                
-                if time_since_last < SIGNAL_DEDUP_WINDOW:
-                    logger.debug(
-                        "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
-                        symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
-                    )
+                if now - last_signal_time < SIGNAL_DEDUP_WINDOW:
                     return False
             
-            # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
-            logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
             return True
-        except Exception as e:
-            logger.debug("Error in dedupe check: %s", e)
+        except Exception:
             return True
 
     async def _wait_until_next_scan_boundary(self) -> float:
-        """
-        Wait until the next scan boundary (clock-aligned) and return the boundary timestamp.
-
-        - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
-        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (multiples of 300s: 00, 05, 10, ...).
-        
-        Returns:
-            float: the epoch timestamp (seconds) of the boundary we woke for.
-        """
         now = time.time()
 
         if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
-            # Align to multiples of ROOT_SCAN_INTERVAL from epoch (exact)
             next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
             to_sleep = next_boundary - now
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.3f sec to align to boundary (ts=%d)",
-                ROOT_SCAN_INTERVAL, to_sleep, int(next_boundary)
-            )
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
             return float(next_boundary)
         else:
-            # ROOT_SCAN_INTERVAL = 0: align to next 5-minute boundary (multiples of 300 seconds)
             FIVE_MIN = 300
             next_boundary = ((int(now) // FIVE_MIN) + 1) * FIVE_MIN
-            to_sleep = next_boundary - now
-            # Ensure non-negative sleep
-            to_sleep = max(0.0, to_sleep)
-            # Log target in human readable terms
-            next_struct = time.gmtime(next_boundary)
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m boundary at %02d:%02d:%02d UTC (sleeping %.3f sec)",
-                next_struct.tm_hour, next_struct.tm_min, next_struct.tm_sec, to_sleep
-            )
+            to_sleep = max(0.0, next_boundary - now)
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
             return float(next_boundary)
@@ -775,53 +629,33 @@ class Scanner:
 
         while not self._stop:
             loop_count += 1
-
-            # ===== SYNC TO NEXT SCAN BOUNDARY (BEFORE ANY WORK) =====
-            # _wait_until_next_scan_boundary now returns the exact boundary timestamp we aligned to.
             boundary_ts = await self._wait_until_next_scan_boundary()
 
-            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d at boundary_ts=%d", loop_count, int(boundary_ts))
-
-            start = time.time()
             try:
                 if not self.symbols:
-                    logger.info("[DIAGNOSTIC] root_scan_loop: No symbols, discovering...")
                     await self.discover_symbols()
                     if self.symbols:
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
                     else:
-                        logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
                         await asyncio.sleep(10)
                         continue
 
                 await self._ensure_rest_poller()
 
-                # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
-                now = float(boundary_ts)  # use exact boundary timestamp for open detection
+                now = float(boundary_ts)
                 refreshed_tfs = []
                 for root in ROOT_TFS:
                     current_start = self._get_current_candle_start(root, now)
                     last_start = self._last_tf_candle_open_times.get(root, 0.0)
                     
                     if current_start > last_start:
-                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
                         self._last_tf_candle_open_times[root] = float(current_start)
                         refreshed_tfs.append(root)
 
                 if refreshed_tfs:
-                    logger.info(
-                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
-                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
-                        refreshed_tfs
-                    )
                     await self.seed_all()
-                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
-                # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
-                logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
                     try:
@@ -841,37 +675,15 @@ class Scanner:
                             return
 
                         self._last_price_cache[sym] = price
-
-                        # Ensure 24h volume is updated from exchange prior to signal generation
                         await self._update_24h_volume(sym)
-
                         now_check = time.time()
 
                         for root in ROOT_TFS:
-                            logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
-
-                            macd_line, sig, hist = self.compute_macd_for(
-                                sym,
-                                root,
-                                include_price=price,
-                                use_ws_current=True
-                            )
-
+                            _, _, hist = self.compute_macd_for(sym, root, include_price=price, use_ws_current=True)
                             flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
 
-                            logger.info(
-                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
-                                sym,
-                                root,
-                                flip
-                            )
-
                             if hist and flip:
-                                # Pull exchange-provided volume info for this symbol
-                                vol_info = self._24h_volumes.get(sym, {})
-                                vol_change = vol_info.get("volume_change")
-                                vol_usdt = vol_info.get("volume_usdt")
-
+                                vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
@@ -880,19 +692,13 @@ class Scanner:
                                 except Exception:
                                     start_at = None
 
-                                # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-                                
-                                # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
                                 
                                 if not is_new_signal:
-                                    logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                                
-                                # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
                                 sig_item = {
@@ -900,8 +706,7 @@ class Scanner:
                                     "root": root,
                                     "price": price,
                                     "hist": hist,
-                                    "vol_change": vol_change,            # fractional form if present (e.g. 0.012 -> +1.2%)
-                                    "volume_usdt": vol_usdt,            # raw USDT quote volume if present
+                                    "vol_change": vol_change,
                                     "start_at": start_at,
                                     "tv_score": tv_score,
                                     "tv_label": tv_label,
@@ -911,38 +716,25 @@ class Scanner:
                                     "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
                                 }
                                 root_signals.append(sig_item)
-                                if not candle_age_ok:
-                                    logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                                else:
-                                    logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                                
                     except Exception:
                         logger.exception("Error checking symbol %s", sym)
 
-                checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
                     if self._stop:
                         break
                     batch = self.symbols[i:i + REQUEST_BATCH_SIZE]
                     tasks = [asyncio.create_task(check_symbol(s)) for s in batch]
                     await asyncio.gather(*tasks)
-                    checked_count += len(batch)
                     if i + REQUEST_BATCH_SIZE < len(self.symbols):
                         await asyncio.sleep(REQUEST_BATCH_DELAY)
 
-                logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
-
-                # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
                 evaluated_aligned = []
                 if newly_aligned:
-                    # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
-                # Use the exact boundary timestamp for Telegram full-push decision so pushes are tied to the aligned boundary
                 now_ts = float(boundary_ts)
                 is_full_push = self.telegram.check_full_push(now_ts)
-                logger.debug("[TELEGRAM] is_full_push=%s now_ts=%d root_signals_count=%d newly_aligned=%d", is_full_push, int(now_ts), len(root_signals), len(newly_aligned))
 
                 if root_signals and is_full_push:
                     for sig in root_signals:
@@ -953,27 +745,22 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
                     evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
-                # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
                     root_signals.extend(newly_aligned)
                     evaluated_signals.extend(evaluated_aligned)
 
-                # Dispatch Telegram summary messages
                 if hasattr(self.telegram, "send_summary"):
                     try:
-                        logger.debug("[TELEGRAM] about to call send_summary: root_signals=%d evaluated=%d full_push=%s is_candle_open=%s", len(root_signals), len(evaluated_signals), is_full_push, is_full_push)
                         await self.telegram.send_summary(
                             root_signals=root_signals,
                             evaluated=evaluated_signals,
                             full_push=is_full_push,
                             is_candle_open=is_full_push
                         )
-                        logger.debug("[TELEGRAM] send_summary returned")
                     except Exception:
                         logger.exception("Failed to dispatch Telegram summary")
 
@@ -984,7 +771,6 @@ class Scanner:
                 logger.exception("Error in root scan loop")
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
-        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
         newly_aligned: List[Dict[str, Any]] = []
         if not self._mtf_monitoring:
             return newly_aligned
@@ -996,7 +782,6 @@ class Scanner:
         for sym, info in list(self._mtf_monitoring.items()):
             try:
                 if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
                     to_remove.append(sym)
                     continue
 
@@ -1016,18 +801,14 @@ class Scanner:
                 status = mtf_align["status"]
 
                 if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
                     to_remove.append(sym)
-                    vol_info = self._24h_volumes.get(sym, {})
-                    vol_change = vol_info.get("volume_change")
-                    vol_usdt = vol_info.get("volume_usdt")
+                    vol_change = self.compute_24h_volume_change(sym)
                     resolved_item = {
                         "symbol": sym,
                         "root": info["root"],
                         "price": price,
                         "hist": [],
                         "vol_change": vol_change,
-                        "volume_usdt": vol_usdt,
                         "from_monitoring": True,
                         "mtf_status": status,
                         "negative_tfs": mtf_align.get("negative_tfs", []),
@@ -1049,7 +830,6 @@ class Scanner:
         return newly_aligned
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
-        logger.info("[HANDLE_ROOT_DEBUG] handle_root_signals called: len(root_signals)=%d allow_open_trades=%s", len(root_signals), allow_open_trades)
         evaluated: List[Dict[str, Any]] = []
         to_open: List[Dict[str, Any]] = []
 
@@ -1058,7 +838,6 @@ class Scanner:
             price = item["price"]
             root = item["root"]
             vol_change = item.get("vol_change")
-            vol_usdt = item.get("volume_usdt")
             tv_label = item.get("tv_label")
             tv_score = item.get("tv_score", 0.0)
             start_at = item.get("start_at")
@@ -1093,7 +872,6 @@ class Scanner:
                 "negative_tfs": negative_tfs,
                 "one_d_slope": mtf_align.get("one_d_slope"),
                 "vol_change": vol_change,
-                "volume_usdt": vol_usdt,
                 "score": score,
                 "accept": False,
                 "reason": "pending",
@@ -1102,19 +880,15 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # ---- CANDLE AGE FILTER: Reject/block trade open if candle too old, but allow Telegram push ----
                 if not candle_age_ok:
                     entry["accept"] = False
                     entry["reason"] = "candle_too_old"
-                    logger.info("Trade blocked by FLIP_CANDLE_AGE_MAX_SEC (candle too old): %s root=%s", sym, root)
                     evaluated.append(entry)
                     continue
 
-                # ---- TV RATING FILTER: Reject if below TRADE_RATING_MIN ----
                 if TRADE_RATING_MIN_VAL > 0.0 and tv_score < TRADE_RATING_MIN_VAL:
                     entry["accept"] = False
                     entry["reason"] = f"tv_rating_below_threshold_{tv_score:.4f}"
-                    logger.info("Trade blocked by TRADE_RATING_MIN: %s tv_score=%.4f < min=%.4f", sym, tv_score, TRADE_RATING_MIN_VAL)
                     evaluated.append(entry)
                     continue
 
@@ -1137,30 +911,10 @@ class Scanner:
                         if marketcap is not None and marketcap < MARKET_CAP_MIN:
                             entry["accept"] = False
                             entry["reason"] = "market_cap_filtered"
-                            logger.info("Market cap filter blocked %s: cap=%s < min=%s", sym, marketcap, MARKET_CAP_MIN)
                             evaluated.append(entry)
                             continue
                     except Exception:
                         logger.exception("Market cap check failed for %s", sym)
-
-                # New: minimum 24h USDT volume filter
-                if MIN_24H_VOLUME_USDT and MIN_24H_VOLUME_USDT > 0:
-                    if vol_usdt is None:
-                        # If the exchange didn't provide volume info, be conservative and block (or choose permissive by not blocking)
-                        entry["accept"] = False
-                        entry["reason"] = "missing_24h_volume"
-                        logger.info("24h USDT volume info missing for %s; blocking due to MIN_24H_VOLUME_USDT=%s", sym, MIN_24H_VOLUME_USDT)
-                        evaluated.append(entry)
-                        continue
-                    try:
-                        if float(vol_usdt) < float(MIN_24H_VOLUME_USDT):
-                            entry["accept"] = False
-                            entry["reason"] = "min_24h_volume_filtered"
-                            logger.info("24h volume filter blocked %s: vol_usdt=%.0f < min=%s", sym, float(vol_usdt), MIN_24H_VOLUME_USDT)
-                            evaluated.append(entry)
-                            continue
-                    except Exception:
-                        logger.exception("Error evaluating 24h volume for %s", sym)
 
                 if VOLUME_FILTER_ENABLED:
                     if vol_change is None or vol_change < VOLUME_MIN_CHANGE_PCT:
@@ -1200,10 +954,8 @@ class Scanner:
 
         candidates = to_open
 
-        # ---- PRIORITIZE BY TV RATING ----
         if TRADE_RATING_PRIORITIZE and candidates:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
-            logger.info("Sorted %d candidates by TV rating (highest first)", len(candidates))
 
         if ROOT_FILTER:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -1274,7 +1026,6 @@ class Scanner:
             sym = c["symbol"]
             price = c["price"]
             vol_change = c.get("vol_change")
-            vol_usdt = c.get("volume_usdt")
 
             if TRADE_NO_NEG_VOL and vol_change is not None and vol_change <= 0:
                 c["accept"] = False
@@ -1289,14 +1040,9 @@ class Scanner:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-            
-            try:
-                symbol_info = await self.client.get_symbol_info(sym)
-            except Exception:
-                symbol_info = {}
-            
-            qty_raw = self.trade_manager.compute_qty_from_balance(balance if balance else 0.0, price, symbol_info)
-            qty = self._quantize_qty(qty_raw, symbol_info.get("step") if symbol_info else None, symbol_info.get("min_qty") if symbol_info else None)
+            symbol_info = await self.client.get_symbol_info(sym)
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
                 c["accept"] = False
                 c["reason"] = "zero_qty"
@@ -1310,15 +1056,13 @@ class Scanner:
             reason_tag = c.get("reason", "signal")
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
-                    logger.debug("[ORDER] Attempting real order for %s qty=%.6f", sym, qty)
                     order = await self.client.create_order(sym, side, qty)
-                    await self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
                         eval["accept"] = True
                         eval["reason"] = "opened"
                         eval["order"] = order
-                    logger.info("[SEND_MSG_DEBUG] About to send trade opened message for %s", sym)
                     await send_message(
                         f"✅ Trade Opened – {sym} {side}\n"
                         f"Price: {price} | Qty: {qty:.6f}\n"
@@ -1333,14 +1077,12 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
-                logger.info("[SIMULATE_ORDER] Simulating open for %s qty=%.6f", sym, qty)
-                await self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True
                     eval["reason"] = "simulated"
                     eval["simulated"] = True
-                logger.info("[SEND_MSG_DEBUG] About to send simulated trade message for %s", sym)
                 await send_message(
                     f"🔔 Simulated Trade – {sym} {side}\n"
                     f"Price: {price} | Qty: {qty:.6f}\n"
@@ -1358,14 +1100,9 @@ class Scanner:
         return combined
 
     async def run(self):
+        self._task = asyncio.create_task(self.root_scan_loop())
         try:
-            self._task = asyncio.create_task(self.root_scan_loop())
-            logger.info("[RUN_TASK] Scanner run() started; root_scan_loop task created")
             await self._task
-        except Exception as e:
-            print(f"[FATAL_CRASH] Main loop crashed with error: {e}")
-            logger.error("[FATAL_CRASH] Main loop crashed with error: %s", e, exc_info=True)
-            raise
         except asyncio.CancelledError:
             logger.info("Scanner run cancelled")
         finally:

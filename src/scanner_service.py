@@ -1,4 +1,4 @@
-# scanner_service.py
+# scanner_service (45).py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 

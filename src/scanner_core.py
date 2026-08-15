@@ -13,7 +13,7 @@ Note: This module will attempt to import pandas_ta (preferred) or the alternativ
 import math
 import json
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 getcontext().prec = 28
 
@@ -97,13 +97,13 @@ def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: i
         return True
 
 
-def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
+def normalize_klines(raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
     """
     Normalize various kline shapes into list of dicts:
       {"start_at", "open", "high", "low", "close", "volume", "is_closed"(optional)}
     Accepts dicts, lists, tuples and attempts to extract common fields.
     """
-    out: List[Dict[str, AnyT]] = []
+    out: List[Dict[str, Any]] = []
     if not raw_klines:
         return out
 
@@ -283,7 +283,7 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
     """
     Compute MACD histogram from a list of closes (floats).
     include_price: when provided, overwrites the last close value with current price.
-    Returns: (macd_line, signal_line, hist) â€” each as list-like (macd_histogram implementation dependent)
+    Returns: (macd_line, signal_line, hist)
     """
     data: List[float] = []
     for c in closes:
@@ -442,7 +442,7 @@ def _safe_bbands(df_close, length: int, std: float):
         return None
 
 
-def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
+def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
     """
     Compute a TradingView-like normalized score using pandas/ta or fallback 'ta' and the TECHNICAL_RATING-style cfg.
     Inputs:
@@ -667,7 +667,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         return 0.0, "Neutral"
 
 
-def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
+def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, Any]:
     """
     Evaluate MTF alignment across timeframes.
     get_closes_fn(tf) -> list of closes for that tf (most recent last).
@@ -675,7 +675,7 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
     mtf_tfs: list of TFs to evaluate (e.g., ["5","15","60","240","D"])
     mtf_slope_lookback: lookback for daily slope
     """
-    tf_states: Dict[str, Dict[str, AnyT]] = {}
+    tf_states: Dict[str, Dict[str, Any]] = {}
     negative_tfs: List[str] = []
     one_d_hist: List[float] = []
 

@@ -327,6 +327,32 @@ def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> 
         return False
 
 
+def compute_24h_volume_change_from(vol_info: Optional[Dict[str, Any]]) -> Optional[float]:
+    """
+    Compute fractional 24h volume change from the stored volume info.
+
+    Expected vol_info shape: {"current": <float>, "previous": <float>}
+    Returns:
+      - fractional change (e.g. 0.25 for +25%) when previous > 0
+      - None when insufficient data or previous is zero (avoids divide-by-zero)
+    """
+    try:
+        if not vol_info or not isinstance(vol_info, dict):
+            return None
+        curr = vol_info.get("current")
+        prev = vol_info.get("previous")
+        if curr is None or prev is None:
+            return None
+        curr_f = float(curr)
+        prev_f = float(prev)
+        # Avoid division by zero; caller treats None as unavailable
+        if prev_f == 0.0:
+            return None
+        return (curr_f - prev_f) / prev_f
+    except Exception:
+        return None
+
+
 # --- Helper wrappers for indicator functions (work with pandas_ta or bukosabino/ta) ---
 def _safe_sma(df_close, length: int):
     try:

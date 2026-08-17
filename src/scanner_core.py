@@ -309,21 +309,30 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
     return macd_line, signal_line, hist
 
 
-def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> bool:
+def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = "") -> bool:
     """
     Detect zero-cross flip from negative (or <=0) to positive on last candle.
     hist is a list where last item is most recent.
+    Includes a debug console snippet explaining why no flip detection occurred.
     """
     if not hist or len(hist) < 2:
+        print(f"[MACD_FLIP_DEBUG] symbol={symbol} tf={tf} -> NO FLIP: Histogram length insufficient (len={len(hist) if hist else 0})")
         return False
+    
     prev = hist[-2]
     cur = hist[-1]
+    
     if prev is None or cur is None:
+        print(f"[MACD_FLIP_DEBUG] symbol={symbol} tf={tf} -> NO FLIP: Histogram values contain None (prev={prev}, cur={cur})")
         return False
+        
     try:
         zero_cross = prev <= 0 and cur > 0
+        if not zero_cross:
+            print(f"[MACD_FLIP_DEBUG] symbol={symbol} tf={tf} -> NO FLIP: No zero-cross condition met (prev={prev:.8f} <= 0, cur={cur:.8f} > 0 -> False)")
         return zero_cross
-    except Exception:
+    except Exception as e:
+        print(f"[MACD_FLIP_DEBUG] symbol={symbol} tf={tf} -> NO FLIP: Error evaluating condition: {e}")
         return False
 
 

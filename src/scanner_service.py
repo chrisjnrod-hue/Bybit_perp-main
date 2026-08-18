@@ -1,4 +1,4 @@
-# scanner_service (45).py
+# scanner_service.py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 
@@ -570,50 +570,7 @@ class Scanner:
         return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
-        """
-        Diagnostic wrapper for core.detect_flip_current_open.
-
-        Logs a short summary (hist length, last 3 values, prev/cur, threshold) and returns
-        the same boolean result as the core function. Non-destructive: does not change logic.
-        """
-        try:
-            # Defensive: examine last values
-            hist_len = len(hist) if hist else 0
-            last3 = hist[-3:] if hist_len >= 3 else (hist[:] if hist else [])
-            prev = None
-            cur = None
-            if hist_len >= 2:
-                try:
-                    prev = hist[-2]
-                except Exception:
-                    prev = None
-                try:
-                    cur = hist[-1]
-                except Exception:
-                    cur = None
-
-            res = detect_flip_current_open(hist, hist_threshold)
-
-            try:
-                logger.debug(
-                    "[DETECT_FLIP] %s %s hist_len=%d prev=%s cur=%s last3=%s threshold=%s -> flip=%s",
-                    symbol or "-", tf or "-", hist_len,
-                    ("{:.12g}".format(prev) if prev is not None else "None"),
-                    ("{:.12g}".format(cur) if cur is not None else "None"),
-                    last3, hist_threshold, res
-                )
-            except Exception:
-                # Fallback if formatting fails
-                logger.debug("[DETECT_FLIP] %s %s hist_len=%d prev=%s cur=%s last3=%s threshold=%s -> flip=%s",
-                             symbol or "-", tf or "-", hist_len, str(prev), str(cur), str(last3), str(hist_threshold), str(res))
-            return res
-        except Exception as e:
-            logger.exception("Diagnostic detect_flip_current_open failed: %s", e)
-            # Fall back to core behavior if logging fails
-            try:
-                return detect_flip_current_open(hist, hist_threshold)
-            except Exception:
-                return False
+        return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
         """Update and track 24h volume data - tries multiple client method names and keys for robustness."""
@@ -903,8 +860,8 @@ class Scanner:
 
                             logger.info("[HIST_VAL] %s %s: prev=%.8f cur=%.8f ZERO_CROSS=%s", sym, root, prev_val, cur_val, zero_cross)
 
-                            # Detect flip
-                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            # Hook detect_flip_current_open inside main scan loop
+                            flip = detect_flip_current_open(hist, 0.0)
                             logger.info("[FLIP_CHECK] %s %s: flip=%s", sym, root, flip)
 
                             if not flip:

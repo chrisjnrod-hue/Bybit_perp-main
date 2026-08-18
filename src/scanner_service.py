@@ -890,6 +890,19 @@ class Scanner:
                             except Exception:
                                 hist_list = []
 
+                            # Unconditional MACD snapshot logging for diagnostics
+                            try:
+                                logger.info(
+                                    "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
+                                    sym, root,
+                                    ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
+                                    ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
+                                    len(hist_list),
+                                    str(hist_list[-2:]) if hist_list else "[]"
+                                )
+                            except Exception:
+                                logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
+
                             # Primary flip detection via helper (best-effort, catch exceptions)
                             flip = False
                             try:

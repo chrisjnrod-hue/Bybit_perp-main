@@ -77,7 +77,27 @@ class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-        self.trade_manager = TradeManager()
+
+        # Build TradeManager config mapping from existing module constants / env
+        tm_config = {
+            "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
+            "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
+            "MIN_MARKET_CAP": MARKET_CAP_MIN or 0,
+            "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
+            "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
+            "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
+            "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1") in ("1", "true", "True"),
+            "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
+            "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
+            "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
+            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+            # SIMULATED is true if TRADE_ENABLED is False or credentials missing
+            "SIMULATED": not bool(TRADE_ENABLED) or not bool(getattr(self.client, "api_key", None)) or not bool(getattr(self.client, "api_secret", None)),
+        }
+
+        self.trade_manager = TradeManager(self.client, tm_config)
+
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
@@ -1209,58 +1229,37 @@ class Scanner:
                     eval["reason"] = "negvol_blocked"
                 continue
 
+            # Get account balance for TradeManager to compute allocation
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-            symbol_info = await self.client.get_symbol_info(sym)
-            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
-            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
-            if qty <= 0 or math.isclose(qty, 0.0):
-                c["accept"] = False
-                c["reason"] = "zero_qty"
-                eval = eval_map.get((c["symbol"], c["root"]))
-                if eval is not None:
-                    eval["accept"] = False
-                    eval["reason"] = "zero_qty"
-                continue
 
-            side = "Buy"
-            reason_tag = c.get("reason", "signal")
-            if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
-                try:
-                    order = await self.client.create_order(sym, side, qty)
-                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
-                    eval = eval_map.get((sym, c["root"]))
-                    if eval is not None:
-                        eval["accept"] = True
-                        eval["reason"] = "opened"
-                        eval["order"] = order
-                    await send_message(
-                        f"✅ Trade Opened – {sym} {side}\n"
-                        f"Price: {price} | Qty: {qty:.6f}\n"
-                        f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
-                    )
-                except Exception:
-                    logger.exception("Failed to place order for %s", sym)
-                    c["accept"] = False
-                    c["reason"] = "order_failed"
-                    eval = eval_map.get((sym, c["root"]))
-                    if eval is not None:
-                        eval["accept"] = False
-                        eval["reason"] = "order_failed"
-            else:
-                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
-                eval = eval_map.get((sym, c["root"]))
+            # Let TradeManager perform checks and execution (or simulation). It returns structured result.
+            try:
+                tm_result = await self.trade_manager.open_trade(sym, "BUY", price, balance)
+            except Exception as e:
+                logger.exception("TradeManager.open_trade raised exception for %s: %s", sym, e)
+                tm_result = {"success": False, "error": str(e)}
+
+            eval = eval_map.get((sym, c["root"]))
+            if tm_result.get("success"):
+                # Opened successfully (or simulated)
                 if eval is not None:
                     eval["accept"] = True
-                    eval["reason"] = "simulated"
-                    eval["simulated"] = True
-                await send_message(
-                    f"🔔 Simulated Trade – {sym} {side}\n"
-                    f"Price: {price} | Qty: {qty:.6f}\n"
-                    f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
-                )
+                    eval["reason"] = "opened" if not tm_result.get("simulated") else "simulated"
+                    if "order" in tm_result:
+                        eval["order"] = tm_result.get("order")
+                    eval["trade_record"] = tm_result.get("trade_record")
+                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
+            else:
+                # failed to open
+                err = tm_result.get("error", "open_failed")
+                c["accept"] = False
+                c["reason"] = err
+                if eval is not None:
+                    eval["accept"] = False
+                    eval["reason"] = err
 
             self._mtf_monitoring.pop(sym, None)
 

@@ -873,7 +873,60 @@ class Scanner:
                                 use_ws_current=True
                             )
 
-                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
+                            # Defensive normalization of hist for logging and fallback detection
+                            hist_list: List[float] = []
+                            try:
+                                if hist is None:
+                                    hist_list = []
+                                elif isinstance(hist, (list, tuple)):
+                                    hist_list = [float(x) for x in hist]
+                                else:
+                                    # try to convert numpy arrays or single numeric
+                                    try:
+                                        hist_list = list(map(float, hist))
+                                    except Exception:
+                                        # treat single numeric as one-element list
+                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
+                            except Exception:
+                                hist_list = []
+
+                            # Primary flip detection via helper (best-effort, catch exceptions)
+                            flip = False
+                            try:
+                                flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
+                            except Exception:
+                                # fall back silently to our heuristic
+                                flip = False
+
+                            # If primary helper didn't detect a flip, try a conservative heuristic:
+                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
+                            if not flip:
+                                try:
+                                    if len(hist_list) >= 2:
+                                        prev_h = float(hist_list[-2])
+                                        last_h = float(hist_list[-1])
+                                        if prev_h < 0 and last_h > 0:
+                                            flip = True
+                                        # also detect a decisive jump from <=0 to significantly positive
+                                        elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
+                                            flip = True
+                                except Exception:
+                                    flip = False
+
+                            # Surgical logging for diagnostics
+                            if DEBUG_SURGICAL_LOGS:
+                                try:
+                                    logger.info(
+                                        "[SURGICAL_MACD] %s %s macd=%s signal=%s hist_len=%d last2=%s flip=%s",
+                                        sym, root,
+                                        ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
+                                        ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
+                                        len(hist_list),
+                                        str(hist_list[-2:]) if hist_list else "[]",
+                                        flip
+                                    )
+                                except Exception:
+                                    logger.debug("Failed surgical macd log for %s %s", sym, root, exc_info=True)
 
                             logger.info(
                                 "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
@@ -882,7 +935,7 @@ class Scanner:
                                 flip
                             )
 
-                            if hist and flip:
+                            if hist_list and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
@@ -911,7 +964,7 @@ class Scanner:
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
-                                    "hist": hist,
+                                    "hist": hist_list,
                                     "vol_change": vol_change,
                                     "start_at": start_at,
                                     "tv_score": tv_score,

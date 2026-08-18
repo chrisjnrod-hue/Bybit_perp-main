@@ -1,4 +1,4 @@
-# scanner_service (45).py
+# scanner_service.py
 # Core scanning, signal evaluation, and trade management orchestration.
 # Telegram messaging delegated to scanner_telegram.py
 
@@ -72,29 +72,12 @@ MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 # Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
-# Default config dictionary for TradeManager
-DEFAULT_TRADE_MANAGER_CONFIG = {
-    "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
-    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
-    "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
-    "MIN_MARKET_CAP": float(os.getenv("MIN_MARKET_CAP", "50000000")),
-    "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
-    "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
-    "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
-    "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
-    "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
-    "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1").strip().lower() in ("1", "true", "yes", "y"),
-}
-
 
 class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-        # FIX: Pass both exchange_client and config to TradeManager
-        self.trade_manager = TradeManager(exchange_client=self.client, config=DEFAULT_TRADE_MANAGER_CONFIG)
+        self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
@@ -649,6 +632,101 @@ class Scanner:
             return closes
         return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
+    def _detect_tf_candle_opens(self, now: float) -> List[str]:
+        """
+        Detect which ROOT_TFS have just opened a new candle.
+        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
+        """
+        opens = []
+        now_struct = time.gmtime(now)
+        current_hour = now_struct.tm_hour
+        current_minute = now_struct.tm_min
+        current_second = now_struct.tm_sec
+        
+        for tf in ROOT_TFS:
+            try:
+                tf_seconds = self._tf_to_seconds(tf)
+                
+                if tf in ("D", "W"):
+                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
+                        opens.append(tf)
+                else:
+                    if tf_seconds >= 3600:
+                        candles_per_day = 86400 // tf_seconds
+                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
+                    else:
+                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
+            except Exception:
+                logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
+        
+        return opens
+
+    async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
+        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
+        newly_aligned: List[Dict[str, Any]] = []
+        if not self._mtf_monitoring:
+            return newly_aligned
+
+        MONITORING_MAX_AGE = 86400
+        now = time.time()
+        to_remove: List[str] = []
+
+        for sym, info in list(self._mtf_monitoring.items()):
+            try:
+                if now - info.get("started_at", now) > MONITORING_MAX_AGE:
+                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
+                    to_remove.append(sym)
+                    continue
+
+                price = self._last_price_cache.get(sym)
+                if price is None:
+                    try:
+                        async with self.request_sem:
+                            price = await self.client.get_latest_price(sym)
+                        if price:
+                            self._last_price_cache[sym] = price
+                    except Exception:
+                        pass
+                if price is None:
+                    continue
+
+                mtf_align = self._compute_mtf_alignment(sym, price)
+                status = mtf_align["status"]
+
+                if status in ("aligned", "daily_rising"):
+                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
+                    to_remove.append(sym)
+                    vol_change = self.compute_24h_volume_change(sym)
+                    resolved_item = {
+                        "symbol": sym,
+                        "root": info["root"],
+                        "price": price,
+                        "hist": [],
+                        "vol_change": vol_change,
+                        "from_monitoring": True,
+                        "mtf_status": status,
+                        "negative_tfs": mtf_align.get("negative_tfs", []),
+                        "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
+                    }
+                    newly_aligned.append(resolved_item)
+                else:
+                    prev_neg = set(info.get("negative_tfs", []))
+                    curr_neg = set(mtf_align.get("negative_tfs", []))
+                    if curr_neg != prev_neg:
+                        self._mtf_monitoring[sym]["negative_tfs"] = list(curr_neg)
+                        self._mtf_monitoring[sym]["last_alert"] = now
+            except Exception:
+                logger.exception("Error checking monitored symbol %s", sym)
+
+        for sym in to_remove:
+            self._mtf_monitoring.pop(sym, None)
+
+        return newly_aligned
+
     def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
         """
         Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
@@ -691,46 +769,6 @@ class Scanner:
             logger.debug("Error in dedupe check: %s", e)
             return True
 
-    async def _wait_until_next_scan_boundary(self) -> float:
-        """
-        Wait until the next scan boundary (clock-aligned) and return the boundary timestamp.
-
-        - If ROOT_SCAN_INTERVAL > 0: aligns to multiples of that interval from epoch (00:00 UTC).
-        - If ROOT_SCAN_INTERVAL = 0: aligns to next 5-minute boundary (multiples of 300s: 00, 05, 10, ...).
-        
-        Returns:
-            float: the epoch timestamp (seconds) of the boundary we woke for.
-        """
-        now = time.time()
-
-        if ROOT_SCAN_INTERVAL and ROOT_SCAN_INTERVAL > 0:
-            # Align to multiples of ROOT_SCAN_INTERVAL from epoch (exact)
-            next_boundary = (int(now / ROOT_SCAN_INTERVAL) + 1) * ROOT_SCAN_INTERVAL
-            to_sleep = next_boundary - now
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=%.0f: sleeping %.3f sec to align to boundary (ts=%d)",
-                ROOT_SCAN_INTERVAL, to_sleep, int(next_boundary)
-            )
-            if to_sleep > 0:
-                await asyncio.sleep(to_sleep)
-            return float(next_boundary)
-        else:
-            # ROOT_SCAN_INTERVAL = 0: align to next 5-minute boundary (multiples of 300 seconds)
-            FIVE_MIN = 300
-            next_boundary = ((int(now) // FIVE_MIN) + 1) * FIVE_MIN
-            to_sleep = next_boundary - now
-            # Ensure non-negative sleep
-            to_sleep = max(0.0, to_sleep)
-            # Log target in human readable terms
-            next_struct = time.gmtime(next_boundary)
-            logger.info(
-                "[SCAN_BOUNDARY] ROOT_SCAN_INTERVAL=0: aligning to next 5m boundary at %02d:%02d:%02d UTC (sleeping %.3f sec)",
-                next_struct.tm_hour, next_struct.tm_min, next_struct.tm_sec, to_sleep
-            )
-            if to_sleep > 0:
-                await asyncio.sleep(to_sleep)
-            return float(next_boundary)
-
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
@@ -738,11 +776,7 @@ class Scanner:
         while not self._stop:
             loop_count += 1
 
-            # ===== SYNC TO NEXT SCAN BOUNDARY (BEFORE ANY WORK) =====
-            # _wait_until_next_scan_boundary now returns the exact boundary timestamp we aligned to.
-            boundary_ts = await self._wait_until_next_scan_boundary()
-
-            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d at boundary_ts=%d", loop_count, int(boundary_ts))
+            logger.info("[DIAGNOSTIC] root_scan_loop: Beginning scan cycle #%d", loop_count)
 
             start = time.time()
             try:
@@ -761,7 +795,7 @@ class Scanner:
                 await self._ensure_rest_poller()
 
                 # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
-                now = float(boundary_ts)  # use exact boundary timestamp for open detection
+                now = time.time()
                 refreshed_tfs = []
                 for root in ROOT_TFS:
                     current_start = self._get_current_candle_start(root, now)
@@ -896,8 +930,7 @@ class Scanner:
                     # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
-                # Use the exact boundary timestamp for Telegram full-push decision so pushes are tied to the aligned boundary
-                now_ts = float(boundary_ts)
+                now_ts = time.time()
                 is_full_push = self.telegram.check_full_push(now_ts)
 
                 if root_signals and is_full_push:
@@ -937,67 +970,30 @@ class Scanner:
             except Exception:
                 logger.exception("Error in root scan loop")
 
-    async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
-        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
-        newly_aligned: List[Dict[str, Any]] = []
-        if not self._mtf_monitoring:
-            return newly_aligned
+            elapsed = time.time() - start
 
-        MONITORING_MAX_AGE = 86400
-        now = time.time()
-        to_remove: List[str] = []
+            if ROOT_SCAN_INTERVAL:
+                to_sleep = max(0, ROOT_SCAN_INTERVAL - elapsed)
+                logger.info("[DIAGNOSTIC] root_scan_loop: Sleeping for %.1f seconds before next cycle", to_sleep)
+                await asyncio.sleep(to_sleep)
+            else:
+                now_sleep = time.time()
+                now_struct = time.gmtime(now_sleep)
+                current_minute = now_struct.tm_min
+                current_second = now_struct.tm_sec
 
-        for sym, info in list(self._mtf_monitoring.items()):
-            try:
-                if now - info.get("started_at", now) > MONITORING_MAX_AGE:
-                    logger.info("MONITORING EXPIRED (24h): %s – removing", sym)
-                    to_remove.append(sym)
-                    continue
+                next_5m_minute = ((current_minute // 5) + 1) * 5
 
-                price = self._last_price_cache.get(sym)
-                if price is None:
-                    try:
-                        async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
-                        if price:
-                            self._last_price_cache[sym] = price
-                    except Exception:
-                        pass
-                if price is None:
-                    continue
-
-                mtf_align = self._compute_mtf_alignment(sym, price)
-                status = mtf_align["status"]
-
-                if status in ("aligned", "daily_rising"):
-                    logger.info("MONITORING RESOLVED: %s → %s – queuing trade open", sym, status)
-                    to_remove.append(sym)
-                    vol_change = self.compute_24h_volume_change(sym)
-                    resolved_item = {
-                        "symbol": sym,
-                        "root": info["root"],
-                        "price": price,
-                        "hist": [],
-                        "vol_change": vol_change,
-                        "from_monitoring": True,
-                        "mtf_status": status,
-                        "negative_tfs": mtf_align.get("negative_tfs", []),
-                        "score": sum(1.0 for d in mtf_align["tfs"].values() if d.get("is_positive")) + sum(0.5 for d in mtf_align["tfs"].values() if d.get("is_flip")) + (min(vol_change, 1.0) if vol_change is not None and vol_change > 0 else 0.0)
-                    }
-                    newly_aligned.append(resolved_item)
+                if next_5m_minute >= 60:
+                    to_sleep = (60 - current_minute) * 60 - current_second
                 else:
-                    prev_neg = set(info.get("negative_tfs", []))
-                    curr_neg = set(mtf_align.get("negative_tfs", []))
-                    if curr_neg != prev_neg:
-                        self._mtf_monitoring[sym]["negative_tfs"] = list(curr_neg)
-                        self._mtf_monitoring[sym]["last_alert"] = now
-            except Exception:
-                logger.exception("Error checking monitored symbol %s", sym)
+                    to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
-        for sym in to_remove:
-            self._mtf_monitoring.pop(sym, None)
-
-        return newly_aligned
+                to_sleep = max(1, min(300, to_sleep))
+                
+                logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
+                           to_sleep, current_minute, current_second, next_5m_minute % 60)
+                await asyncio.sleep(to_sleep)
 
     async def handle_root_signals(self, root_signals: List[Dict[str, Any]], allow_open_trades: bool = True) -> List[Dict[str, Any]]:
         evaluated: List[Dict[str, Any]] = []
@@ -1217,14 +1213,9 @@ class Scanner:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-            
-            try:
-                symbol_info = await self.client.get_symbol_info(sym)
-            except Exception:
-                symbol_info = {}
-            
-            qty_raw = self.trade_manager.compute_qty_from_balance(balance if balance else 0.0, price, symbol_info)
-            qty = self._quantize_qty(qty_raw, symbol_info.get("step") if symbol_info else None, symbol_info.get("min_qty") if symbol_info else None)
+            symbol_info = await self.client.get_symbol_info(sym)
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
             if qty <= 0 or math.isclose(qty, 0.0):
                 c["accept"] = False
                 c["reason"] = "zero_qty"
@@ -1239,7 +1230,7 @@ class Scanner:
             if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
                 try:
                     order = await self.client.create_order(sym, side, qty)
-                    await self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
                     eval = eval_map.get((sym, c["root"]))
                     if eval is not None:
                         eval["accept"] = True
@@ -1259,7 +1250,7 @@ class Scanner:
                         eval["accept"] = False
                         eval["reason"] = "order_failed"
             else:
-                await self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
                 eval = eval_map.get((sym, c["root"]))
                 if eval is not None:
                     eval["accept"] = True

@@ -432,6 +432,81 @@ class Scanner:
 
         logger.info("[DIAGNOSTIC] seed_all: COMPLETE")
 
+    async def _debug_post_seed_summary(self, limit: Optional[int] = None):
+        """
+        Post-seed diagnostics: log per-symbol/TF summary to help troubleshoot why no MACD flip signals.
+        limit: optional number of symbols to inspect (None = all). If there are many symbols this will be large.
+        """
+        try:
+            now = time.time()
+            tfs_to_check = list(set(list(ROOT_TFS) + MTF_ALIGN_TFS))
+            syms = self.symbols if limit is None else self.symbols[:limit]
+            logger.info("[SEED_DEBUG] Post-seed diagnostics start (symbols=%d, tfs=%s)", len(syms), tfs_to_check)
+            for sym in syms:
+                for tf in tfs_to_check:
+                    try:
+                        klines = self.kline_store.get(sym, {}).get(tf, []) or []
+                        count = len(klines)
+                        last = klines[-1] if klines else None
+                        last_start = last.get("start_at") if isinstance(last, dict) else None
+                        last_close = None
+                        if isinstance(last, dict):
+                            last_close = last.get("close")
+                        # compute MACD hist using current last_close if present
+                        macd_line, macd_sig, hist = self.compute_macd_for(sym, tf, include_price=last_close)
+                        # normalize hist for logging
+                        hist_list = []
+                        try:
+                            if hist is None:
+                                hist_list = []
+                            elif isinstance(hist, (list, tuple)):
+                                hist_list = [None if v is None else float(v) for v in hist]
+                            else:
+                                # try to coerce numpy arrays/series
+                                hist_list = list(map(lambda x: None if x is None else float(x), hist))
+                        except Exception:
+                            hist_list = []
+                        # determine quick reason why no flip
+                        noflip_reason = "unknown"
+                        if len(hist_list) < 2:
+                            noflip_reason = "insufficient_hist"
+                        else:
+                            prev_h = hist_list[-2]
+                            cur_h = hist_list[-1]
+                            if prev_h is None or cur_h is None:
+                                noflip_reason = "nan_in_hist"
+                            elif not (prev_h < 0 and cur_h > 0):
+                                try:
+                                    noflip_reason = f"no_zero_cross prev={prev_h:.6f} cur={cur_h:.6f}"
+                                except Exception:
+                                    noflip_reason = f"no_zero_cross prev={prev_h} cur={cur_h}"
+                            else:
+                                noflip_reason = "flip_detected_in_hist"
+                        # tv rating & mtf alignment
+                        try:
+                            tv_score, tv_label = self.compute_tv_rating(sym, tf, price=last_close)
+                        except Exception:
+                            tv_score, tv_label = 0.0, "Neutral"
+                        try:
+                            mtf = self._compute_mtf_alignment(sym, last_close or 0.0)
+                        except Exception:
+                            mtf = {"status": "err", "tfs": {}}
+                        vol = None
+                        if sym in self._24h_volumes:
+                            vol = self._24h_volumes[sym].get("current")
+                        candle_age_ok = self._is_candle_age_acceptable(last_start, now)
+                        logger.info(
+                            "[SEED_DEBUG] %s %s count=%d last_start=%s last_close=%s candle_age_ok=%s hist_len=%d last2=%s reason=%s tv=%s(%.3f) mtf=%s vol=%s",
+                            sym, tf, count, last_start, last_close, candle_age_ok,
+                            len(hist_list), str(hist_list[-2:]) if hist_list else "[]",
+                            noflip_reason, tv_label, tv_score, mtf.get("status"), vol
+                        )
+                    except Exception:
+                        logger.exception("SEED_DEBUG error for %s %s", sym, tf)
+            logger.info("[SEED_DEBUG] Post-seed diagnostics complete")
+        except Exception:
+            logger.exception("SEED_DEBUG failed")
+
     async def _rest_poller(self):
         """REST poller as fallback when WS is unavailable."""
         logger.info("REST poller started (interval=%s seconds)", REST_POLL_INTERVAL)
@@ -806,6 +881,10 @@ class Scanner:
                     if self.symbols:
                         logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
+                        try:
+                            await self._debug_post_seed_summary(limit=50)  # limit to first 50 symbols to avoid massive logs; set None to log all
+                        except Exception:
+                            logger.exception("Post-seed diagnostics failed")
                         logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
                     else:
                         logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
@@ -833,6 +912,11 @@ class Scanner:
                         refreshed_tfs
                     )
                     await self.seed_all()
+                    # Post-seed diagnostics for candle-open refresh
+                    try:
+                        await self._debug_post_seed_summary(limit=50)
+                    except Exception:
+                        logger.exception("Post-seed diagnostics failed (candle open refresh)")
                     logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
                 # -------------------------------------------------------------
 

@@ -112,8 +112,8 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
         
-        # Track which ROOT_TF candles have opened in the current cycle
-        self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
+        # Track which ROOT_TF candles have opened in the current cycle (use int to avoid int/float mismatch)
+        self._last_tf_candle_open_times: Dict[str, int] = {tf: 0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
         # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
@@ -405,7 +405,7 @@ class Scanner:
                     continue
 
                 try:
-                    klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
+                    klines_sorted = sorted(valid, key=lambda x: int(x.get("start_at") or 0))
                 except Exception:
                     klines_sorted = valid
                 self.kline_store[symbol][tf] = klines_sorted
@@ -474,7 +474,7 @@ class Scanner:
                                     if last_new:
                                         if lst:
                                             try:
-                                                if lst[-1].get("start_at") == last_new.get("start_at"):
+                                                if int(lst[-1].get("start_at") or 0) == int(last_new.get("start_at") or 0):
                                                     lst[-1] = last_new
                                                 else:
                                                     lst.append(last_new)
@@ -573,7 +573,6 @@ class Scanner:
         return compute_macd_from_closes(closes, include_price=current_price)
 
     def detect_flip_current_open(self, hist: List[float], hist_threshold: float = 0.0, symbol: str = "", tf: str = ""):
-        # wrapper to preserve original method signature used elsewhere in the codebase
         return detect_flip_current_open(hist, hist_threshold)
 
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
@@ -656,10 +655,7 @@ class Scanner:
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
         Detect which ROOT_TFS have just opened a new candle.
-
-        This implementation uses the same logic as _get_current_candle_start to ensure
-        consistent candle boundaries across the scanner. A TF is considered 'opened' if
-        now - current_candle_start < TELEGRAM_DISPATCH_WINDOW seconds.
+        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
         try:
@@ -808,12 +804,13 @@ class Scanner:
                 now = time.time()
                 refreshed_tfs = []
                 for root in ROOT_TFS:
-                    current_start = self._get_current_candle_start(root, now)
-                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    current_start = int(self._get_current_candle_start(root, now))
+                    last_start = int(self._last_tf_candle_open_times.get(root, 0))
                     
                     if current_start > last_start:
                         logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
-                        self._last_tf_candle_open_times[root] = float(current_start)
+                        # store as int to avoid mismatches (fixes repeated seed_all)
+                        self._last_tf_candle_open_times[root] = int(current_start)
                         refreshed_tfs.append(root)
 
                 if refreshed_tfs:
@@ -830,6 +827,12 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
+                    """
+                    Check a single symbol for flip signals across ROOT_TFS.
+
+                    This function is defensive: it builds a cleaned hist_list that filters out None/NaN
+                    and logs contextual information if an error happens so the cause is visible.
+                    """
                     try:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
@@ -856,28 +859,42 @@ class Scanner:
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
 
-                            macd_line, sig, hist = self.compute_macd_for(
-                                sym,
-                                root,
-                                include_price=price,
-                                use_ws_current=True
-                            )
+                            try:
+                                macd_line, sig, hist = self.compute_macd_for(
+                                    sym,
+                                    root,
+                                    include_price=price,
+                                    use_ws_current=True
+                                )
+                            except Exception as e:
+                                # MACD computation failed — log and continue to next TF
+                                logger.exception("MACD computation failed for %s %s: %s", sym, root, e)
+                                continue
 
-                            # Defensive normalization of hist for logging and fallback detection
+                            # Build a robust hist_list: accept lists, tuples, numpy arrays or single numeric values.
                             hist_list: List[float] = []
                             try:
                                 if hist is None:
                                     hist_list = []
-                                elif isinstance(hist, (list, tuple)):
-                                    hist_list = [float(x) for x in hist]
                                 else:
-                                    # try to convert numpy arrays or single numeric
                                     try:
-                                        hist_list = list(map(float, hist))
+                                        iterable = list(hist)
                                     except Exception:
-                                        # treat single numeric as one-element list
-                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
-                            except Exception:
+                                        # hist may be a scalar
+                                        iterable = [hist]
+                                    for x in iterable:
+                                        if x is None:
+                                            continue
+                                        try:
+                                            v = float(x)
+                                            if math.isnan(v):
+                                                continue
+                                            hist_list.append(v)
+                                        except Exception:
+                                            # skip items that cannot be converted
+                                            continue
+                            except Exception as e:
+                                logger.debug("Failed to construct hist_list for %s %s: %s", sym, root, e)
                                 hist_list = []
 
                             # Unconditional MACD snapshot logging for diagnostics
@@ -893,16 +910,14 @@ class Scanner:
                             except Exception:
                                 logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
 
-                            # Primary flip detection via helper (best-effort, catch exceptions)
+                            # Primary flip detection via helper (best-effort)
                             flip = False
                             try:
                                 flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
                             except Exception:
-                                # fall back silently to our heuristic
                                 flip = False
 
-                            # If primary helper didn't detect a flip, try a conservative heuristic:
-                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
+                            # Conservative heuristic fallback (if helper didn't detect)
                             if not flip:
                                 try:
                                     if len(hist_list) >= 2:
@@ -910,13 +925,11 @@ class Scanner:
                                         last_h = float(hist_list[-1])
                                         if prev_h < 0 and last_h > 0:
                                             flip = True
-                                        # also detect jump from <=0 to decisively positive
                                         elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
                                             flip = True
                                 except Exception:
                                     flip = False
 
-                            # Surgical logging for diagnostics
                             if DEBUG_SURGICAL_LOGS:
                                 try:
                                     logger.info(
@@ -932,10 +945,11 @@ class Scanner:
                                     logger.debug("Failed surgical macd log for %s %s", sym, root, exc_info=True)
 
                             logger.info(
-                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
+                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s hist_len=%d",
                                 sym,
                                 root,
-                                flip
+                                flip,
+                                len(hist_list)
                             )
 
                             if hist_list and flip:
@@ -982,9 +996,11 @@ class Scanner:
                                     logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 else:
                                     logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                                
                     except Exception:
-                        logger.exception("Error checking symbol %s", sym)
+                        # log with context to make issues visible and actionable
+                        logger.exception("Error checking symbol %s (during symbol check). Last known price=%s", sym, self._last_price_cache.get(sym))
+                        # continue: do not let a single symbol crash the loop
+                        return
 
                 checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
@@ -1022,7 +1038,6 @@ class Scanner:
                 # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    # note: allow_open_trades only when is_full_push is True; this is an explicit gating mechanism
                     evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
                 # Combine both new signals and resolved monitoring signals for the Telegram summary

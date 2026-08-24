@@ -132,6 +132,9 @@ class Scanner:
             TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
+        # Unconditional runtime print for Render console visibility
+        print(f"[RUNNING] Scanner initialized PID={os.getpid()} DEBUG_SURGICAL_LOGS={DEBUG_SURGICAL_LOGS} DIAGNOSTIC_MODE={DIAGNOSTIC_MODE}")
+
     def register_callback(self, cb: Callable[[str, Any], Any]):
         if not callable(cb):
             raise TypeError("callback must be callable")
@@ -442,6 +445,8 @@ class Scanner:
             tfs_to_check = list(set(list(ROOT_TFS) + MTF_ALIGN_TFS))
             syms = self.symbols if limit is None else self.symbols[:limit]
             logger.info("[SEED_DEBUG] Post-seed diagnostics start (symbols=%d, tfs=%s)", len(syms), tfs_to_check)
+            # Unconditional print so Render free console shows the diagnostics start
+            print(f"[SEED_DEBUG] running post-seed diagnostics for {len(syms)} symbols (limit={limit})")
             for sym in syms:
                 for tf in tfs_to_check:
                     try:
@@ -866,6 +871,8 @@ class Scanner:
 
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
+        # Unconditional print so Render console shows the loop start
+        print(f"[RUNNING] root_scan_loop started at {time.time()} (PID={os.getpid()})")
         loop_count = 0
 
         while not self._stop:

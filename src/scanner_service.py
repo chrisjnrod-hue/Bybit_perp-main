@@ -72,9 +72,6 @@ MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 # Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
-# Force immediate open trades (bypass Telegram gating). Default ON to match requested behavior.
-FORCE_OPEN_TRADES = os.getenv("FORCE_OPEN_TRADES", "1").strip().lower() in ("1", "true", "yes", "y")
-
 
 class Scanner:
     def __init__(self):
@@ -114,9 +111,9 @@ class Scanner:
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
-
-        # Track which ROOT_TF candles have opened in the current cycle (use int to avoid int/float mismatch)
-        self._last_tf_candle_open_times: Dict[str, int] = {tf: 0 for tf in ROOT_TFS}
+        
+        # Track which ROOT_TF candles have opened in the current cycle
+        self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
         # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
@@ -129,10 +126,10 @@ class Scanner:
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s FORCE_OPEN_TRADES=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, FORCE_OPEN_TRADES
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -408,7 +405,7 @@ class Scanner:
                     continue
 
                 try:
-                    klines_sorted = sorted(valid, key=lambda x: int(x.get("start_at") or 0))
+                    klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
                 except Exception:
                     klines_sorted = valid
                 self.kline_store[symbol][tf] = klines_sorted
@@ -477,7 +474,7 @@ class Scanner:
                                     if last_new:
                                         if lst:
                                             try:
-                                                if int(lst[-1].get("start_at") or 0) == int(last_new.get("start_at") or 0):
+                                                if lst[-1].get("start_at") == last_new.get("start_at"):
                                                     lst[-1] = last_new
                                                 else:
                                                     lst.append(last_new)
@@ -550,7 +547,6 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        This function logs MACD inputs for easier debugging.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -565,10 +561,7 @@ class Scanner:
 
         current_price = None
         if include_price is not None:
-            try:
-                current_price = float(include_price)
-            except Exception:
-                current_price = None
+            current_price = float(include_price)
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
                 ws_last = self.client.get_ws_latest_kline(symbol, tf)
@@ -576,12 +569,6 @@ class Scanner:
                     current_price = float(ws_last.get("close"))
             except Exception:
                 pass
-
-        # MACD input debug (always shown)
-        try:
-            logger.info("[MACD_INPUT] %s %s closes_count=%d include_price=%s", symbol, tf, len(closes), str(current_price))
-        except Exception:
-            logger.debug("MACD_INPUT logging failure for %s %s", symbol, tf, exc_info=True)
 
         return compute_macd_from_closes(closes, include_price=current_price)
 
@@ -668,20 +655,34 @@ class Scanner:
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
         """
         Detect which ROOT_TFS have just opened a new candle.
-        Uses same math as _get_current_candle_start and considers a TF 'opened' if now - start < TELEGRAM_DISPATCH_WINDOW.
+        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
         """
         opens = []
-        try:
-            for tf in ROOT_TFS:
-                try:
-                    current_start = int(self._get_current_candle_start(tf, now))
-                    seconds_since_open = now - current_start
-                    if seconds_since_open < TELEGRAM_DISPATCH_WINDOW:
+        now_struct = time.gmtime(now)
+        current_hour = now_struct.tm_hour
+        current_minute = now_struct.tm_min
+        current_second = now_struct.tm_sec
+        
+        for tf in ROOT_TFS:
+            try:
+                tf_seconds = self._tf_to_seconds(tf)
+                
+                if tf in ("D", "W"):
+                    if current_hour == 0 and current_minute == 0 and current_second < TELEGRAM_DISPATCH_WINDOW:
                         opens.append(tf)
-                except Exception:
-                    logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
-        except Exception:
-            logger.exception("Error in _detect_tf_candle_opens")
+                else:
+                    if tf_seconds >= 3600:
+                        candles_per_day = 86400 // tf_seconds
+                        seconds_since_candle_open = (current_hour % (24 // candles_per_day)) * 3600 + current_minute * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
+                    else:
+                        seconds_since_candle_open = (current_minute % (tf_seconds // 60)) * 60 + current_second
+                        if seconds_since_candle_open < TELEGRAM_DISPATCH_WINDOW:
+                            opens.append(tf)
+            except Exception:
+                logger.debug("Error detecting candle open for TF %s", tf, exc_info=True)
+        
         return opens
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
@@ -761,25 +762,25 @@ class Scanner:
         if SIGNAL_DEDUP_WINDOW <= 0:
             # Deduplication disabled
             return True
-
+        
         if candle_open_time is None:
             logger.debug("Cannot dedupe signal: candle_open_time is None")
             return True
-
+        
         try:
             cache_key = (symbol, tf, int(candle_open_time))
-
+            
             if cache_key in self._signal_cache:
                 last_signal_time = self._signal_cache[cache_key]
                 time_since_last = now - last_signal_time
-
+                
                 if time_since_last < SIGNAL_DEDUP_WINDOW:
                     logger.debug(
                         "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
                         symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
                     )
                     return False
-
+            
             # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
@@ -817,13 +818,12 @@ class Scanner:
                 now = time.time()
                 refreshed_tfs = []
                 for root in ROOT_TFS:
-                    current_start = int(self._get_current_candle_start(root, now))
-                    last_start = int(self._last_tf_candle_open_times.get(root, 0))
-
+                    current_start = self._get_current_candle_start(root, now)
+                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    
                     if current_start > last_start:
                         logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
-                        # store as int to avoid mismatches (fixes repeated seed_all)
-                        self._last_tf_candle_open_times[root] = int(current_start)
+                        self._last_tf_candle_open_times[root] = float(current_start)
                         refreshed_tfs.append(root)
 
                 if refreshed_tfs:
@@ -840,12 +840,6 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
-                    """
-                    Check a single symbol for flip signals across ROOT_TFS.
-
-                    This function is defensive: it builds a cleaned hist_list that filters out None/NaN
-                    and logs contextual information if an error happens so the cause is visible.
-                    """
                     try:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
@@ -872,67 +866,53 @@ class Scanner:
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
 
-                            try:
-                                macd_line, sig, hist = self.compute_macd_for(
-                                    sym,
-                                    root,
-                                    include_price=price,
-                                    use_ws_current=True
-                                )
-                            except Exception as e:
-                                # MACD computation failed — log and continue to next TF
-                                logger.exception("MACD computation failed for %s %s: %s", sym, root, e)
-                                continue
+                            macd_line, sig, hist = self.compute_macd_for(
+                                sym,
+                                root,
+                                include_price=price,
+                                use_ws_current=True
+                            )
 
-                            # Build a robust hist_list: accept lists, tuples, numpy arrays or single numeric values.
+                            # Defensive normalization of hist for logging and fallback detection
                             hist_list: List[float] = []
-                            raw_len = 0
                             try:
                                 if hist is None:
                                     hist_list = []
-                                    raw_len = 0
+                                elif isinstance(hist, (list, tuple)):
+                                    hist_list = [float(x) for x in hist]
                                 else:
+                                    # try to convert numpy arrays or single numeric
                                     try:
-                                        iterable = list(hist)
+                                        hist_list = list(map(float, hist))
                                     except Exception:
-                                        iterable = [hist]
-                                    raw_len = len(iterable)
-                                    for x in iterable:
-                                        if x is None:
-                                            continue
-                                        try:
-                                            v = float(x)
-                                            if math.isnan(v):
-                                                continue
-                                            hist_list.append(v)
-                                        except Exception:
-                                            continue
-                            except Exception as e:
-                                logger.debug("Failed to construct hist_list for %s %s: %s", sym, root, e)
+                                        # treat single numeric as one-element list
+                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
+                            except Exception:
                                 hist_list = []
 
-                            # MACD debug logging (always)
-                            macd_line_str = ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line)
-                            sig_str = ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig)
+                            # Unconditional MACD snapshot logging for diagnostics
                             try:
-                                logger.info("[MACD_DEBUG] %s %s macd=%s signal=%s raw_hist_len=%d clean_hist_len=%d last2=%s",
-                                            sym, root, macd_line_str, sig_str, raw_len, len(hist_list), str(hist_list[-2:]) if hist_list else "[]")
+                                logger.info(
+                                    "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
+                                    sym, root,
+                                    ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
+                                    ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
+                                    len(hist_list),
+                                    str(hist_list[-2:]) if hist_list else "[]"
+                                )
                             except Exception:
-                                logger.debug("[MACD_DEBUG] %s %s failed to format macd debug log", sym, root, exc_info=True)
+                                logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
 
-                            if raw_len != len(hist_list):
-                                logger.info("[MACD_DEBUG] %s %s filtered None/NaN or unconvertible entries from hist: %d -> %d", sym, root, raw_len, len(hist_list))
-                            if not hist_list:
-                                logger.warning("[MACD_DEBUG] %s %s macd histogram empty after filtering; flip detection will not run for this TF", sym, root)
-
-                            # Primary flip detection via helper (best-effort)
+                            # Primary flip detection via helper (best-effort, catch exceptions)
                             flip = False
                             try:
                                 flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
                             except Exception:
+                                # fall back silently to our heuristic
                                 flip = False
 
-                            # Conservative heuristic fallback (if helper didn't detect)
+                            # If primary helper didn't detect a flip, try a conservative heuristic:
+                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
                             if not flip:
                                 try:
                                     if len(hist_list) >= 2:
@@ -940,18 +920,20 @@ class Scanner:
                                         last_h = float(hist_list[-1])
                                         if prev_h < 0 and last_h > 0:
                                             flip = True
+                                        # also detect a decisive jump from <=0 to significantly positive
                                         elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
                                             flip = True
                                 except Exception:
                                     flip = False
 
+                            # Surgical logging for diagnostics
                             if DEBUG_SURGICAL_LOGS:
                                 try:
                                     logger.info(
                                         "[SURGICAL_MACD] %s %s macd=%s signal=%s hist_len=%d last2=%s flip=%s",
                                         sym, root,
-                                        macd_line_str,
-                                        sig_str,
+                                        ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
+                                        ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
                                         len(hist_list),
                                         str(hist_list[-2:]) if hist_list else "[]",
                                         flip
@@ -960,11 +942,10 @@ class Scanner:
                                     logger.debug("Failed surgical macd log for %s %s", sym, root, exc_info=True)
 
                             logger.info(
-                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s hist_len=%d",
+                                "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
                                 sym,
                                 root,
-                                flip,
-                                len(hist_list)
+                                flip
                             )
 
                             if hist_list and flip:
@@ -979,16 +960,16 @@ class Scanner:
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-
+                                
                                 # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
-
+                                
                                 if not is_new_signal:
                                     logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-
+                                
                                 # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
@@ -1011,10 +992,9 @@ class Scanner:
                                     logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 else:
                                     logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
+                                
                     except Exception:
-                        # log with context to make issues visible and actionable and continue to next symbol
-                        logger.exception("Error checking symbol %s (during symbol check). Last known price=%s", sym, self._last_price_cache.get(sym))
-                        return
+                        logger.exception("Error checking symbol %s", sym)
 
                 checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
@@ -1038,7 +1018,6 @@ class Scanner:
 
                 now_ts = time.time()
                 is_full_push = self.telegram.check_full_push(now_ts)
-                logger.info("[DIAGNOSTIC] Telegram full_push check -> %s (now=%s)", is_full_push, now_ts)
 
                 if root_signals and is_full_push:
                     for sig in root_signals:
@@ -1052,9 +1031,7 @@ class Scanner:
                 # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    # Determine open gating: force immediate if FORCE_OPEN_TRADES true, else respect telegram gating
-                    allow_open = bool(FORCE_OPEN_TRADES) or bool(is_full_push)
-                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=allow_open)
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
 
                 # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
@@ -1099,7 +1076,7 @@ class Scanner:
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(1, min(300, to_sleep))
-
+                
                 logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
                            to_sleep, current_minute, current_second, next_5m_minute % 60)
                 await asyncio.sleep(to_sleep)

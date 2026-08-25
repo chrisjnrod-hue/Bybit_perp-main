@@ -72,6 +72,9 @@ MTF_ALIGN_TFS = ["5", "15", "60", "240", "D"]
 # Telegram summary dispatch window (in seconds) — group TF opens within this window
 TELEGRAM_DISPATCH_WINDOW = 5
 
+# Force immediate open trades (bypass Telegram gating). Default ON to match requested behavior.
+FORCE_OPEN_TRADES = os.getenv("FORCE_OPEN_TRADES", "1").strip().lower() in ("1", "true", "yes", "y")
+
 
 class Scanner:
     def __init__(self):
@@ -111,7 +114,7 @@ class Scanner:
         self._last_price_time: Dict[str, float] = {}
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
-        
+
         # Track which ROOT_TF candles have opened in the current cycle (use int to avoid int/float mismatch)
         self._last_tf_candle_open_times: Dict[str, int] = {tf: 0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
@@ -126,10 +129,10 @@ class Scanner:
         logger.info(
             "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
-            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
+            "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s FORCE_OPEN_TRADES=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
             TRADE_RATING_MIN_VAL, TV_RATING_WEIGHT, TRADE_RATING_PRIORITIZE, FLIP_CANDLE_AGE_MAX_SEC, SIGNAL_DEDUP_WINDOW,
-            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER
+            TRADE_NO_NEG_VOL, MARKET_CAP_MIN, PRIORITIZE_SLOT_ORDER, FORCE_OPEN_TRADES
         )
 
     def register_callback(self, cb: Callable[[str, Any], Any]):
@@ -547,6 +550,7 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
+        This function logs MACD inputs for easier debugging.
         """
         data = self.kline_store.get(symbol, {}).get(tf, [])
         closes: List[float] = []
@@ -561,7 +565,10 @@ class Scanner:
 
         current_price = None
         if include_price is not None:
-            current_price = float(include_price)
+            try:
+                current_price = float(include_price)
+            except Exception:
+                current_price = None
         elif use_ws_current and USE_WS and hasattr(self.client, "get_ws_latest_kline"):
             try:
                 ws_last = self.client.get_ws_latest_kline(symbol, tf)
@@ -569,6 +576,12 @@ class Scanner:
                     current_price = float(ws_last.get("close"))
             except Exception:
                 pass
+
+        # MACD input debug (always shown)
+        try:
+            logger.info("[MACD_INPUT] %s %s closes_count=%d include_price=%s", symbol, tf, len(closes), str(current_price))
+        except Exception:
+            logger.debug("MACD_INPUT logging failure for %s %s", symbol, tf, exc_info=True)
 
         return compute_macd_from_closes(closes, include_price=current_price)
 
@@ -748,25 +761,25 @@ class Scanner:
         if SIGNAL_DEDUP_WINDOW <= 0:
             # Deduplication disabled
             return True
-        
+
         if candle_open_time is None:
             logger.debug("Cannot dedupe signal: candle_open_time is None")
             return True
-        
+
         try:
             cache_key = (symbol, tf, int(candle_open_time))
-            
+
             if cache_key in self._signal_cache:
                 last_signal_time = self._signal_cache[cache_key]
                 time_since_last = now - last_signal_time
-                
+
                 if time_since_last < SIGNAL_DEDUP_WINDOW:
                     logger.debug(
                         "DEDUPE BLOCKED: %s %s candle_open=%d (last signal %.0f sec ago, window=%.0f sec)",
                         symbol, tf, candle_open_time, time_since_last, SIGNAL_DEDUP_WINDOW
                     )
                     return False
-            
+
             # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
@@ -806,7 +819,7 @@ class Scanner:
                 for root in ROOT_TFS:
                     current_start = int(self._get_current_candle_start(root, now))
                     last_start = int(self._last_tf_candle_open_times.get(root, 0))
-                    
+
                     if current_start > last_start:
                         logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
                         # store as int to avoid mismatches (fixes repeated seed_all)
@@ -882,7 +895,6 @@ class Scanner:
                                     try:
                                         iterable = list(hist)
                                     except Exception:
-                                        # hist may be a scalar
                                         iterable = [hist]
                                     raw_len = len(iterable)
                                     for x in iterable:
@@ -894,13 +906,12 @@ class Scanner:
                                                 continue
                                             hist_list.append(v)
                                         except Exception:
-                                            # skip items that cannot be converted
                                             continue
                             except Exception as e:
                                 logger.debug("Failed to construct hist_list for %s %s: %s", sym, root, e)
                                 hist_list = []
 
-                            # MACD debug logging: always log macd_line/signal and histogram shape/cleaning
+                            # MACD debug logging (always)
                             macd_line_str = ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line)
                             sig_str = ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig)
                             try:
@@ -968,16 +979,16 @@ class Scanner:
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-                                
+
                                 # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
-                                
+
                                 if not is_new_signal:
                                     logger.info("SIGNAL REJECTED (duplicate): %s %s @ %s", sym, root, price)
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                                
+
                                 # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
@@ -1000,10 +1011,10 @@ class Scanner:
                                     logger.info("SIGNAL DETECTED (OLD CANDLE - TELEGRAM ONLY): %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
                                 else:
                                     logger.info("SIGNAL DETECTED: %s %s @ %s (tv=%s %+.3f candle_age=%.0f sec)", sym, root, price, tv_label, tv_score, now_check - start_at if start_at else -1)
-                        except Exception:
-                            # log with context to make issues visible and actionable and continue to next symbol
-                            logger.exception("Error checking symbol %s (during symbol check). Last known price=%s", sym, self._last_price_cache.get(sym))
-                            return
+                    except Exception:
+                        # log with context to make issues visible and actionable and continue to next symbol
+                        logger.exception("Error checking symbol %s (during symbol check). Last known price=%s", sym, self._last_price_cache.get(sym))
+                        return
 
                 checked_count = 0
                 for i in range(0, len(self.symbols), REQUEST_BATCH_SIZE):
@@ -1029,7 +1040,6 @@ class Scanner:
                 is_full_push = self.telegram.check_full_push(now_ts)
                 logger.info("[DIAGNOSTIC] Telegram full_push check -> %s (now=%s)", is_full_push, now_ts)
 
-                # If root_signals exist, request MTF subscribe where possible (best-effort)
                 if root_signals and is_full_push:
                     for sig in root_signals:
                         try:
@@ -1042,8 +1052,9 @@ class Scanner:
                 # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    # OPEN TRADES IMMEDIATELY: allow_open_trades=True (bypass telegram gating)
-                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=True)
+                    # Determine open gating: force immediate if FORCE_OPEN_TRADES true, else respect telegram gating
+                    allow_open = bool(FORCE_OPEN_TRADES) or bool(is_full_push)
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=allow_open)
 
                 # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
@@ -1088,7 +1099,7 @@ class Scanner:
                     to_sleep = ((next_5m_minute - current_minute) * 60) - current_second
 
                 to_sleep = max(1, min(300, to_sleep))
-                
+
                 logger.info("[DIAGNOSTIC] Aligning to next 5m candle open: sleeping %.1f seconds (current=%02d:%02d, target=:%02d:00)",
                            to_sleep, current_minute, current_second, next_5m_minute % 60)
                 await asyncio.sleep(to_sleep)

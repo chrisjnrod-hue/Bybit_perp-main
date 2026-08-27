@@ -7,11 +7,13 @@ import asyncio
 import os
 import signal
 import time
+import math
+from typing import Optional
 from aiohttp import web
 from .logger import get_logger
 from .scanner import Scanner
 from .ratelimiter import TokenBucket
-from .config import RATE_LIMIT_RPS
+from .config import RATE_LIMIT_RPS, SIGNAL_DEDUP_WINDOW
 
 logger = get_logger("main")
 
@@ -26,42 +28,95 @@ async def health(request):
     return web.Response(text="ok")
 
 
-async def start_background_tasks(app: web.Application):
-    # Create scanner and run it in the background
-    scanner = Scanner()
-    # Replace scanner rate limiter with one configured from env
-    scanner.rate_limiter = TokenBucket(max(1.0, float(RATE_LIMIT_RPS)))
-    scanner.client.rate_limiter = scanner.rate_limiter
-    app["scanner"] = scanner
-    app["scanner_task"] = asyncio.create_task(scanner.run())
-    logger.info("Scanner task started")
-
-    # Log registered routes so we can confirm debug route is present
-    try:
-        routes = [r.resource.canonical for r in app.router.routes()]
-    except Exception:
-        # older aiohttp versions: fallback
-        routes = [str(r) for r in app.router.routes()]
-    logger.info("Registered routes: %s", routes)
-
-
-async def cleanup_background_tasks(app: web.Application):
-    scanner: Scanner = app.get("scanner")
-    task: asyncio.Task = app.get("scanner_task")
-    if scanner:
-        scanner.stop()
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            logger.info("Scanner task cancelled")
-
-
-def _parse_bool(x: str) -> bool:
+def _parse_bool(x: Optional[str]) -> bool:
     if x is None:
         return False
     return str(x).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _dedupe_peek(scanner: Scanner, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
+    """
+    Non-mutating dedupe check: returns True if signal would be considered NEW
+    according to the scanner dedupe policy, without modifying the scanner cache.
+    Mirrors logic in scanner._try_dedupe_signal but does not write to cache.
+    """
+    try:
+        if SIGNAL_DEDUP_WINDOW <= 0:
+            return True
+        if candle_open_time is None:
+            return True
+        key = (symbol, tf, int(candle_open_time))
+        last_signal_time = scanner._signal_cache.get(key)
+        if last_signal_time is None:
+            return True
+        time_since_last = now - last_signal_time
+        return time_since_last >= float(SIGNAL_DEDUP_WINDOW)
+    except Exception:
+        return True
+
+
+async def debug_symbols(request: web.Request):
+    """
+    Returns a summary of discovered symbols and kline counts cached in the scanner.
+    Requires DEBUG_API_KEY to be set (empty-string allows anonymous).
+    """
+    if DEBUG_API_KEY is None:
+        return web.Response(status=404, text="Debug endpoint disabled. Set DEBUG_API_KEY env to enable ('' for anonymous or a secret).")
+
+    api_key = request.query.get("api_key", "")
+    if DEBUG_API_KEY != "" and api_key != DEBUG_API_KEY:
+        return web.Response(status=403, text="Forbidden - invalid debug api_key")
+
+    scanner: Scanner = request.app.get("scanner")
+    if not scanner:
+        return web.Response(status=500, text="Scanner not initialized")
+
+    try:
+        result = {}
+        for sym in scanner.symbols:
+            tf_map = {}
+            store = scanner.kline_store.get(sym, {})
+            for tf, lst in store.items():
+                try:
+                    tf_map[str(tf)] = len(lst or [])
+                except Exception:
+                    tf_map[str(tf)] = 0
+            result[sym] = tf_map
+    except Exception:
+        logger.exception("Failed to build symbol summary for debug_symbols")
+        return web.Response(status=500, text="Internal error")
+
+    return web.json_response({"symbols_count": len(scanner.symbols), "symbols": result})
+
+
+async def debug_seed_symbol(request: web.Request):
+    """
+    Trigger a background seed_klines_for_symbol(symbol) to populate kline cache.
+    Useful when a symbol shows 0 cached candles in the debug view.
+    Access control same as other debug endpoints.
+    """
+    if DEBUG_API_KEY is None:
+        return web.Response(status=404, text="Debug endpoint disabled. Set DEBUG_API_KEY env to enable ('' for anonymous or a secret).")
+
+    api_key = request.query.get("api_key", "")
+    if DEBUG_API_KEY != "" and api_key != DEBUG_API_KEY:
+        return web.Response(status=403, text="Forbidden - invalid debug api_key")
+
+    symbol = request.match_info.get("symbol", "").upper()
+    if not symbol:
+        return web.Response(status=400, text="Missing symbol path parameter")
+
+    scanner: Scanner = request.app.get("scanner")
+    if not scanner:
+        return web.Response(status=500, text="Scanner not initialized")
+
+    # spawn background seeding so the request returns quickly
+    try:
+        asyncio.create_task(scanner.seed_klines_for_symbol(symbol))
+        return web.json_response({"status": "seeding_started", "symbol": symbol})
+    except Exception:
+        logger.exception("Failed to start seeding for symbol %s", symbol)
+        return web.Response(status=500, text="Failed to start seeding task")
 
 
 async def debug_symbol(request: web.Request):
@@ -100,7 +155,7 @@ async def debug_symbol(request: web.Request):
     # compute macd via scanner wrapper (keeps identical behavior)
     try:
         macd_line, signal_line, hist = scanner.compute_macd_for(symbol, tf, include_price=last_price)
-    except Exception as e:
+    except Exception:
         logger.exception("MACD compute failed in debug endpoint for %s %s", symbol, tf)
         macd_line, signal_line, hist = None, None, None
 
@@ -147,8 +202,8 @@ async def debug_symbol(request: web.Request):
         start_at = None
     candle_age_ok = scanner._is_candle_age_acceptable(start_at, now)
 
-    # dedupe check (do not update cache; call will update cache in scanner, but that's acceptable for debug)
-    dedupe_ok = scanner._try_dedupe_signal(symbol, tf, start_at, now)
+    # dedupe check (non-mutating peek so debug calls don't mark signals as seen)
+    dedupe_ok = _dedupe_peek(scanner, symbol, tf, start_at, now)
 
     # tv rating & mtf alignment & vol change
     try:
@@ -195,11 +250,52 @@ async def debug_symbol(request: web.Request):
     return web.json_response(out)
 
 
+async def start_background_tasks(app: web.Application):
+    # Create scanner and run it in the background
+    scanner = Scanner()
+    # Replace scanner rate limiter with one configured from env
+    scanner.rate_limiter = TokenBucket(max(1.0, float(RATE_LIMIT_RPS)))
+    scanner.client.rate_limiter = scanner.rate_limiter
+    app["scanner"] = scanner
+    app["scanner_task"] = asyncio.create_task(scanner.run())
+    logger.info("Scanner task started")
+
+    # Log registered routes so we can confirm debug route is present
+    try:
+        routes_info = []
+        for r in app.router.routes():
+            try:
+                # route may have .method and .path attributes
+                method = getattr(r, "method", None) or getattr(r, "methods", None) or ""
+                path = getattr(r, "path", None) or (getattr(getattr(r, "resource", None), "canonical", None) if getattr(r, "resource", None) else None) or str(r)
+                routes_info.append(f"{method} {path}")
+            except Exception:
+                routes_info.append(str(r))
+    except Exception:
+        routes_info = [str(r) for r in app.router.routes()]
+    logger.info("Registered routes: %s", routes_info)
+
+
+async def cleanup_background_tasks(app: web.Application):
+    scanner: Scanner = app.get("scanner")
+    task: asyncio.Task = app.get("scanner_task")
+    if scanner:
+        scanner.stop()
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("Scanner task cancelled")
+
+
 def make_app():
     app = web.Application()
     app.router.add_get("/", health)
-    # add debug route (registered regardless; behavior controlled by DEBUG_API_KEY)
+    # add debug routes (registered regardless; behavior controlled by DEBUG_API_KEY)
     app.router.add_get("/debug/symbol/{symbol}", debug_symbol)
+    app.router.add_get("/debug/symbols", debug_symbols)
+    app.router.add_get("/debug/seed/{symbol}", debug_seed_symbol)
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
     return app

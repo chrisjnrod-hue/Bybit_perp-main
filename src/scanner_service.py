@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional, Callable, Tuple
 import math
 import inspect
 from decimal import getcontext
+import statistics  # added for dynamic hist threshold calculation
 
 getcontext().prec = 28
 
@@ -910,6 +911,24 @@ class Scanner:
                             except Exception:
                                 hist_list = []
 
+                            # SURGICAL_DEBUG: dynamic threshold, hist sample info
+                            try:
+                                raw_closes = self.kline_store.get(sym, {}).get(root, [])
+                                closes_len = len(raw_closes)
+                                try:
+                                    hist_std = statistics.pstdev(hist_list) if len(hist_list) >= 2 else 0.0
+                                except Exception:
+                                    hist_std = 0.0
+                                hist_threshold = max(1e-9, abs(hist_std) * 0.05)
+                                logger.info(
+                                    "[SURGICAL_DEBUG] %s %s closes=%d include_price=%s hist_len=%d last4=%s hist_std=%.12g hist_threshold=%.12g",
+                                    sym, root, closes_len, bool(price), len(hist_list),
+                                    hist_list[-4:] if len(hist_list) >= 4 else hist_list,
+                                    hist_std, hist_threshold
+                                )
+                            except Exception:
+                                logger.debug("SURGICAL_DEBUG failed for %s %s", sym, root, exc_info=True)
+
                             # Unconditional MACD snapshot logging for diagnostics
                             try:
                                 logger.info(
@@ -923,24 +942,22 @@ class Scanner:
                             except Exception:
                                 logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
 
-                            # Primary flip detection via helper (best-effort, catch exceptions)
+                            # Primary flip detection via helper (best-effort, with dynamic threshold)
                             flip = False
                             try:
-                                flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
+                                flip = bool(self.detect_flip_current_open(hist_list, hist_threshold, symbol=sym, tf=root))
                             except Exception:
-                                # fall back silently to our heuristic
                                 flip = False
 
-                            # If primary helper didn't detect a flip, try a conservative heuristic:
-                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
+                            # If primary helper didn't detect a flip, try a conservative heuristic with same threshold:
                             if not flip:
                                 try:
                                     if len(hist_list) >= 2:
                                         prev_h = float(hist_list[-2])
                                         last_h = float(hist_list[-1])
-                                        if prev_h < 0 and last_h > 0:
+                                        if prev_h < 0 and last_h > 0 and abs(last_h) > hist_threshold:
                                             flip = True
-                                        elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-9:
+                                        elif prev_h > 0 and last_h < 0 and abs(last_h) > hist_threshold:
                                             flip = True
                                 except Exception:
                                     flip = False

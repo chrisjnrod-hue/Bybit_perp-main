@@ -283,7 +283,7 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
     """
     Compute MACD histogram from a list of closes (floats).
     include_price: when provided, overwrites the last close value with current price.
-    Returns: (macd_line, signal_line, hist) â€” each as list-like (macd_histogram implementation dependent)
+    Returns: (macd_line, signal_line, hist) — each as list-like (macd_histogram implementation dependent)
     """
     data: List[float] = []
     for c in closes:
@@ -301,6 +301,14 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
         else:
             data.append(current_price)
 
+    # Warm-up hint: EMAs need history to stabilize — helpful when debugging/live runs
+    try:
+        if len(data) < 30:
+            # lightweight console hint for troubleshooting
+            print(f"[MACD_DEBUG] compute_macd_from_closes: only {len(data)} closes provided; MACD EMAs may be unstable")
+    except Exception:
+        pass
+
     macd_line, signal_line, hist = macd_histogram(data)
     try:
         hist = [None if v is None else float(v) for v in (hist or [])]
@@ -311,18 +319,32 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
 
 def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> bool:
     """
-    Detect zero-cross flip from negative (or <=0) to positive on last candle.
-    hist is a list where last item is most recent.
+    Detect zero-cross flip between previous and current hist values.
+
+    - hist: list-like where last item is the most recent histogram value (after any cleaning)
+    - hist_threshold: absolute minimum magnitude required for the new hist value to count (guards against noise)
+    Returns True if a sign-change flip is detected (either down->up or up->down) and
+    the new histogram value exceeds the given threshold in absolute terms.
     """
-    if not hist or len(hist) < 2:
-        return False
-    prev = hist[-2]
-    cur = hist[-1]
-    if prev is None or cur is None:
-        return False
     try:
-        zero_cross = prev <= 0 and cur > 0
-        return zero_cross
+        if not hist or len(hist) < 2:
+            return False
+        prev = hist[-2]
+        cur = hist[-1]
+        if prev is None or cur is None:
+            return False
+
+        # enforce a minimum absolute magnitude for the current histogram value to avoid noise flips
+        try:
+            thresh = float(hist_threshold) if hist_threshold is not None else 0.0
+        except Exception:
+            thresh = 0.0
+
+        if abs(cur) <= thresh:
+            return False
+
+        # detect sign change (either negative->positive or positive->negative)
+        return (prev <= 0 and cur > 0) or (prev >= 0 and cur < 0)
     except Exception:
         return False
 

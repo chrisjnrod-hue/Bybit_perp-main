@@ -112,8 +112,8 @@ class Scanner:
         self._mtf_monitoring: Dict[str, Dict[str, Any]] = {}
         self._symbol_check_count = 0
         
-        # Track which ROOT_TF candles have opened in the current cycle
-        self._last_tf_candle_open_times: Dict[str, float] = {tf: 0.0 for tf in ROOT_TFS}
+        # Track which ROOT_TF candles have opened in the current cycle (use ints)
+        self._last_tf_candle_open_times: Dict[str, int] = {tf: 0 for tf in ROOT_TFS}
         self._last_telegram_dispatch_time: Optional[float] = None
 
         # Signal deduplication cache: (symbol, tf, candle_open_time) -> signal_timestamp
@@ -377,6 +377,12 @@ class Scanner:
                         if close is None:
                             continue
                         if isinstance(close, (int, float)) and math.isfinite(float(close)):
+                            # normalize start to int when possible
+                            try:
+                                if start is not None:
+                                    start = int(start)
+                            except Exception:
+                                start = None
                             valid.append({
                                 "start_at": start,
                                 "open": c.get("open"),
@@ -461,8 +467,15 @@ class Scanner:
 
                                     for c in reversed(normalized):
                                         if c.get("close") is not None:
+                                            # normalize start_at
+                                            start_at = c.get("start_at")
+                                            try:
+                                                if start_at is not None:
+                                                    start_at = int(start_at)
+                                            except Exception:
+                                                start_at = start_at
                                             last_new = {
-                                                "start_at": c.get("start_at"),
+                                                "start_at": start_at,
                                                 "open": c.get("open"),
                                                 "high": c.get("high"),
                                                 "low": c.get("low"),
@@ -819,11 +832,12 @@ class Scanner:
                 refreshed_tfs = []
                 for root in ROOT_TFS:
                     current_start = self._get_current_candle_start(root, now)
-                    last_start = self._last_tf_candle_open_times.get(root, 0.0)
+                    last_start = int(self._last_tf_candle_open_times.get(root, 0))
                     
                     if current_start > last_start:
-                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, current_start, last_start)
-                        self._last_tf_candle_open_times[root] = float(current_start)
+                        logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, int(current_start), last_start)
+                        # normalize to int
+                        self._last_tf_candle_open_times[root] = int(current_start)
                         refreshed_tfs.append(root)
 
                 if refreshed_tfs:
@@ -873,20 +887,26 @@ class Scanner:
                                 use_ws_current=True
                             )
 
-                            # Defensive normalization of hist for logging and fallback detection
+                            # Defensive normalization of hist for logging and flip detection
                             hist_list: List[float] = []
                             try:
                                 if hist is None:
                                     hist_list = []
-                                elif isinstance(hist, (list, tuple)):
-                                    hist_list = [float(x) for x in hist]
                                 else:
-                                    # try to convert numpy arrays or single numeric
                                     try:
-                                        hist_list = list(map(float, hist))
+                                        iterable = list(hist)
                                     except Exception:
-                                        # treat single numeric as one-element list
-                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
+                                        iterable = [hist]
+                                    for x in iterable:
+                                        if x is None:
+                                            continue
+                                        try:
+                                            v = float(x)
+                                            if math.isnan(v):
+                                                continue
+                                            hist_list.append(v)
+                                        except Exception:
+                                            continue
                             except Exception:
                                 hist_list = []
 
@@ -920,8 +940,7 @@ class Scanner:
                                         last_h = float(hist_list[-1])
                                         if prev_h < 0 and last_h > 0:
                                             flip = True
-                                        # also detect a decisive jump from <=0 to significantly positive
-                                        elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
+                                        elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-9:
                                             flip = True
                                 except Exception:
                                     flip = False
@@ -955,6 +974,11 @@ class Scanner:
                                     last_candles = self.kline_store.get(sym, {}).get(root, [])
                                     if last_candles:
                                         start_at = last_candles[-1].get("start_at")
+                                        try:
+                                            if start_at is not None:
+                                                start_at = int(start_at)
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     start_at = None
 
@@ -1031,7 +1055,8 @@ class Scanner:
                 # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=is_full_push)
+                    # Open trades immediately (do not wait for telegram full_push)
+                    evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=True)
 
                 # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:

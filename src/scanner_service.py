@@ -46,6 +46,27 @@ from .scanner_telegram import TelegramSummary
 
 logger = get_logger("scanner")
 
+
+def _normalize_tf_for_api(tf: str) -> str:
+    """
+    Normalize common timeframe aliases to the canonical keys used by the scanner
+    and the exchange client. Examples:
+      "1h" -> "60", "4h" -> "240", "1d" -> "D"
+    If tf is already canonical (e.g., "60","240","D"), it is returned as-is.
+    """
+    if tf is None:
+        return tf
+    s = str(tf).strip()
+    alias_map = {
+        "1h": "60", "1H": "60", "60": "60",
+        "4h": "240", "4H": "240", "240": "240",
+        "1d": "D", "1D": "D", "d": "D", "D": "D",
+        "1w": "W", "1W": "W", "w": "W", "W": "W",
+        "5": "5", "15": "15"
+    }
+    return alias_map.get(s, s)
+
+
 SEED_KLINES_LIMIT = int(os.getenv("SEED_KLINES_LIMIT", str(KLINE_SEED_LIMIT)))
 DEBUG_SURGICAL_LOGS = os.getenv("DEBUG_SURGICAL_LOGS", "").strip().lower() in ("1", "true", "yes", "y")
 DIAGNOSTIC_MODE = os.getenv("DIAGNOSTIC_MODE", "").strip().lower() in ("1", "true", "yes", "y")
@@ -325,10 +346,11 @@ class Scanner:
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
         for tf in tfs:
             try:
-                logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
+                api_tf = _normalize_tf_for_api(tf)
+                logger.debug("seed_klines_for_symbol: requesting %s %s (api_tf=%s) with limit=%d", symbol, tf, api_tf, SEED_KLINES_LIMIT)
 
                 async with self.request_sem:
-                    raw = await self._call_get_klines(symbol, tf, limit=SEED_KLINES_LIMIT)
+                    raw = await self._call_get_klines(symbol, api_tf, limit=SEED_KLINES_LIMIT)
 
                 if not raw:
                     logger.debug("No klines returned for %s %s (raw empty)", symbol, tf)
@@ -415,7 +437,8 @@ class Scanner:
                     klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
                 except Exception:
                     klines_sorted = valid
-                self.kline_store[symbol][tf] = klines_sorted
+                # Store under the canonical/api TF key so later lookups use the same key
+                self.kline_store.setdefault(symbol, {})[api_tf] = klines_sorted
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -562,7 +585,8 @@ class Scanner:
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
         """
-        data = self.kline_store.get(symbol, {}).get(tf, [])
+        api_tf = _normalize_tf_for_api(tf)
+        data = self.kline_store.get(symbol, {}).get(api_tf, [])
         closes: List[float] = []
         for c in data:
             try:
@@ -648,12 +672,14 @@ class Scanner:
         return compute_24h_volume_change_from(self._24h_volumes.get(symbol))
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
-        klines = self.kline_store.get(symbol, {}).get(tf, [])
+        api_tf = _normalize_tf_for_api(tf)
+        klines = self.kline_store.get(symbol, {}).get(api_tf, [])
         return compute_tv_rating_from(klines, TECHNICAL_RATING, tf=tf, price=price)
 
     def _compute_mtf_alignment(self, symbol: str, price: float):
         def _get_closes(tf: str) -> List[float]:
-            items = self.kline_store.get(symbol, {}).get(tf, [])
+            api_tf = _normalize_tf_for_api(tf)
+            items = self.kline_store.get(symbol, {}).get(api_tf, [])
             closes = []
             for c in items:
                 try:

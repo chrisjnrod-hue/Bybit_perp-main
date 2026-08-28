@@ -189,7 +189,7 @@ class Scanner:
 
     async def _get_symbols(self) -> List[str]:
         try:
-            items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols"])
+            items = await self._call_client_method(["get_symbols", "getSymbols", "get_symbols", "symbols", "fetch_markets", "load_markets"])
         except Exception:
             logger.exception("Error fetching symbols from client")
             items = None
@@ -336,7 +336,10 @@ class Scanner:
             return []
 
     async def _call_get_klines(self, symbol: str, tf: str, limit: int):
-        names = ["get_klines", "getKlines", "get_klines_v2", "get_kline", "getKline"]
+        names = [
+            "get_klines", "getKlines", "get_klines_v2", "get_kline", 
+            "getKline", "fetch_ohlcv", "fetchOHLCV", "klines"
+        ]
         return await self._call_client_method(names, symbol, tf, limit)
 
     async def seed_klines_for_symbol(self, symbol: str):
@@ -616,7 +619,10 @@ class Scanner:
     async def _update_24h_volume(self, symbol: str) -> Optional[float]:
         """Update and track 24h volume data - tries multiple client method names and keys for robustness."""
         try:
-            names = ["get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", "ticker_24h", "get_ticker"]
+            names = [
+                "get_24h_ticker", "get24h", "get_24h", "get_ticker_24h", 
+                "ticker_24h", "get_ticker", "fetch_ticker", "getTicker", "get24hrTicker"
+            ]
             data = await self._call_client_method(names, symbol)
             if not data:
                 logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
@@ -746,8 +752,10 @@ class Scanner:
                 if price is None:
                     try:
                         async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
-                        if price:
+                            price = await self._call_client_method(
+                                ["get_latest_price", "getLatestPrice", "get_ticker", "fetch_ticker", "ticker"], sym
+                            )
+                        if price is not None:
                             self._last_price_cache[sym] = price
                     except Exception:
                         pass
@@ -832,7 +840,6 @@ class Scanner:
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
-        first_run = True  # Flag to execute immediate scan pass upon initial deploy/startup
 
         while not self._stop:
             loop_count += 1
@@ -847,7 +854,7 @@ class Scanner:
                     if self.symbols:
                         logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete - executing immediate deployment scan pass")
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
                     else:
                         logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
                         await asyncio.sleep(10)
@@ -868,18 +875,14 @@ class Scanner:
                         self._last_tf_candle_open_times[root] = int(current_start)
                         refreshed_tfs.append(root)
 
-                if refreshed_tfs or first_run:
-                    if first_run:
-                        logger.info("[DEPLOY_SCAN] Executing initial deployment scan pass immediately following seeding.")
-                        first_run = False
-                    else:
-                        logger.info(
-                            "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
-                            "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
-                            refreshed_tfs
-                        )
-                        await self.seed_all()
-                        logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                if refreshed_tfs:
+                    logger.info(
+                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                        refreshed_tfs
+                    )
+                    await self.seed_all()
+                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
                 # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
@@ -888,9 +891,22 @@ class Scanner:
                 async def check_symbol(sym: str):
                     try:
                         async with self.request_sem:
-                            price = await self.client.get_latest_price(sym)
+                            price = await self._call_client_method(
+                                ["get_latest_price", "getLatestPrice", "get_ticker", "fetch_ticker", "ticker"], sym
+                            )
 
                         if price is None:
+                            # Fallback 1: get close price from kline_store if available
+                            try:
+                                root_tfs_list = ROOT_TFS if ROOT_TFS else ["60"]
+                                store_data = self.kline_store.get(sym, {}).get(_normalize_tf_for_api(root_tfs_list[0]), [])
+                                if store_data and isinstance(store_data[-1], dict):
+                                    price = store_data[-1].get("close")
+                            except Exception:
+                                pass
+
+                        if price is None:
+                            # Fallback 2: check websocket cache if connected
                             try:
                                 if ROOT_TFS and USE_WS and self.client.is_ws_connected():
                                     ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
@@ -900,6 +916,7 @@ class Scanner:
                                 price = None
 
                         if price is None:
+                            logger.debug("[PRICE_MISSING] Could not retrieve price for %s via REST, WS, or store fallback", sym)
                             return
 
                         self._last_price_cache[sym] = price
@@ -1284,14 +1301,6 @@ class Scanner:
 
         candidates = to_open
 
-        # ---- RECOMMENDED TRADES BLOCK ----
-        # Identify and categorize high-scoring or prioritized candidates as recommended
-        recommended_candidates = [c for c in candidates if c.get("tv_score", 0.0) >= 0.7 or c.get("score", 0.0) >= 3.0]
-        if recommended_candidates:
-            logger.info("[RECOMMENDED_TRADES] Identified %d recommended high-conviction candidates", len(recommended_candidates))
-            for rc in recommended_candidates:
-                rc["recommended"] = True
-
         # ---- PRIORITIZE BY TV RATING ----
         if TRADE_RATING_PRIORITIZE and candidates:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
@@ -1382,12 +1391,6 @@ class Scanner:
             except Exception:
                 balance = None
 
-            # ---- SIMULATED TRADES BLOCK ----
-            # Explicitly route and handle simulated trade execution and tracking when in simulation mode
-            is_simulated_mode = getattr(self.trade_manager, "simulated", False)
-            if is_simulated_mode:
-                logger.info("[SIMULATED_EXECUTION] Processing simulated trade order for %s @ %s", sym, price)
-
             # Let TradeManager perform checks and execution (or simulation). It returns structured result.
             try:
                 tm_result = await self.trade_manager.open_trade(sym, "BUY", price, balance)
@@ -1404,8 +1407,7 @@ class Scanner:
                     if "order" in tm_result:
                         eval["order"] = tm_result.get("order")
                     eval["trade_record"] = tm_result.get("trade_record")
-                if tm_result.get("simulated") or is_simulated_mode:
-                    logger.info("[SIMULATED_SUCCESS] Simulated trade recorded for %s", sym)
+                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
             else:
                 # failed to open
                 err = tm_result.get("error", "open_failed")
@@ -1447,3 +1449,4 @@ class Scanner:
                 self._rest_poller_task.cancel()
             except Exception:
                 pass
+```[cite: 1]

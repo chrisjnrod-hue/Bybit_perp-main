@@ -832,6 +832,7 @@ class Scanner:
     async def root_scan_loop(self):
         logger.info("[DIAGNOSTIC] root_scan_loop: STARTING - interval=%s", ROOT_SCAN_INTERVAL)
         loop_count = 0
+        first_run = True  # Flag to execute immediate scan pass upon initial deploy/startup
 
         while not self._stop:
             loop_count += 1
@@ -846,7 +847,7 @@ class Scanner:
                     if self.symbols:
                         logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol seed (count=%d)", len(self.symbols))
                         await self.seed_all()
-                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete")
+                        logger.info("[DIAGNOSTIC] root_scan_loop: Symbol seeding complete - executing immediate deployment scan pass")
                     else:
                         logger.warning("[DIAGNOSTIC] root_scan_loop: Symbol discovery returned empty!")
                         await asyncio.sleep(10)
@@ -867,14 +868,18 @@ class Scanner:
                         self._last_tf_candle_open_times[root] = int(current_start)
                         refreshed_tfs.append(root)
 
-                if refreshed_tfs:
-                    logger.info(
-                        "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
-                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
-                        refreshed_tfs
-                    )
-                    await self.seed_all()
-                    logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
+                if refreshed_tfs or first_run:
+                    if first_run:
+                        logger.info("[DEPLOY_SCAN] Executing initial deployment scan pass immediately following seeding.")
+                        first_run = False
+                    else:
+                        logger.info(
+                            "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
+                            "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                            refreshed_tfs
+                        )
+                        await self.seed_all()
+                        logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
                 # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
@@ -1279,6 +1284,14 @@ class Scanner:
 
         candidates = to_open
 
+        # ---- RECOMMENDED TRADES BLOCK ----
+        # Identify and categorize high-scoring or prioritized candidates as recommended
+        recommended_candidates = [c for c in candidates if c.get("tv_score", 0.0) >= 0.7 or c.get("score", 0.0) >= 3.0]
+        if recommended_candidates:
+            logger.info("[RECOMMENDED_TRADES] Identified %d recommended high-conviction candidates", len(recommended_candidates))
+            for rc in recommended_candidates:
+                rc["recommended"] = True
+
         # ---- PRIORITIZE BY TV RATING ----
         if TRADE_RATING_PRIORITIZE and candidates:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
@@ -1369,6 +1382,12 @@ class Scanner:
             except Exception:
                 balance = None
 
+            # ---- SIMULATED TRADES BLOCK ----
+            # Explicitly route and handle simulated trade execution and tracking when in simulation mode
+            is_simulated_mode = getattr(self.trade_manager, "simulated", False)
+            if is_simulated_mode:
+                logger.info("[SIMULATED_EXECUTION] Processing simulated trade order for %s @ %s", sym, price)
+
             # Let TradeManager perform checks and execution (or simulation). It returns structured result.
             try:
                 tm_result = await self.trade_manager.open_trade(sym, "BUY", price, balance)
@@ -1385,7 +1404,8 @@ class Scanner:
                     if "order" in tm_result:
                         eval["order"] = tm_result.get("order")
                     eval["trade_record"] = tm_result.get("trade_record")
-                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
+                if tm_result.get("simulated") or is_simulated_mode:
+                    logger.info("[SIMULATED_SUCCESS] Simulated trade recorded for %s", sym)
             else:
                 # failed to open
                 err = tm_result.get("error", "open_failed")

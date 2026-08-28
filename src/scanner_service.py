@@ -862,36 +862,30 @@ class Scanner:
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
 
                 async def check_symbol(sym: str):
-                    try:
-                        async with self.request_sem:
-                            price = await self._call_client_method(
-                                ["get_latest_price", "getLatestPrice", "get_ticker", "fetch_ticker", "ticker"], sym
-                            )
+    try:
+        async with self.request_sem:
+            price = await self.client.get_latest_price(sym)
 
-                        if price is None:
-                            try:
-                                root_tfs_list = ROOT_TFS if ROOT_TFS else ["60"]
-                                store_data = self.kline_store.get(sym, {}).get(_normalize_tf_for_api(root_tfs_list[0]), [])
-                                if store_data and isinstance(store_data[-1], dict):
-                                    price = store_data[-1].get("close")
-                            except Exception:
-                                pass
+        # CRITICAL FALLBACK: If REST price fails, extract from last kline
+        if price is None:
+            logger.info("[PRICE_FALLBACK] %s: REST failed, extracting from cached klines", sym)
+            try:
+                for tf in ROOT_TFS:
+                    last_candles = self.kline_store.get(sym, {}).get(tf, [])
+                    if last_candles and last_candles[-1].get("close"):
+                        price = float(last_candles[-1]["close"])
+                        logger.info("[PRICE_FALLBACK_SUCCESS] %s: extracted from %s candle: %.8f", sym, tf, price)
+                        break
+            except Exception as e:
+                logger.debug("[PRICE_FALLBACK_ERROR] %s: %s", sym, e)
+                price = None
 
-                        if price is None:
-                            try:
-                                if ROOT_TFS and USE_WS and self.client.is_ws_connected():
-                                    ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
-                                    if ws_last and ws_last.get("close") is not None:
-                                        price = float(ws_last.get("close"))
-                            except Exception:
-                                price = None
+        if price is None:
+            logger.warning("[SYMBOL_CHECK] %s: SKIPPED – no price available", sym)
+            return
 
-                        if price is None:
-                            logger.debug("[PRICE_MISSING] Could not retrieve price for %s via REST, WS, or store fallback", sym)
-                            return
-
-                        self._last_price_cache[sym] = price
-
+        self._last_price_cache[sym] = price
+        # ... rest of function
                         await self._update_24h_volume(sym)
 
                         now_check = time.time()

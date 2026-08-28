@@ -403,7 +403,6 @@ class Scanner:
                         if close is None:
                             continue
                         if isinstance(close, (int, float)) and math.isfinite(float(close)):
-                            # normalize start to int when possible
                             try:
                                 if start is not None:
                                     start = int(start)
@@ -440,7 +439,6 @@ class Scanner:
                     klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
                 except Exception:
                     klines_sorted = valid
-                # Store under the canonical/api TF key so later lookups use the same key
                 self.kline_store.setdefault(symbol, {})[api_tf] = klines_sorted
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
@@ -494,7 +492,6 @@ class Scanner:
 
                                     for c in reversed(normalized):
                                         if c.get("close") is not None:
-                                            # normalize start_at
                                             start_at = c.get("start_at")
                                             try:
                                                 if start_at is not None:
@@ -564,7 +561,6 @@ class Scanner:
         logger.info("[REST_POLLER_START] WS unavailable, starting REST poller as fallback")
         self._rest_poller_task = asyncio.create_task(self._rest_poller())
 
-    # Wrappers that use core helpers
     def _tf_to_seconds(self, tf: str) -> int:
         return tf_to_seconds(tf)
 
@@ -584,10 +580,6 @@ class Scanner:
             return int(now // tf_sec) * tf_sec
 
     def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
-        """
-        Build closes list from kline_store and call core.compute_macd_from_closes.
-        The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        """
         api_tf = _normalize_tf_for_api(tf)
         data = self.kline_store.get(symbol, {}).get(api_tf, [])
         closes: List[float] = []
@@ -628,7 +620,6 @@ class Scanner:
                 logger.debug("[VOLUME_UPDATE] No ticker data returned for %s", symbol)
                 return None
 
-            # Normalize nested shapes
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], (dict, list)):
                     if isinstance(data["data"], dict):
@@ -699,10 +690,6 @@ class Scanner:
         return compute_mtf_alignment(_get_closes, price, MTF_ALIGN_TFS, mtf_slope_lookback=MTF_SLOPE_LOOKBACK)
 
     def _detect_tf_candle_opens(self, now: float) -> List[str]:
-        """
-        Detect which ROOT_TFS have just opened a new candle.
-        Returns list of ROOT_TFS that are within the first TELEGRAM_DISPATCH_WINDOW seconds.
-        """
         opens = []
         now_struct = time.gmtime(now)
         current_hour = now_struct.tm_hour
@@ -732,7 +719,6 @@ class Scanner:
         return opens
 
     async def _check_monitored_symbols(self) -> List[Dict[str, Any]]:
-        """Scenario B monitor: re-evaluate symbols waiting for their last negative TF to flip."""
         newly_aligned: List[Dict[str, Any]] = []
         if not self._mtf_monitoring:
             return newly_aligned
@@ -796,19 +782,10 @@ class Scanner:
         return newly_aligned
 
     def _is_candle_age_acceptable(self, start_at: Optional[int], now: float) -> bool:
-        """
-        Check if a candle is fresh enough for trading using core function and FLIP_CANDLE_AGE_MAX_SEC config.
-        """
         return is_candle_age_acceptable(start_at, now, FLIP_CANDLE_AGE_MAX_SEC)
 
     def _try_dedupe_signal(self, symbol: str, tf: str, candle_open_time: Optional[int], now: float) -> bool:
-        """
-        Check if this (symbol, tf, candle_open_time) has already generated a signal recently.
-        Returns True if signal is NEW (not in cache or cache expired); False if DUPLICATE.
-        Caches the signal timestamp to prevent re-triggers across scan cycles.
-        """
         if SIGNAL_DEDUP_WINDOW <= 0:
-            # Deduplication disabled
             return True
         
         if candle_open_time is None:
@@ -829,7 +806,6 @@ class Scanner:
                     )
                     return False
             
-            # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
             return True
@@ -862,7 +838,6 @@ class Scanner:
 
                 await self._ensure_rest_poller()
 
-                # ---- ROOT TF CANDLE OPEN DETECTION & SEEDING/REFRESH ----
                 now = time.time()
                 refreshed_tfs = []
                 for root in ROOT_TFS:
@@ -871,7 +846,6 @@ class Scanner:
                     
                     if current_start > last_start:
                         logger.info("[CANDLE_OPEN] New candle opened for root TF %s at timestamp %d (previous was %d)", root, int(current_start), last_start)
-                        # normalize to int
                         self._last_tf_candle_open_times[root] = int(current_start)
                         refreshed_tfs.append(root)
 
@@ -883,7 +857,6 @@ class Scanner:
                     )
                     await self.seed_all()
                     logger.info("[CANDLE_OPEN_REFRESH] Kline seeding & caching refresh complete.")
-                # -------------------------------------------------------------
 
                 root_signals: List[Dict[str, Any]] = []
                 logger.info("[DIAGNOSTIC] root_scan_loop: Starting symbol checks (total=%d)", len(self.symbols))
@@ -896,7 +869,6 @@ class Scanner:
                             )
 
                         if price is None:
-                            # Fallback 1: get close price from kline_store if available
                             try:
                                 root_tfs_list = ROOT_TFS if ROOT_TFS else ["60"]
                                 store_data = self.kline_store.get(sym, {}).get(_normalize_tf_for_api(root_tfs_list[0]), [])
@@ -906,7 +878,6 @@ class Scanner:
                                 pass
 
                         if price is None:
-                            # Fallback 2: check websocket cache if connected
                             try:
                                 if ROOT_TFS and USE_WS and self.client.is_ws_connected():
                                     ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
@@ -921,7 +892,6 @@ class Scanner:
 
                         self._last_price_cache[sym] = price
 
-                        # Ensure 24h volume is fully updated prior to signal generation
                         await self._update_24h_volume(sym)
 
                         now_check = time.time()
@@ -936,7 +906,6 @@ class Scanner:
                                 use_ws_current=True
                             )
 
-                            # Defensive normalization of hist for logging and flip detection
                             hist_list: List[float] = []
                             try:
                                 if hist is None:
@@ -959,7 +928,6 @@ class Scanner:
                             except Exception:
                                 hist_list = []
 
-                            # SURGICAL_DEBUG: dynamic threshold, hist sample info
                             try:
                                 raw_closes = self.kline_store.get(sym, {}).get(root, [])
                                 closes_len = len(raw_closes)
@@ -977,7 +945,6 @@ class Scanner:
                             except Exception:
                                 logger.debug("SURGICAL_DEBUG failed for %s %s", sym, root, exc_info=True)
 
-                            # Unconditional MACD snapshot logging for diagnostics
                             try:
                                 logger.info(
                                     "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
@@ -990,14 +957,12 @@ class Scanner:
                             except Exception:
                                 logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
 
-                            # Primary flip detection via helper (best-effort, with dynamic threshold)
                             flip = False
                             try:
                                 flip = bool(self.detect_flip_current_open(hist_list, hist_threshold, symbol=sym, tf=root))
                             except Exception:
                                 flip = False
 
-                            # If primary helper didn't detect a flip, try a conservative heuristic with same threshold:
                             if not flip:
                                 try:
                                     if len(hist_list) >= 2:
@@ -1010,7 +975,6 @@ class Scanner:
                                 except Exception:
                                     flip = False
 
-                            # Surgical logging for diagnostics
                             if DEBUG_SURGICAL_LOGS:
                                 try:
                                     logger.info(
@@ -1047,10 +1011,7 @@ class Scanner:
                                 except Exception:
                                     start_at = None
 
-                                # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
-                                
-                                # Check if this signal was already generated in recent past (deduplication)
                                 is_new_signal = self._try_dedupe_signal(sym, root, start_at, now_check)
                                 
                                 if not is_new_signal:
@@ -1058,8 +1019,6 @@ class Scanner:
                                     continue
 
                                 tv_score, tv_label = self.compute_tv_rating(sym, root, price)
-                                
-                                # Pre-compute MTF alignment so immediate blocks never show N/A status
                                 mtf_align = self._compute_mtf_alignment(sym, price)
 
                                 sig_item = {
@@ -1098,11 +1057,9 @@ class Scanner:
 
                 logger.info("[DIAGNOSTIC] root_scan_loop: Checked %d symbols, found %d signals", checked_count, len(root_signals))
 
-                # Capture newly aligned monitored signals and evaluate them immediately
                 newly_aligned = await self._check_monitored_symbols()
                 evaluated_aligned = []
                 if newly_aligned:
-                    # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
                 now_ts = time.time()
@@ -1117,18 +1074,14 @@ class Scanner:
                         except Exception:
                             logger.exception("Failed to request MTF subscribe for %s", sig.get("symbol"))
 
-                # Evaluate new candidates for trade manager execution
                 evaluated_signals = []
                 if root_signals:
-                    # Open trades immediately (do not wait for telegram full_push)
                     evaluated_signals = await self.handle_root_signals(root_signals, allow_open_trades=True)
 
-                # Combine both new signals and resolved monitoring signals for the Telegram summary
                 if newly_aligned:
                     root_signals.extend(newly_aligned)
                     evaluated_signals.extend(evaluated_aligned)
 
-                # Dispatch Telegram summary messages
                 if hasattr(self.telegram, "send_summary"):
                     try:
                         await self.telegram.send_summary(
@@ -1222,7 +1175,6 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # ---- CANDLE AGE FILTER: Reject/block trade open if candle too old, but allow Telegram push ----
                 if not candle_age_ok:
                     entry["accept"] = False
                     entry["reason"] = "candle_too_old"
@@ -1230,7 +1182,6 @@ class Scanner:
                     evaluated.append(entry)
                     continue
 
-                # ---- TV RATING FILTER: Reject if below TRADE_RATING_MIN ----
                 if TRADE_RATING_MIN_VAL > 0.0 and tv_score < TRADE_RATING_MIN_VAL:
                     entry["accept"] = False
                     entry["reason"] = f"tv_rating_below_threshold_{tv_score:.4f}"
@@ -1301,7 +1252,6 @@ class Scanner:
 
         candidates = to_open
 
-        # ---- PRIORITIZE BY TV RATING ----
         if TRADE_RATING_PRIORITIZE and candidates:
             candidates = sorted(candidates, key=lambda c: c.get("tv_score", 0.0), reverse=True)
             logger.info("Sorted %d candidates by TV rating (highest first)", len(candidates))
@@ -1385,13 +1335,11 @@ class Scanner:
                     eval["reason"] = "negvol_blocked"
                 continue
 
-            # Get account balance for TradeManager to compute allocation
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
 
-            # Let TradeManager perform checks and execution (or simulation). It returns structured result.
             try:
                 tm_result = await self.trade_manager.open_trade(sym, "BUY", price, balance)
             except Exception as e:
@@ -1400,16 +1348,13 @@ class Scanner:
 
             eval = eval_map.get((sym, c["root"]))
             if tm_result.get("success"):
-                # Opened successfully (or simulated)
                 if eval is not None:
                     eval["accept"] = True
                     eval["reason"] = "opened" if not tm_result.get("simulated") else "simulated"
                     if "order" in tm_result:
                         eval["order"] = tm_result.get("order")
                     eval["trade_record"] = tm_result.get("trade_record")
-                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
             else:
-                # failed to open
                 err = tm_result.get("error", "open_failed")
                 c["accept"] = False
                 c["reason"] = err
@@ -1449,4 +1394,3 @@ class Scanner:
                 self._rest_poller_task.cancel()
             except Exception:
                 pass
-```[cite: 1]

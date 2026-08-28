@@ -46,7 +46,6 @@ except Exception:
         _PANDAS_TA_STYLE = False
 
 # Import MACD helper and slope function from package (keeps same external dependency)
-# If you have a macd.py with macd_histogram and slope, keep it; otherwise fallback implementations below will handle MACD.
 try:
     from .macd import macd_histogram, slope  # type: ignore
 except Exception:
@@ -88,7 +87,6 @@ def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: i
             return True
         if start_at is None:
             return True
-        # detect milliseconds
         start_sec = float(start_at) / 1000.0 if int(start_at) > 10000000000 else float(start_at)
         age = now - start_sec
         return age <= float(max_age_sec)
@@ -365,7 +363,6 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
         except Exception:
             pass
 
-    # try macd_histogram helper if present
     if macd_histogram is not None:
         try:
             macd_line_raw, signal_line_raw, hist_raw = macd_histogram(data)
@@ -376,7 +373,7 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
                 if hasattr(macd_line_raw, "__len__") and len(macd_line_raw):
                     macd_last = float(macd_line_raw[-1])
             except Exception:
-                macd_last = _safe_last(macd_line_raw) if ' _safe_last' in globals() else None
+                macd_last = None
             try:
                 if hasattr(signal_line_raw, "__len__") and len(signal_line_raw):
                     signal_last = float(signal_line_raw[-1])
@@ -386,34 +383,10 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
         except Exception:
             pass
 
-    # fallback pure-python MACD
     macd_series, signal_series, hist_series = _fallback_macd(data, fast=fast, slow=slow, signal=signal)
     macd_last = float(macd_series[-1]) if macd_series else None
     signal_last = float(signal_series[-1]) if signal_series else None
     return macd_last, signal_last, hist_series
-
-
-def _safe_last(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        if hasattr(v, "iloc"):
-            if len(v) == 0:
-                return None
-            val = v.iloc[-1]
-            return float(val) if _is_finite_number(val) else None
-        if hasattr(v, "tolist"):
-            lst = v.tolist()
-            if not lst:
-                return None
-            return float(lst[-1]) if _is_finite_number(lst[-1]) else None
-        if isinstance(v, (list, tuple)):
-            if not v:
-                return None
-            return float(v[-1]) if _is_finite_number(v[-1]) else None
-        return float(v) if _is_finite_number(v) else None
-    except Exception:
-        return None
 
 
 # --------------------
@@ -443,32 +416,25 @@ def detect_flip_current_open(hist: List[float], hist_threshold: Optional[float] 
 
 
 # --------------------
-# Volume helper (unchanged)
+# Volume helper
 # --------------------
 def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
     try:
         if not vol_data:
-            print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
             return None
         prev_vol = vol_data.get("previous", 0)
         curr_vol = vol_data.get("current", 0)
         if prev_vol <= 0:
-            print(f"[VOL_DEBUG] compute_24h_volume_change: prev_vol <= 0 (prev={prev_vol}, curr={curr_vol})")
             return None
         change = (curr_vol - prev_vol) / prev_vol
         result = min(change, 1.0)
-        try:
-            print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
-        except Exception:
-            print(f"[VOL_DEBUG] prev={prev_vol}, curr={curr_vol}, change={change}")
         return result
-    except Exception as e:
-        print(f"[VOL_DEBUG] compute_24h_volume_change error: {e}")
+    except Exception:
         return None
 
 
 # --------------------
-# Indicator wrappers (unchanged)
+# Indicator wrappers
 # --------------------
 def _safe_sma(df_close, length: int):
     try:
@@ -581,18 +547,10 @@ def _safe_bbands(df_close, length: int, std: float):
 # TV rating & MTF alignment
 # --------------------
 def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
-    # Keep original logic but robustly handle missing pandas/pandas_ta
-    try:
-        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE} pandas_ta_style={_PANDAS_TA_STYLE}")
-    except Exception:
-        pass
-
     if not cfg.get("enabled", True):
-        print("[TV_DEBUG] TECHNICAL_RATING disabled in config -> Neutral")
         return 0.0, "Neutral"
 
     if not _PANDAS_TA_AVAILABLE or pd is None or np is None:
-        print("[TV_DEBUG] pandas/pandas_ta/ta not available -> returning Neutral")
         return 0.0, "Neutral"
 
     try:
@@ -600,7 +558,6 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         min_candles = max(26, ma_max + 5)
 
         if not klines or len(klines) < min_candles:
-            print(f"[TV_DEBUG] insufficient candles for tf={tf}: have={len(klines) if klines else 0} need={min_candles}")
             return 0.0, "Neutral"
 
         df = pd.DataFrame(klines)
@@ -615,8 +572,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             df["low"] = pd.to_numeric(df["low"], errors="coerce")
             df["close"] = pd.to_numeric(df["close"], errors="coerce")
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-        except Exception as e:
-            print(f"[TV_DEBUG] dtype conversion error for tf={tf}: {e}")
+        except Exception:
             return 0.0, "Neutral"
 
         if price is not None:
@@ -631,7 +587,6 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                 sma_series = _safe_sma(df["close"], length=int(l))
                 if sma_series is not None:
                     df[f"sma_{l}"] = sma_series
-            print(f"[TV_DEBUG] computed SMAs: {ma_lengths}")
 
             macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
             macd_result = _safe_macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
@@ -643,11 +598,9 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                     df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
                 df["macd_hist"] = 0.0
-            print(f"[TV_DEBUG] computed MACD (macd_result columns: {list(macd_result.columns) if macd_result is not None and hasattr(macd_result,'columns') else 'n/a'})")
 
             rsi_series = _safe_rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
             df["rsi"] = rsi_series
-            print("[TV_DEBUG] computed RSI")
 
             stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
             try:
@@ -656,9 +609,8 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                     stoch_k_col = next((c for c in st.columns if "STOCH" in str(c).upper() or "k" in str(c).lower()), None)
                     if stoch_k_col:
                         df["stoch_k"] = st[stoch_k_col]
-                print("[TV_DEBUG] computed Stochastic (k)")
             except Exception:
-                print("[TV_DEBUG] stoch calc failed (continuing)")
+                pass
 
             try:
                 adx_result = _safe_adx(df["high"], df["low"], df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
@@ -670,17 +622,11 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                         df["adx"] = np.nan
                 else:
                     df["adx"] = np.nan
-                print("[TV_DEBUG] computed ADX")
             except Exception:
                 df["adx"] = np.nan
-                print("[TV_DEBUG] adx calc failed (continuing)")
 
             obv_series = _safe_obv(df["close"], df["volume"])
             df["obv"] = obv_series
-            try:
-                print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
-            except Exception:
-                print("[TV_DEBUG] computed OBV")
 
             try:
                 boll_cfg = cfg["indicators"].get("bollinger", [20, 2])
@@ -688,15 +634,12 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
                 if bb is not None and hasattr(bb, "columns"):
                     for c in bb.columns:
                         df[c] = bb[c]
-                print("[TV_DEBUG] computed Bollinger Bands")
             except Exception:
-                print("[TV_DEBUG] bb calc failed (continuing)")
+                pass
 
-        except Exception as e:
-            print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
+        except Exception:
             return 0.0, "Neutral"
 
-        # scoring (same as original logic)
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
@@ -750,7 +693,6 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             scores.append((sub, weights.get("obv", 1.0)))
 
         if not scores:
-            print("[TV_DEBUG] no indicator scores computed -> Neutral")
             return 0.0, "Neutral"
 
         num = sum(s * w for (s, w) in scores)
@@ -778,13 +720,8 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         elif score <= t["sell"]:
             label = "Sell"
 
-        try:
-            print(f"[TV_DEBUG] tf={tf} score={score:.4f} label={label}")
-        except Exception:
-            print(f"[TV_DEBUG] tf={tf} score={score} label={label}")
         return score, label
-    except Exception as e:
-        print(f"[TV_DEBUG] compute_tv_rating error: {e}")
+    except Exception:
         return 0.0, "Neutral"
 
 
@@ -795,25 +732,46 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
 
     for tf in mtf_tfs:
         closes = get_closes_fn(tf) or []
-        _, _, hist = compute_macd_from_closes(closes, include_price=price)
-        hist = hist or []
-        cur = hist[-1] if hist else None
-        prev = hist[-2] if len(hist) >= 2 else None
-        is_positive = cur is not None and cur > 0
-        is_flip = (prev is not None and prev < 0 and cur is not None and cur > 0)
-        tf_states[tf] = {"cur": cur, "prev": prev, "is_positive": is_positive, "is_flip": is_flip, "slope": None}
-        if tf == "D":
-            one_d_hist = hist
-        if not is_positive:
+        _, _, hist = compute_macd_from_closes(closes)
+        clean = _clean_hist(hist)
+        last_val = clean[-1] if clean else 0.0
+        prev_val = clean[-2] if len(clean) >= 2 else last_val
+        is_pos = last_val > 0.0
+        is_flp = (prev_val <= 0.0 and last_val > 0.0)
+
+        tf_states[tf] = {
+            "is_positive": is_pos,
+            "is_flip": is_flp,
+            "hist_last": last_val,
+            "hist_prev": prev_val
+        }
+        if not is_pos:
             negative_tfs.append(tf)
 
-    if not negative_tfs:
-        return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
+        if tf in ("D", "1D"):
+            one_d_hist = clean
 
-    if negative_tfs == ["D"]:
-        if slope is not None:
-            one_d_slope = slope(one_d_hist, lookback=mtf_slope_lookback) if one_d_hist else None
-            if one_d_slope is not None and one_d_slope > 0:
-                tf_states["D"]["slope"] = one_d_slope
-                return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
-    return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}
+    status = "aligned"
+    if len(negative_tfs) > 0:
+        if len(negative_tfs) == 1:
+            status = "monitoring"
+        else:
+            status = "unaligned"
+
+    one_d_slope_val = 0.0
+    if slope is not None and len(one_d_hist) >= mtf_slope_lookback:
+        try:
+            one_d_slope_val = float(slope(one_d_hist, mtf_slope_lookback))
+        except Exception:
+            one_d_slope_val = 0.0
+
+    if status == "aligned" and "D" in tf_states and tf_states["D"].get("is_positive"):
+        if one_d_slope_val > 0:
+            status = "daily_rising"
+
+    return {
+        "status": status,
+        "tfs": tf_states,
+        "negative_tfs": negative_tfs,
+        "one_d_slope": one_d_slope_val
+    }

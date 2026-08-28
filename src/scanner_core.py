@@ -1,6 +1,5 @@
+# scanner_core.py
 """
-scanner_core.py
-
 Pure, synchronous helpers and deterministic computations extracted from scanner.py.
 
 These functions:
@@ -12,6 +11,7 @@ Note: This module will attempt to import pandas_ta (preferred) or the alternativ
 """
 import math
 import json
+import statistics
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
 
@@ -51,239 +51,139 @@ except Exception:
 from .macd import macd_histogram, slope  # type: ignore
 
 
-def tf_to_seconds(tf: str) -> int:
+# --------------------
+# Utilities / Helpers
+# --------------------
+def _is_finite_number(x: Any) -> bool:
     try:
-        s = str(tf)
-        if s.endswith("m"):
-            return int(s[:-1]) * 60
-        if s.endswith("h"):
-            return int(s[:-1]) * 3600
-        if s == "D" or s.endswith("d"):
-            try:
-                if s == "D":
-                    return 24 * 3600
-                return int(s[:-1]) * 86400
-            except Exception:
-                return 24 * 3600
-        return int(s) * 60
+        v = float(x)
+        return math.isfinite(v)
     except Exception:
-        return 60
+        return False
 
 
-def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: int) -> bool:
+def _clean_hist(hist: Any) -> List[float]:
     """
-    Check if the candle's start time is fresh enough compared to current time.
-
-    Behavior:
-    - If max_age_sec <= 0: check is disabled -> return True (accept flips of any age).
-    - If start_at is None/unparseable: return True (conservative: allow).
-    - start_at may be seconds or milliseconds; detect and normalize.
-    - Return True if (now - start_sec) <= max_age_sec, else False.
+    Convert many possible histogram shapes (list, tuple, numpy array, pandas Series)
+    into a plain list of finite floats (oldest -> newest). Removes None/NaN/infinite.
     """
-    try:
-        # If max_age_sec <= 0, treat as disabled (accept any age)
-        if max_age_sec is None or int(max_age_sec) <= 0:
-            return True
-
-        if start_at is None:
-            return True
-
-        # convert to float seconds (handle milliseconds)
-        start_sec = float(start_at) / 1000.0 if int(start_at) > 10000000000 else float(start_at)
-        age = now - start_sec
-        return age <= float(max_age_sec)
-    except Exception:
-        # On any error be permissive (do not block signals)
-        return True
-
-
-def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
-    """
-    Normalize various kline shapes into list of dicts:
-      {"start_at", "open", "high", "low", "close", "volume", "is_closed"(optional)}
-    Accepts dicts, lists, tuples and attempts to extract common fields.
-    """
-    out: List[Dict[str, AnyT]] = []
-    if not raw_klines:
+    out: List[float] = []
+    if hist is None:
         return out
-
-    if isinstance(raw_klines, dict):
-        if "list" in raw_klines and isinstance(raw_klines["list"], (list, dict)):
-            raw_klines = raw_klines["list"]
-        elif "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
-            raw_klines = raw_klines["result"]
-        elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
-            raw_klines = raw_klines["data"]
-
-    if not isinstance(raw_klines, (list, tuple)):
-        if isinstance(raw_klines, dict):
-            seq = [raw_klines]
+    try:
+        # If it's a pandas Series or numpy array, turn into list
+        if hasattr(hist, "tolist"):
+            iterable = hist.tolist()
         else:
-            seq = [raw_klines] if raw_klines else []
-    else:
-        seq = raw_klines
-
-    for item in seq:
+            iterable = list(hist) if not isinstance(hist, (str, bytes)) else [hist]
+    except Exception:
         try:
-            if isinstance(item, (list, tuple)):
-                start = None
-                open_p = None
-                high = None
-                low = None
-                close = None
-                vol = None
-                if len(item) >= 1:
-                    try:
-                        start = int(item[0])
-                    except Exception:
-                        start = None
-                if len(item) >= 2:
-                    try:
-                        open_p = float(item[1])
-                    except Exception:
-                        open_p = None
-                if len(item) >= 3:
-                    try:
-                        high = float(item[2])
-                    except Exception:
-                        high = None
-                if len(item) >= 4:
-                    try:
-                        low = float(item[3])
-                    except Exception:
-                        low = None
-                if len(item) >= 5:
-                    try:
-                        close = float(item[4])
-                    except Exception:
-                        close = None
-                if len(item) >= 6:
-                    try:
-                        vol = float(item[5])
-                    except Exception:
-                        vol = None
-
-                if close is not None:
-                    out.append({
-                        "start_at": start, "open": open_p, "high": high, "low": low,
-                        "close": close, "volume": vol
-                    })
-                continue
-
-            if isinstance(item, dict):
-                start = (
-                    item.get("start_at")
-                    or item.get("open_time")
-                    or item.get("t")
-                    or item.get("timestamp")
-                    or item.get("start")
-                    or item.get("time")
-                )
-                open_p = (
-                    item.get("open")
-                    or item.get("openPrice")
-                    or item.get("o")
-                )
-                high = (
-                    item.get("high")
-                    or item.get("h")
-                )
-                low = (
-                    item.get("low")
-                    or item.get("l")
-                )
-                close = (
-                    item.get("close")
-                    or item.get("close_price")
-                    or item.get("c")
-                    or item.get("last_price")
-                    or item.get("Close")
-                )
-                vol = (
-                    item.get("volume")
-                    or item.get("vol")
-                    or item.get("turnover")
-                    or item.get("v")
-                    or item.get("quoteAsset")
-                )
-                is_closed = item.get("isClosed")
-                if is_closed is None:
-                    is_closed = item.get("is_closed") or item.get("complete") or item.get("confirmed")
-
-                try:
-                    if start is not None:
-                        start = int(start)
-                except Exception:
-                    start = None
-                try:
-                    if open_p is not None:
-                        open_p = float(open_p)
-                except Exception:
-                    open_p = None
-                try:
-                    if high is not None:
-                        high = float(high)
-                except Exception:
-                    high = None
-                try:
-                    if low is not None:
-                        low = float(low)
-                except Exception:
-                    low = None
-                try:
-                    if close is not None:
-                        close = float(close)
-                except Exception:
-                    close = None
-                try:
-                    if vol is not None:
-                        vol = float(vol)
-                except Exception:
-                    vol = None
-
-                if close is not None:
-                    out.append({
-                        "start_at": start, "open": open_p, "high": high, "low": low,
-                        "close": close, "volume": vol, "is_closed": is_closed
-                    })
-                continue
+            iterable = list(hist)
         except Exception:
-            # Best-effort: skip malformed item
-            continue
+            iterable = [hist]
 
+    for x in iterable:
+        try:
+            if x is None:
+                continue
+            v = float(x)
+            if math.isnan(v) or not math.isfinite(v):
+                continue
+            out.append(v)
+        except Exception:
+            continue
     return out
 
 
-def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
+def _safe_last(v: Any) -> Optional[float]:
     """
-    Quantize a raw quantity to the nearest valid step size and respect min_qty.
+    Return last numeric scalar from various shapes, else None.
+    If v is list-like, returns last element converted to float, else if it's scalar numeric returns float.
     """
-    if qty is None:
-        return 0.0
-    qty_d = Decimal(str(qty))
-    if step is None or step <= 0:
-        if min_qty and qty_d < Decimal(str(min_qty)):
-            return float(Decimal(str(min_qty)))
-        return float(qty_d)
-    step_d = Decimal(str(step))
-    mult = (qty_d / step_d).to_integral_value(rounding=ROUND_DOWN)
-    quant = (mult * step_d)
-    if min_qty is not None:
-        min_d = Decimal(str(min_qty))
-        if quant < min_d:
-            quant = min_d
+    if v is None:
+        return None
+    # pandas Series/DataFrame
     try:
-        quant = quant.normalize()
+        if hasattr(v, "iloc"):
+            # Series-like
+            if len(v) == 0:
+                return None
+            try:
+                val = v.iloc[-1]
+                return float(val) if _is_finite_number(val) else None
+            except Exception:
+                return None
+        if hasattr(v, "tolist"):
+            lst = v.tolist()
+            if not lst:
+                return None
+            try:
+                return float(lst[-1])
+            except Exception:
+                return None
     except Exception:
         pass
-    return float(quant)
+    # list/tuple
+    try:
+        if isinstance(v, (list, tuple)):
+            if not v:
+                return None
+            return float(v[-1]) if _is_finite_number(v[-1]) else None
+    except Exception:
+        pass
+    # scalar
+    try:
+        return float(v) if _is_finite_number(v) else None
+    except Exception:
+        return None
 
 
-def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None):
+# --------------------
+# MACD helpers
+# --------------------
+def _fallback_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Pure-Python fallback MACD calculation using EMA.
+    Returns (macd_series, signal_series, hist_series) — each oldest->newest lists.
+    EMA implementation uses standard smoothing alpha = 2 / (period + 1).
+    """
+    if not closes:
+        return [], [], []
+
+    def ema_series(values: List[float], period: int) -> List[float]:
+        out: List[float] = []
+        alpha = 2.0 / (period + 1.0)
+        prev = None
+        for v in values:
+            if prev is None:
+                prev = float(v)
+            else:
+                prev = (float(v) * alpha) + (prev * (1.0 - alpha))
+            out.append(float(prev))
+        return out
+
+    # compute EMAs
+    try:
+        fast_ema = ema_series(closes, fast)
+        slow_ema = ema_series(closes, slow)
+        # macd series (fast - slow), align lengths (they are same length because we computed over same closes)
+        macd_series = [f - s for f, s in zip(fast_ema, slow_ema)]
+        # signal is EMA of macd_series
+        signal_series = ema_series(macd_series, signal)
+        hist_series = [m - s for m, s in zip(macd_series, signal_series)]
+        return macd_series, signal_series, hist_series
+    except Exception:
+        return [], [], []
+
+
+def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None, fast: int = 12, slow: int = 26, signal: int = 9):
     """
     Compute MACD histogram from a list of closes (floats).
     include_price: when provided, overwrites the last close value with current price.
-    Returns: (macd_line, signal_line, hist) — each as list-like (macd_histogram implementation dependent)
+    Returns: (macd_line_last, signal_line_last, hist_list) where:
+      - macd_line_last, signal_line_last are last numeric values (or None)
+      - hist_list is a list of floats (oldest -> newest); may be empty.
+    This function is robust to pandas/numpy/ta outputs and provides a pure-python fallback.
     """
     data: List[float] = []
     for c in closes:
@@ -295,60 +195,80 @@ def compute_macd_from_closes(closes: List[float], include_price: Optional[float]
             continue
 
     if include_price is not None:
-        current_price = float(include_price)
-        if data:
-            data[-1] = current_price
-        else:
-            data.append(current_price)
+        try:
+            current_price = float(include_price)
+            if data:
+                data[-1] = current_price
+            else:
+                data.append(current_price)
+        except Exception:
+            pass
 
-    # Warm-up hint: EMAs need history to stabilize — helpful when debugging/live runs
+    # Try existing macd_histogram helper first (keeps behaviour)
     try:
-        if len(data) < 30:
-            # lightweight console hint for troubleshooting
-            print(f"[MACD_DEBUG] compute_macd_from_closes: only {len(data)} closes provided; MACD EMAs may be unstable")
+        macd_line_raw, signal_line_raw, hist_raw = macd_histogram(data)
+        # hist may be list-like, numpy array, pandas Series — convert to list of floats
+        hist_list = _clean_hist(hist_raw)
+        macd_last = _safe_last(macd_line_raw)
+        signal_last = _safe_last(signal_line_raw)
+        return macd_last, signal_last, hist_list
     except Exception:
-        pass
+        # Fallback: compute MACD in pure python
+        try:
+            macd_series, signal_series, hist_series = _fallback_macd(data, fast=fast, slow=slow, signal=signal)
+            macd_last = float(macd_series[-1]) if macd_series else None
+            signal_last = float(signal_series[-1]) if signal_series else None
+            return macd_last, signal_last, hist_series
+        except Exception:
+            return None, None, []
 
-    macd_line, signal_line, hist = macd_histogram(data)
-    try:
-        hist = [None if v is None else float(v) for v in (hist or [])]
-    except Exception:
-        pass
-    return macd_line, signal_line, hist
 
-
-def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> bool:
+# --------------------
+# Flip detection
+# --------------------
+def detect_flip_current_open(hist: List[float], hist_threshold: Optional[float] = None, std_mult: float = 0.05, abs_min: float = 1e-9, lookback: int = 1) -> bool:
     """
-    Detect zero-cross flip between previous and current hist values.
+    Detect zero-cross flip from negative (or <=0) to positive on last candle, with noise gating.
 
-    - hist: list-like where last item is the most recent histogram value (after any cleaning)
-    - hist_threshold: absolute minimum magnitude required for the new hist value to count (guards against noise)
-    Returns True if a sign-change flip is detected (either down->up or up->down) and
-    the new histogram value exceeds the given threshold in absolute terms.
+    Parameters:
+      hist: list-like of histogram values (oldest -> newest). Can contain None/NaN; will be cleaned.
+      hist_threshold: optional explicit numeric threshold; if None a dynamic threshold is computed.
+      std_mult: multiplier applied to sample std for dynamic threshold.
+      abs_min: minimum absolute threshold to avoid triggering on tiny noise.
+      lookback: how many candles back to consider as 'previous' (1 => prev = -2, cur = -1)
+
+    Behavior:
+      - Clean input to finite floats.
+      - Need at least 2 clean values otherwise return False.
+      - Compute prev = clean[-(lookback+1)], cur = clean[-1].
+      - If hist_threshold is None compute threshold = max(abs_min, hist_std * std_mult).
+      - Return True only if prev <= 0 and cur > threshold.
     """
     try:
-        if not hist or len(hist) < 2:
+        clean = _clean_hist(hist)
+        if not clean or len(clean) < (lookback + 1):
             return False
-        prev = hist[-2]
-        cur = hist[-1]
+        prev = clean[-(lookback + 1)]
+        cur = clean[-1]
+        # If either None/unfinites present after cleaning, bail
         if prev is None or cur is None:
             return False
-
-        # enforce a minimum absolute magnitude for the current histogram value to avoid noise flips
-        try:
-            thresh = float(hist_threshold) if hist_threshold is not None else 0.0
-        except Exception:
-            thresh = 0.0
-
-        if abs(cur) <= thresh:
-            return False
-
-        # detect sign change (either negative->positive or positive->negative)
-        return (prev <= 0 and cur > 0) or (prev >= 0 and cur < 0)
+        # Dynamic threshold if not provided
+        if hist_threshold is None:
+            try:
+                hist_std = statistics.pstdev(clean) if len(clean) >= 2 else 0.0
+            except Exception:
+                hist_std = 0.0
+            hist_threshold = max(abs_min, abs(hist_std) * std_mult)
+        # Zero-cross with gating
+        return (prev <= 0.0) and (cur > float(hist_threshold))
     except Exception:
         return False
 
 
+# --------------------
+# Volume helper (unchanged)
+# --------------------
 def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
     """
     Compute percentage change given a symbol's volume tracking dict:
@@ -493,6 +413,9 @@ def _safe_bbands(df_close, length: int, std: float):
         return None
 
 
+# --------------------
+# TV rating and MTF alignment (unchanged core logic, but robust inputs)
+# --------------------
 def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
     """
     Compute a TradingView-like normalized score using pandas/ta or fallback 'ta' and the TECHNICAL_RATING-style cfg.
@@ -625,7 +548,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
             return 0.0, "Neutral"
 
-        # Scoring
+        # Scoring (unchanged)
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
@@ -736,8 +659,10 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
         hist = hist or []
         cur = hist[-1] if hist else None
         prev = hist[-2] if len(hist) >= 2 else None
+
+        # Use robust flip detection with small threshold (same defaults as detect_flip_current_open)
         is_positive = cur is not None and cur > 0
-        is_flip = (prev is not None and prev < 0 and cur is not None and cur > 0)
+        is_flip = detect_flip_current_open(hist, None, std_mult=0.05, abs_min=1e-9, lookback=1)
 
         tf_states[tf] = {"cur": cur, "prev": prev, "is_positive": is_positive, "is_flip": is_flip, "slope": None}
         if tf == "D":

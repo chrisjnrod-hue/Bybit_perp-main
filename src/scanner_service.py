@@ -75,36 +75,17 @@ TELEGRAM_DISPATCH_WINDOW = 5
 
 class Scanner:
     def __init__(self):
-        self.rate_limiter = TokenBucket(max(1.0, float(1)))
-        self.client = BybitClient(rate_limiter=self.rate_limiter)
-
-        # Build TradeManager config mapping from existing module constants / env
-        tm_config = {
-            "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
-            "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
-            "MIN_MARKET_CAP": MARKET_CAP_MIN or 0,
-            "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
-            "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
-            "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
-            "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1") in ("1", "true", "True"),
-            "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-            "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
-            "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
-            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
-            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
-            # SIMULATED is true if TRADE_ENABLED is False or credentials missing
-            "SIMULATED": not bool(TRADE_ENABLED) or not bool(getattr(self.client, "api_key", None)) or not bool(getattr(self.client, "api_secret", None)),
-        }
-
-        self.trade_manager = TradeManager(self.client, tm_config)
-
-        self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
-        self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
-        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
+        # ============ CRITICAL FIX: Do NOT create async objects in __init__ ============
+        # These must be created AFTER event loop starts
+        self.rate_limiter = None  # Will be created in _initialize_async()
+        self.client = None  # Will be created in _initialize_async()
+        self.trade_manager = None  # Will be created in _initialize_async()
         
-        # ============ FIX 1: Add asyncio.Lock for thread-safe kline_store access ============
-        self._kline_store_lock = asyncio.Lock()
-        # ==================================================================================
+        self.concurrent_sem = None  # Will be created in _initialize_async()
+        self.request_sem = None  # Will be created in _initialize_async()
+        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
+        self._kline_store_lock = None  # Will be created in _initialize_async()
+        # ================================================================================
         
         self.symbols: List[str] = []
         self._stop = False
@@ -127,9 +108,62 @@ class Scanner:
 
         # Initialize Telegram state manager
         self.telegram = TelegramSummary()
+        
+        # Flag to track if async initialization is done
+        self._async_initialized = False
 
         logger.info(
-            "scanner initialized (USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s) "
+            "scanner __init__ complete (async init will happen in run())"
+        )
+
+    async def _initialize_async(self):
+        """
+        Initialize all async/event-loop-dependent objects.
+        MUST be called once at the start of run() before any async operations.
+        """
+        if self._async_initialized:
+            logger.info("[ASYNC_INIT] Already initialized, skipping")
+            return
+        
+        logger.info("[ASYNC_INIT] Starting async initialization...")
+        
+        # Create TokenBucket rate limiter
+        self.rate_limiter = TokenBucket(max(1.0, float(1)))
+        
+        # Create BybitClient
+        self.client = BybitClient(rate_limiter=self.rate_limiter)
+        
+        # Build TradeManager config
+        tm_config = {
+            "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
+            "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
+            "MIN_MARKET_CAP": MARKET_CAP_MIN or 0,
+            "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
+            "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
+            "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
+            "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1") in ("1", "true", "True"),
+            "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
+            "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
+            "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
+            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+            "SIMULATED": not bool(TRADE_ENABLED) or not bool(getattr(self.client, "api_key", None)) or not bool(getattr(self.client, "api_secret", None)),
+        }
+        
+        self.trade_manager = TradeManager(self.client, tm_config)
+        
+        # Create semaphores (must be done in event loop context)
+        self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
+        self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
+        
+        # Create lock for kline_store
+        self._kline_store_lock = asyncio.Lock()
+        
+        self._async_initialized = True
+        
+        logger.info(
+            "[ASYNC_INIT] Complete. "
+            "USE_WS=%s SEED_KLINES_LIMIT=%d CONCURRENCY=%d DEBUG_SURGICAL=%s DIAGNOSTIC=%s "
             "TRADE_RATING_MIN=%.4f TV_RATING_WEIGHT=%.2f TRADE_RATING_PRIORITIZE=%s FLIP_CANDLE_AGE_MAX_SEC=%d SIGNAL_DEDUP_WINDOW=%d "
             "TRADE_NO_NEG_VOL=%s MARKET_CAP_MIN=%s PRIORITIZE=%s",
             bool(USE_WS), SEED_KLINES_LIMIT, CONCURRENCY, DEBUG_SURGICAL_LOGS, DIAGNOSTIC_MODE,
@@ -159,15 +193,17 @@ class Scanner:
             try:
                 fn = getattr(self.client, name, None)
                 if not fn:
+                    logger.debug("[CLIENT_METHOD] %s not found on client", name)
                     continue
                 res = fn(*args, **kwargs)
                 if inspect.isawaitable(res):
                     res = await res
+                logger.debug("[CLIENT_METHOD] %s succeeded", name)
                 return res
-            except Exception:
-                logger.debug("Client method %s failed", name, exc_info=True)
+            except Exception as e:
+                logger.debug("Client method %s failed: %s", name, e, exc_info=True)
                 continue
-        logger.debug("No client method among %s succeeded", names)
+        logger.warning("[CLIENT_METHOD] No client method among %s succeeded", names)
         return None
 
     async def _get_symbols(self) -> List[str]:
@@ -178,7 +214,7 @@ class Scanner:
             items = None
 
         if not items:
-            logger.info("No symbols returned from client")
+            logger.warning("[SYMBOLS] No symbols returned from client")
             await self._emit_event("symbols", [])
             self.symbols = []
             return []
@@ -267,7 +303,7 @@ class Scanner:
                 logger.exception("Error normalizing symbol entry: %s", it)
 
         syms = sorted(set(syms))
-        logger.info("Discovered %d USDT perpetual symbols", len(syms))
+        logger.info("[SYMBOLS_DISCOVERED] Found %d USDT perpetual symbols", len(syms))
         await self._emit_event("symbols", syms)
         self.symbols = syms
         return syms
@@ -284,11 +320,13 @@ class Scanner:
 
             if USE_WS:
                 try:
+                    logger.info("[WS_STARTUP] Attempting to start websocket...")
                     await self.client.start_kline_ws()
-                except Exception:
-                    logger.exception("Failed to start client WS")
+                    logger.info("[WS_STARTUP] Websocket started successfully")
+                except Exception as e:
+                    logger.exception("[WS_STARTUP_FAILED] Failed to start websocket: %s", e)
             else:
-                logger.info("USE_WS is False; websocket startup and subscriptions skipped (REST-only mode)")
+                logger.info("[WS_DISABLED] USE_WS is False; websocket startup and subscriptions skipped (REST-only mode)")
 
             if USE_WS and syms:
                 tasks = []
@@ -414,10 +452,8 @@ class Scanner:
                 except Exception:
                     klines_sorted = valid
 
-                # ============ FIX 3: Acquire lock before writing to kline_store ============
                 async with self._kline_store_lock:
                     self.kline_store[symbol][tf] = klines_sorted
-                # ===========================================================================
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -465,7 +501,6 @@ class Scanner:
                                 normalized = normalize_klines(data, tf) if data else []
 
                                 if normalized:
-                                    # ============ FIX 4: Acquire lock before read+modify ============
                                     async with self._kline_store_lock:
                                         lst = self.kline_store.get(sym, {}).get(tf, [])
                                         last_new = None
@@ -493,7 +528,6 @@ class Scanner:
                                                     self.kline_store.setdefault(sym, {})[tf] = [last_new]
                                             else:
                                                 self.kline_store.setdefault(sym, {})[tf] = [last_new]
-                                    # ================================================================
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -559,15 +593,9 @@ class Scanner:
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
-        
-        ============ FIX 2: Protect kline_store access with lock ============
-        Acquire lock before reading, make defensive copy to avoid iterator corruption.
-        =====================================================================
         """
-        # Acquire lock and make defensive copy of klines
         async with self._kline_store_lock:
             raw_data = self.kline_store.get(symbol, {}).get(tf, [])
-            # Make a deep copy to prevent concurrent modification during processing
             data = [dict(c) for c in raw_data] if raw_data else []
         
         closes: List[float] = []
@@ -641,34 +669,22 @@ class Scanner:
                     self._24h_volumes[symbol]["previous"] = self._24h_volumes[symbol]["current"]
                     self._24h_volumes[symbol]["current"] = vol
                 logger.debug("[VOLUME_UPDATE] %s: current=%.0f", symbol, vol)
-                prev = self._24h_volumes[symbol].get("previous", 0)
-                curr = self._24h_volumes[symbol].get("current", 0)
-                logger.debug("[VOL_DEBUG] prev=%s, curr=%s", prev, curr)
                 return vol
             else:
                 logger.debug("[VOLUME_UPDATE] %s: ticker returned but no volume field matched: %s", symbol, data if isinstance(data, dict) else str(data))
-        except Exception:
-            logger.debug("Could not update 24h volume for %s", symbol, exc_info=True)
+        except Exception as e:
+            logger.debug("[VOLUME_UPDATE] Could not update 24h volume for %s: %s", symbol, e)
         return None
 
     def compute_24h_volume_change(self, symbol: str) -> Optional[float]:
         return compute_24h_volume_change_from(self._24h_volumes.get(symbol))
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
-        async def get_klines_async() -> List[Dict[str, Any]]:
-            async with self._kline_store_lock:
-                return [dict(c) for c in self.kline_store.get(symbol, {}).get(tf, [])]
-        
-        # Since compute_tv_rating_from is synchronous, we can't call async here
-        # Instead, we'll fetch synchronously (accepting potential race as acceptable)
         klines = self.kline_store.get(symbol, {}).get(tf, [])
         return compute_tv_rating_from(klines, TECHNICAL_RATING, tf=tf, price=price)
 
     def _compute_mtf_alignment(self, symbol: str, price: float):
         def _get_closes(tf: str) -> List[float]:
-            # ============ FIX 2b: Protect kline_store access with lock ============
-            # Use nested sync context manager if lock is available
-            # For this function we accept slight race condition as it's compute-only
             items = self.kline_store.get(symbol, {}).get(tf, [])
             closes = []
             for c in items:
@@ -790,7 +806,6 @@ class Scanner:
         Caches the signal timestamp to prevent re-triggers across scan cycles.
         """
         if SIGNAL_DEDUP_WINDOW <= 0:
-            # Deduplication disabled
             return True
         
         if candle_open_time is None:
@@ -811,7 +826,6 @@ class Scanner:
                     )
                     return False
             
-            # Signal is new or cache expired; update cache
             self._signal_cache[cache_key] = now
             logger.debug("DEDUPE PASSED: %s %s candle_open=%d (new or expired)", symbol, tf, candle_open_time)
             return True
@@ -859,7 +873,7 @@ class Scanner:
                 if refreshed_tfs:
                     logger.info(
                         "[CANDLE_OPEN_REFRESH] Detected new candle open(s) for root TFs %s. "
-                        "Executing full kline seeding & caching refresh (seed_all) to ensure subsequent root scans are as fresh and accurate as initial deploy.",
+                        "Executing full kline seeding & caching refresh (seed_all)...",
                         refreshed_tfs
                     )
                     await self.seed_all()
@@ -871,21 +885,28 @@ class Scanner:
 
                 async def check_symbol(sym: str):
                     try:
+                        logger.debug("[CHECK_SYMBOL_START] %s: Getting latest price", sym)
+                        
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
-
+                        
                         if price is None:
+                            logger.warning("[CHECK_SYMBOL] %s: get_latest_price returned None, trying WS fallback", sym)
                             try:
                                 if ROOT_TFS and USE_WS and self.client.is_ws_connected():
                                     ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
                                     if ws_last and ws_last.get("close") is not None:
                                         price = float(ws_last.get("close"))
-                            except Exception:
+                                        logger.info("[CHECK_SYMBOL] %s: Got price from WS fallback: %.8f", sym, price)
+                            except Exception as e:
+                                logger.debug("[CHECK_SYMBOL] %s: WS fallback failed: %s", sym, e)
                                 price = None
 
                         if price is None:
+                            logger.warning("[CHECK_SYMBOL] %s: Could not get price via REST or WS", sym)
                             return
 
+                        logger.debug("[CHECK_SYMBOL] %s: Price=%.8f", sym, price)
                         self._last_price_cache[sym] = price
 
                         # Ensure 24h volume is fully updated prior to signal generation
@@ -896,18 +917,15 @@ class Scanner:
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
 
-                            # ============ FIX 5: Defensive check for kline availability ============
                             async with self._kline_store_lock:
                                 available_count = len(self.kline_store.get(sym, {}).get(root, []))
                             
                             if available_count < 26:
                                 logger.warning(
-                                    "[ROOT_SCAN_SKIP] %s %s: insufficient klines (%d < 26 minimum). "
-                                    "Waiting for seeding to complete or REST poll to catch up.",
+                                    "[ROOT_SCAN_SKIP] %s %s: insufficient klines (%d < 26 minimum)",
                                     sym, root, available_count
                                 )
                                 continue
-                            # =====================================================================
 
                             macd_line, sig, hist = await self.compute_macd_for(
                                 sym,
@@ -942,35 +960,28 @@ class Scanner:
 
                             if not hist_list:
                                 logger.warning(
-                                    "[HIST_EMPTY] Histogram normalization resulted in empty list for %s %s. "
-                                    "Check: sufficient klines? NaN/inf values?",
+                                    "[HIST_EMPTY] Histogram normalization resulted in empty list for %s %s",
                                     sym, root
                                 )
                                 continue
 
-                            # Unconditional MACD snapshot logging for diagnostics
-                            try:
-                                logger.info(
-                                    "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
-                                    sym, root,
-                                    ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
-                                    ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
-                                    len(hist_list),
-                                    str(hist_list[-2:]) if hist_list else "[]"
-                                )
-                            except Exception:
-                                logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
+                            logger.info(
+                                "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
+                                sym, root,
+                                ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
+                                ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
+                                len(hist_list),
+                                str(hist_list[-2:]) if hist_list else "[]"
+                            )
 
                             # Primary flip detection via helper (best-effort, catch exceptions)
                             flip = False
                             try:
                                 flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
                             except Exception:
-                                # fall back silently to our heuristic
                                 flip = False
 
-                            # If primary helper didn't detect a flip, try a conservative heuristic:
-                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
+                            # If primary helper didn't detect a flip, try a conservative heuristic
                             if not flip:
                                 try:
                                     if len(hist_list) >= 2:
@@ -978,26 +989,10 @@ class Scanner:
                                         last_h = float(hist_list[-1])
                                         if prev_h < 0 and last_h > 0:
                                             flip = True
-                                        # also detect a decisive jump from <=0 to significantly positive
                                         elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
                                             flip = True
                                 except Exception:
                                     flip = False
-
-                            # Surgical logging for diagnostics
-                            if DEBUG_SURGICAL_LOGS:
-                                try:
-                                    logger.info(
-                                        "[SURGICAL_MACD] %s %s macd=%s signal=%s hist_len=%d last2=%s flip=%s",
-                                        sym, root,
-                                        ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
-                                        ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
-                                        len(hist_list),
-                                        str(hist_list[-2:]) if hist_list else "[]",
-                                        flip
-                                    )
-                                except Exception:
-                                    logger.debug("Failed surgical macd log for %s %s", sym, root, exc_info=True)
 
                             logger.info(
                                 "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
@@ -1069,7 +1064,6 @@ class Scanner:
                 newly_aligned = await self._check_monitored_symbols()
                 evaluated_aligned = []
                 if newly_aligned:
-                    # Allow execution for monitored signals that are now fully aligned
                     evaluated_aligned = await self.handle_root_signals(newly_aligned, allow_open_trades=True)
 
                 now_ts = time.time()
@@ -1188,7 +1182,7 @@ class Scanner:
             }
 
             if mtf_status in ("aligned", "daily_rising"):
-                # ---- CANDLE AGE FILTER: Reject/block trade open if candle too old, but allow Telegram push ----
+                # ---- CANDLE AGE FILTER ----
                 if not candle_age_ok:
                     entry["accept"] = False
                     entry["reason"] = "candle_too_old"
@@ -1196,7 +1190,7 @@ class Scanner:
                     evaluated.append(entry)
                     continue
 
-                # ---- TV RATING FILTER: Reject if below TRADE_RATING_MIN ----
+                # ---- TV RATING FILTER ----
                 if TRADE_RATING_MIN_VAL > 0.0 and tv_score < TRADE_RATING_MIN_VAL:
                     entry["accept"] = False
                     entry["reason"] = f"tv_rating_below_threshold_{tv_score:.4f}"
@@ -1373,7 +1367,6 @@ class Scanner:
                     if "order" in tm_result:
                         eval["order"] = tm_result.get("order")
                     eval["trade_record"] = tm_result.get("trade_record")
-                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
             else:
                 # failed to open
                 err = tm_result.get("error", "open_failed")
@@ -1394,10 +1387,12 @@ class Scanner:
         return combined
 
     async def run(self):
-        # ============ FIX 6: Ensure lock is initialized in event loop context ============
-        if not hasattr(self, '_kline_store_lock') or self._kline_store_lock is None:
-            self._kline_store_lock = asyncio.Lock()
-        # ====================================================================================
+        """Main async entry point - must initialize async objects HERE."""
+        logger.info("[ASYNC_START] Scanner.run() starting...")
+        
+        # ============ CRITICAL: Initialize ALL async objects NOW ============
+        await self._initialize_async()
+        # ====================================================================
         
         self._task = asyncio.create_task(self.root_scan_loop())
         try:

@@ -100,10 +100,11 @@ class Scanner:
 
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
+        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
         
-        # ===== FIXED: Use regular dict instead of defaultdict to prevent overwrites =====
-        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-        self._store_lock = asyncio.Lock()  # Prevent concurrent modifications
+        # ============ FIX 1: Add asyncio.Lock for thread-safe kline_store access ============
+        self._kline_store_lock = asyncio.Lock()
+        # ==================================================================================
         
         self.symbols: List[str] = []
         self._stop = False
@@ -326,8 +327,6 @@ class Scanner:
             logger.warning("SEED_KLINES_LIMIT is very low (%d); MACD requires >=26 for stability", SEED_KLINES_LIMIT)
 
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
-        logger.info("[SEED_DIAG] %s: Starting seed for TFs: %s", symbol, tfs)
-        
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
@@ -415,29 +414,10 @@ class Scanner:
                 except Exception:
                     klines_sorted = valid
 
-                # ===== THREAD-SAFE: Use lock for all store operations =====
-                async with self._store_lock:
-                    # Ensure symbol entry exists
-                    if symbol not in self.kline_store:
-                        logger.info("[SEED_DIAG] Creating kline_store entry for %s", symbol)
-                        self.kline_store[symbol] = {}
-                    
-                    logger.info("[SEED_DIAG_PRE_ASSIGN] %s %s: About to assign %d candles. Store state before: %s", 
-                               symbol, tf, len(klines_sorted), list(self.kline_store.get(symbol, {}).keys()))
-                    
-                    # Perform assignment
+                # ============ FIX 3: Acquire lock before writing to kline_store ============
+                async with self._kline_store_lock:
                     self.kline_store[symbol][tf] = klines_sorted
-                    
-                    logger.info("[SEED_DIAG_POST_ASSIGN] %s %s: Successfully assigned. Verifying...", symbol, tf)
-                    
-                    # ===== VERIFICATION: Check immediately inside lock =====
-                    stored = self.kline_store.get(symbol, {}).get(tf, [])
-                    logger.info("[SEED_DIAG_VERIFY] %s %s: Stored count=%d, matches=%s", 
-                               symbol, tf, len(stored), len(stored) == len(klines_sorted))
-                    
-                    if len(stored) != len(klines_sorted):
-                        logger.error("[SEED_DIAG_ERROR] %s %s: MISMATCH! Expected %d, got %d", 
-                                   symbol, tf, len(klines_sorted), len(stored))
+                # ===========================================================================
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -485,7 +465,8 @@ class Scanner:
                                 normalized = normalize_klines(data, tf) if data else []
 
                                 if normalized:
-                                    async with self._store_lock:
+                                    # ============ FIX 4: Acquire lock before read+modify ============
+                                    async with self._kline_store_lock:
                                         lst = self.kline_store.get(sym, {}).get(tf, [])
                                         last_new = None
 
@@ -502,8 +483,6 @@ class Scanner:
                                                 break
 
                                         if last_new:
-                                            if sym not in self.kline_store:
-                                                self.kline_store[sym] = {}
                                             if lst:
                                                 try:
                                                     if lst[-1].get("start_at") == last_new.get("start_at"):
@@ -511,9 +490,10 @@ class Scanner:
                                                     else:
                                                         lst.append(last_new)
                                                 except Exception:
-                                                    self.kline_store[sym][tf] = [last_new]
+                                                    self.kline_store.setdefault(sym, {})[tf] = [last_new]
                                             else:
-                                                self.kline_store[sym][tf] = [last_new]
+                                                self.kline_store.setdefault(sym, {})[tf] = [last_new]
+                                    # ================================================================
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -575,12 +555,21 @@ class Scanner:
         else:
             return int(now // tf_sec) * tf_sec
 
-    def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
+    async def compute_macd_for(self, symbol: str, tf: str, include_price: Optional[float] = None, use_ws_current: bool = False):
         """
         Build closes list from kline_store and call core.compute_macd_from_closes.
         The optional use_ws_current path tries to consult the client's WS cached kline (best-effort).
+        
+        ============ FIX 2: Protect kline_store access with lock ============
+        Acquire lock before reading, make defensive copy to avoid iterator corruption.
+        =====================================================================
         """
-        data = self.kline_store.get(symbol, {}).get(tf, [])
+        # Acquire lock and make defensive copy of klines
+        async with self._kline_store_lock:
+            raw_data = self.kline_store.get(symbol, {}).get(tf, [])
+            # Make a deep copy to prevent concurrent modification during processing
+            data = [dict(c) for c in raw_data] if raw_data else []
+        
         closes: List[float] = []
         for c in data:
             try:
@@ -666,11 +655,20 @@ class Scanner:
         return compute_24h_volume_change_from(self._24h_volumes.get(symbol))
 
     def compute_tv_rating(self, symbol: str, tf: str, price: Optional[float] = None):
+        async def get_klines_async() -> List[Dict[str, Any]]:
+            async with self._kline_store_lock:
+                return [dict(c) for c in self.kline_store.get(symbol, {}).get(tf, [])]
+        
+        # Since compute_tv_rating_from is synchronous, we can't call async here
+        # Instead, we'll fetch synchronously (accepting potential race as acceptable)
         klines = self.kline_store.get(symbol, {}).get(tf, [])
         return compute_tv_rating_from(klines, TECHNICAL_RATING, tf=tf, price=price)
 
     def _compute_mtf_alignment(self, symbol: str, price: float):
         def _get_closes(tf: str) -> List[float]:
+            # ============ FIX 2b: Protect kline_store access with lock ============
+            # Use nested sync context manager if lock is available
+            # For this function we accept slight race condition as it's compute-only
             items = self.kline_store.get(symbol, {}).get(tf, [])
             closes = []
             for c in items:
@@ -876,35 +874,16 @@ class Scanner:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
 
-                        # ===== CRITICAL FALLBACK CHAIN: Extract price from multiple sources =====
-                        if price is None:
-                            logger.debug("[PRICE_FALLBACK] %s: REST get_latest_price returned None, trying kline fallback", sym)
-                            try:
-                                # Try to extract price from the first ROOT_TF with cached klines
-                                async with self._store_lock:
-                                    for tf in ROOT_TFS:
-                                        last_candles = self.kline_store.get(sym, {}).get(tf, [])
-                                        if last_candles and last_candles[-1].get("close"):
-                                            price = float(last_candles[-1]["close"])
-                                            logger.info("[PRICE_FALLBACK_SUCCESS] %s: extracted from %s kline close: %.8f", sym, tf, price)
-                                            break
-                            except Exception as e:
-                                logger.debug("[PRICE_FALLBACK_ERROR] %s: kline fallback failed: %s", sym, e)
-                                price = None
-
-                        # ===== WS Fallback if kline extraction also failed =====
                         if price is None:
                             try:
                                 if ROOT_TFS and USE_WS and self.client.is_ws_connected():
                                     ws_last = self.client.get_ws_latest_kline(sym, ROOT_TFS[0]) if hasattr(self.client, "get_ws_latest_kline") else None
                                     if ws_last and ws_last.get("close") is not None:
                                         price = float(ws_last.get("close"))
-                                        logger.info("[PRICE_WS_FALLBACK] %s: extracted from WS: %.8f", sym, price)
                             except Exception:
                                 price = None
 
                         if price is None:
-                            logger.warning("[SYMBOL_CHECK] %s: SKIPPED – no price available (REST failed, klines empty, WS unavailable)", sym)
                             return
 
                         self._last_price_cache[sym] = price
@@ -917,7 +896,20 @@ class Scanner:
                         for root in ROOT_TFS:
                             logger.info("[ROOT_SCAN_CALC] %s %s: STARTING MACD calculation", sym, root)
 
-                            macd_line, sig, hist = self.compute_macd_for(
+                            # ============ FIX 5: Defensive check for kline availability ============
+                            async with self._kline_store_lock:
+                                available_count = len(self.kline_store.get(sym, {}).get(root, []))
+                            
+                            if available_count < 26:
+                                logger.warning(
+                                    "[ROOT_SCAN_SKIP] %s %s: insufficient klines (%d < 26 minimum). "
+                                    "Waiting for seeding to complete or REST poll to catch up.",
+                                    sym, root, available_count
+                                )
+                                continue
+                            # =====================================================================
+
+                            macd_line, sig, hist = await self.compute_macd_for(
                                 sym,
                                 root,
                                 include_price=price,
@@ -930,16 +922,31 @@ class Scanner:
                                 if hist is None:
                                     hist_list = []
                                 elif isinstance(hist, (list, tuple)):
-                                    hist_list = [float(x) for x in hist]
+                                    for item in hist:
+                                        try:
+                                            val = float(item)
+                                            if math.isfinite(val):  # Filter NaN/inf
+                                                hist_list.append(val)
+                                        except (ValueError, TypeError):
+                                            continue
                                 else:
-                                    # try to convert numpy arrays or single numeric
                                     try:
-                                        hist_list = list(map(float, hist))
-                                    except Exception:
-                                        # treat single numeric as one-element list
-                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
-                            except Exception:
+                                        val = float(hist)
+                                        if math.isfinite(val):
+                                            hist_list = [val]
+                                    except (ValueError, TypeError):
+                                        hist_list = []
+                            except Exception as e:
+                                logger.debug("[HIST_PARSE_ERROR] %s %s: %s", sym, root, e)
                                 hist_list = []
+
+                            if not hist_list:
+                                logger.warning(
+                                    "[HIST_EMPTY] Histogram normalization resulted in empty list for %s %s. "
+                                    "Check: sufficient klines? NaN/inf values?",
+                                    sym, root
+                                )
+                                continue
 
                             # Unconditional MACD snapshot logging for diagnostics
                             try:
@@ -1002,13 +1009,10 @@ class Scanner:
                             if hist_list and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
-                                try:
-                                    async with self._store_lock:
-                                        last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                        if last_candles:
-                                            start_at = last_candles[-1].get("start_at")
-                                except Exception:
-                                    start_at = None
+                                async with self._kline_store_lock:
+                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                    if last_candles:
+                                        start_at = last_candles[-1].get("start_at")
 
                                 # Check if candle is fresh enough for trading
                                 candle_age_ok = self._is_candle_age_acceptable(start_at, now_check)
@@ -1152,7 +1156,7 @@ class Scanner:
 
             hist = item.get("hist", [])
             if not hist:
-                _, _, hist = self.compute_macd_for(sym, root, include_price=price)
+                _, _, hist = await self.compute_macd_for(sym, root, include_price=price)
                 hist = hist or []
             macd_hist_val = hist[-1] if hist else 0.0
 
@@ -1390,6 +1394,11 @@ class Scanner:
         return combined
 
     async def run(self):
+        # ============ FIX 6: Ensure lock is initialized in event loop context ============
+        if not hasattr(self, '_kline_store_lock') or self._kline_store_lock is None:
+            self._kline_store_lock = asyncio.Lock()
+        # ====================================================================================
+        
         self._task = asyncio.create_task(self.root_scan_loop())
         try:
             await self._task

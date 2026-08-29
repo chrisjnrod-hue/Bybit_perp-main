@@ -7,10 +7,11 @@ These functions:
 - Do NOT perform network I/O
 - Accept inputs (klines, closes, volume dicts, config) to be unit-testable
 - Preserve behavior of original helpers (normalization, MACD wrapper, TV rating, quantize, MTF alignment)
+
+Note: This module will attempt to import pandas_ta (preferred) or the alternative 'ta' package and will attempt to compute indicators using whichever is available. If no supported TA API is present, compute_tv_rating will return neutral.
 """
 import math
 import json
-import statistics
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
 
@@ -34,6 +35,7 @@ try:
     _PANDAS_TA_AVAILABLE = True
     _PANDAS_TA_STYLE = True
 except Exception:
+    # Try the alternative 'ta' package (bukosabino) which uses class-based API
     try:
         import ta  # type: ignore
         _ta_module = ta
@@ -46,16 +48,9 @@ except Exception:
         _PANDAS_TA_STYLE = False
 
 # Import MACD helper and slope function from package (keeps same external dependency)
-# If you have a macd.py with macd_histogram and slope, keep it; otherwise fallback implementations below will handle MACD.
-try:
-    from .macd import macd_histogram, slope  # type: ignore
-except Exception:
-    macd_histogram = None
-    slope = None  # type: ignore
+from .macd import macd_histogram, slope  # type: ignore
 
-# --------------------
-# Timeframe helpers
-# --------------------
+
 def tf_to_seconds(tf: str) -> int:
     try:
         s = str(tf)
@@ -78,27 +73,30 @@ def tf_to_seconds(tf: str) -> int:
 def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: int) -> bool:
     """
     Check if the candle's start time is fresh enough compared to current time.
+
     Behavior:
-    - If max_age_sec <= 0: check is disabled -> return True.
-    - If start_at is None/unparseable: return True.
+    - If max_age_sec <= 0: check is disabled -> return True (accept flips of any age).
+    - If start_at is None/unparseable: return True (conservative: allow).
     - start_at may be seconds or milliseconds; detect and normalize.
+    - Return True if (now - start_sec) <= max_age_sec, else False.
     """
     try:
+        # If max_age_sec <= 0, treat as disabled (accept any age)
         if max_age_sec is None or int(max_age_sec) <= 0:
             return True
+
         if start_at is None:
             return True
-        # detect milliseconds
+
+        # convert to float seconds (handle milliseconds)
         start_sec = float(start_at) / 1000.0 if int(start_at) > 10000000000 else float(start_at)
         age = now - start_sec
         return age <= float(max_age_sec)
     except Exception:
+        # On any error be permissive (do not block signals)
         return True
 
 
-# --------------------
-# Normalization helpers
-# --------------------
 def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
     """
     Normalize various kline shapes into list of dicts:
@@ -250,15 +248,16 @@ def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
                     })
                 continue
         except Exception:
+            # Best-effort: skip malformed item
             continue
 
     return out
 
 
-# --------------------
-# Quantize helper
-# --------------------
 def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
+    """
+    Quantize a raw quantity to the nearest valid step size and respect min_qty.
+    """
     if qty is None:
         return 0.0
     qty_d = Decimal(str(qty))
@@ -280,278 +279,61 @@ def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) ->
     return float(quant)
 
 
-# --------------------
-# MACD computation (ROBUST & ENHANCED)
-# --------------------
-def _is_finite_number(x: Any) -> bool:
-    try:
-        v = float(x)
-        return math.isfinite(v)
-    except Exception:
-        return False
-
-
-def _clean_hist(hist: Any) -> List[float]:
-    out: List[float] = []
-    if hist is None:
-        return out
-    try:
-        if hasattr(hist, "tolist"):
-            iterable = hist.tolist()
-        else:
-            iterable = list(hist) if not isinstance(hist, (str, bytes)) else [hist]
-    except Exception:
-        try:
-            iterable = list(hist)
-        except Exception:
-            iterable = [hist]
-    for x in iterable:
-        try:
-            if x is None:
-                continue
-            v = float(x)
-            if math.isnan(v) or not math.isfinite(v):
-                continue
-            out.append(v)
-        except Exception:
-            continue
-    return out
-
-
-def _fallback_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float], List[float]]:
+def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None):
     """
-    Pure-Python MACD calculation using EMA.
-    Robust implementation with better handling of edge cases.
+    Compute MACD histogram from a list of closes (floats).
+    include_price: when provided, overwrites the last close value with current price.
+    Returns: (macd_line, signal_line, hist) â€” each as list-like (macd_histogram implementation dependent)
     """
-    if not closes:
-        return [], [], []
-    
-    def ema(values: List[float], period: int) -> List[float]:
-        """Calculate EMA with proper initialization."""
-        if not values or period < 1:
-            return []
-        
-        out: List[float] = []
-        alpha = 2.0 / (period + 1.0)
-        
-        # Initialize with SMA of first 'period' values
-        if len(values) < period:
-            # If we have fewer values than period, use simple average
-            sma_val = sum(values) / len(values)
-            for v in values:
-                out.append(sma_val)
-            return out
-        
-        # Calculate initial SMA
-        sma_val = sum(values[:period]) / period
-        out.append(sma_val)
-        
-        # EMA for remaining values
-        for v in values[period:]:
-            sma_val = (float(v) * alpha) + (sma_val * (1.0 - alpha))
-            out.append(sma_val)
-        
-        return out
-    
-    try:
-        # Calculate EMAs
-        fast_ema = ema(closes, fast)
-        slow_ema = ema(closes, slow)
-        
-        if not fast_ema or not slow_ema or len(fast_ema) < slow or len(slow_ema) < slow:
-            print(f"[MACD_DEBUG] EMA calculation failed: fast_len={len(fast_ema)}, slow_len={len(slow_ema)}, need>={slow}")
-            return [], [], []
-        
-        # Calculate MACD line
-        macd_series = [f - s for f, s in zip(fast_ema, slow_ema)]
-        
-        # Calculate Signal line (EMA of MACD)
-        signal_series = ema(macd_series, signal)
-        
-        if not signal_series:
-            print(f"[MACD_DEBUG] Signal line calculation failed")
-            return [], [], []
-        
-        # Calculate Histogram
-        hist_series = [m - s for m, s in zip(macd_series, signal_series)]
-        
-        print(f"[MACD_DEBUG] Fallback MACD calculated: closes={len(closes)}, macd={len(macd_series)}, signal={len(signal_series)}, hist={len(hist_series)}")
-        if hist_series:
-            print(f"[MACD_DEBUG] Last 3 histogram values: {hist_series[-3:] if len(hist_series) >= 3 else hist_series}")
-        
-        return macd_series, signal_series, hist_series
-    except Exception as e:
-        print(f"[MACD_ERROR] Fallback MACD failed: {e}")
-        return [], [], []
-
-
-def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None, fast: int = 12, slow: int = 26, signal: int = 9):
-    """
-    Returns (macd_last, signal_last, hist_list) where hist_list is oldest->newest plain list.
-    
-    ENHANCED: Better validation, logging, and fallback handling.
-    """
-    # ============ ENHANCED: Input validation ============
     data: List[float] = []
     for c in closes:
         try:
             if c is None:
                 continue
-            val = float(c)
-            if math.isfinite(val):  # Filter NaN/inf
-                data.append(val)
+            data.append(float(c))
         except Exception:
             continue
-    
-    print(f"[MACD_INPUT] Input closes: {len(closes)} raw, {len(data)} valid finite values")
-    
-    # ============ ENHANCED: Minimum window check ============
-    min_window = slow + signal  # 26 + 9 = 35 minimum
-    # Previously code returned early if len(data) < min_window. That prevented fallback from running.
-    # Let the fallback attempt computation even with fewer-than-recommended samples; warn accordingly.
-    if len(data) < slow:
-        print(f"[MACD_UNDERFLOW] WARNING: {len(data)} closes < slow ({slow}). Will attempt MACD fallback; results may be noisy.")
-    elif len(data) < min_window:
-        print(f"[MACD_INFO] Only {len(data)} closes (< recommended {min_window}) available; will attempt fallback MACD computation.")
 
     if include_price is not None:
-        try:
-            current_price = float(include_price)
-            if math.isfinite(current_price):
-                # Replace last close with current price for real-time calculation
-                if data:
-                    data[-1] = current_price
-                    print(f"[MACD_INPUT] Included current price: {current_price}")
-                else:
-                    # no closes present; include current price as single value
-                    data.append(current_price)
-                    print(f"[MACD_INPUT] No historical closes; using current price as single data point: {current_price}")
-        except Exception:
-            pass
+        current_price = float(include_price)
+        if data:
+            data[-1] = current_price
+        else:
+            data.append(current_price)
 
-    # ============ Try external macd_histogram helper first ============
-    if macd_histogram is not None:
-        try:
-            print(f"[MACD_ATTEMPT] Trying external macd_histogram helper with {len(data)} closes...")
-            macd_line_raw, signal_line_raw, hist_raw = macd_histogram(data)
-            hist_list = _clean_hist(hist_raw)
-            
-            macd_last = None
-            signal_last = None
-            
-            try:
-                if hasattr(macd_line_raw, "__len__") and len(macd_line_raw):
-                    macd_last = float(macd_line_raw[-1])
-            except Exception:
-                pass
-            
-            try:
-                if hasattr(signal_line_raw, "__len__") and len(signal_line_raw):
-                    signal_last = float(signal_line_raw[-1])
-            except Exception:
-                pass
-            
-            if hist_list:
-                print(f"[MACD_SUCCESS] External helper returned {len(hist_list)} histogram values")
-                print(f"[MACD_SUCCESS] Last 3 histogram: {hist_list[-3:] if len(hist_list) >= 3 else hist_list}")
-                return macd_last, signal_last, hist_list
-            else:
-                print(f"[MACD_FAIL] External helper returned empty histogram, falling back to pure Python")
-        except Exception as e:
-            print(f"[MACD_FAIL] External helper failed: {e}, falling back to pure Python")
-
-    # ============ Fallback to pure-python MACD ============
-    print(f"[MACD_FALLBACK] Using pure-Python MACD fallback with {len(data)} closes")
-    macd_series, signal_series, hist_series = _fallback_macd(data, fast=fast, slow=slow, signal=signal)
-    
-    if not hist_series:
-        print(f"[MACD_FAILURE] Pure-Python MACD also failed - returning empty")
-        return None, None, []
-    
-    macd_last = float(macd_series[-1]) if macd_series else None
-    signal_last = float(signal_series[-1]) if signal_series else None
-    
-    print(f"[MACD_RESULT] Fallback MACD computed: hist_len={len(hist_series)}, macd_last={macd_last}, signal_last={signal_last}")
-    if hist_series:
-        print(f"[MACD_RESULT] Last 3 histogram: {hist_series[-3:] if len(hist_series) >= 3 else hist_series}")
-    
-    return macd_last, signal_last, hist_series
-
-
-def _safe_last(v: Any) -> Optional[float]:
-    if v is None:
-        return None
+    macd_line, signal_line, hist = macd_histogram(data)
     try:
-        if hasattr(v, "iloc"):
-            if len(v) == 0:
-                return None
-            val = v.iloc[-1]
-            return float(val) if _is_finite_number(val) else None
-        if hasattr(v, "tolist"):
-            lst = v.tolist()
-            if not lst:
-                return None
-            return float(lst[-1]) if _is_finite_number(lst[-1]) else None
-        if isinstance(v, (list, tuple)):
-            if not v:
-                return None
-            return float(v[-1]) if _is_finite_number(v[-1]) else None
-        return float(v) if _is_finite_number(v) else None
+        hist = [None if v is None else float(v) for v in (hist or [])]
     except Exception:
-        return None
+        pass
+    return macd_line, signal_line, hist
 
 
-# --------------------
-# Flip detection (ROBUST)
-# --------------------
-def detect_flip_current_open(hist: List[float], hist_threshold: Optional[float] = None, std_mult: float = 0.05, abs_min: float = 1e-9, lookback: int = 1) -> bool:
+def detect_flip_current_open(hist: List[float], hist_threshold: float = 0.0) -> bool:
     """
-    Detect zero-cross flip from negative (or <=0) to positive on last candle, with noise gating.
-    ENHANCED: Better logging and threshold handling.
+    Detect zero-cross flip from negative (or <=0) to positive on last candle.
+    hist is a list where last item is most recent.
     """
+    if not hist or len(hist) < 2:
+        return False
+    prev = hist[-2]
+    cur = hist[-1]
+    if prev is None or cur is None:
+        return False
     try:
-        clean = _clean_hist(hist)
-        
-        if not clean:
-            print(f"[FLIP_DEBUG] Empty histogram after cleaning")
-            return False
-        
-        if len(clean) < (lookback + 1):
-            print(f"[FLIP_DEBUG] Insufficient history: {len(clean)} < {lookback + 1}")
-            return False
-        
-        prev = clean[-(lookback + 1)]
-        cur = clean[-1]
-        
-        if prev is None or cur is None:
-            print(f"[FLIP_DEBUG] None values: prev={prev}, cur={cur}")
-            return False
-        
-        # Calculate threshold
-        if hist_threshold is None:
-            try:
-                hist_std = statistics.pstdev(clean) if len(clean) >= 2 else 0.0
-            except Exception:
-                hist_std = 0.0
-            
-            hist_threshold = max(abs_min, abs(hist_std) * std_mult)
-            hist_threshold = min(hist_threshold, 0.01)  # Cap at 1%
-        
-        # Detect flip: prev negative/zero, cur positive above threshold
-        flip = (prev < -1e-9) and (cur > hist_threshold)
-        
-        print(f"[FLIP_DEBUG] prev={prev:.8f}, cur={cur:.8f}, threshold={hist_threshold:.8f}, flip={flip}")
-        
-        return flip
-    except Exception as e:
-        print(f"[FLIP_ERROR] {e}")
+        zero_cross = prev <= 0 and cur > 0
+        return zero_cross
+    except Exception:
         return False
 
 
-# --------------------
-# Volume helper (unchanged)
-# --------------------
 def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
+    """
+    Compute percentage change given a symbol's volume tracking dict:
+      {"current": float, "previous": float}
+    Returns None if insufficient data or prev <= 0. Clamps to 1.0 max.
+    Also prints debug info to console for troubleshooting.
+    """
     try:
         if not vol_data:
             print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
@@ -563,6 +345,7 @@ def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Opti
             return None
         change = (curr_vol - prev_vol) / prev_vol
         result = min(change, 1.0)
+        # Console debug
         try:
             print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
         except Exception:
@@ -573,25 +356,29 @@ def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Opti
         return None
 
 
-# --------------------
-# Indicator wrappers (unchanged)
-# --------------------
+# --- Helper wrappers for indicator functions (work with pandas_ta or bukosabino/ta) ---
 def _safe_sma(df_close, length: int):
     try:
         if _PANDAS_TA_STYLE:
             return _ta_module.sma(df_close, length=length)
         else:
+            # bukosabino style
             return _ta_module.trend.SMAIndicator(df_close, window=int(length)).sma_indicator()
     except Exception:
         return None
 
 
 def _safe_macd(df_close, fast: int, slow: int, signal: int):
+    """
+    Return a DataFrame-like object (or None). Try pandas_ta.macd first, else construct DataFrame for macd, macd_signal, macd_diff.
+    """
     try:
         if _PANDAS_TA_STYLE:
             return _ta_module.macd(df_close, fast=fast, slow=slow, signal=signal)
         else:
+            # bukosabino style: MACD class
             macd_obj = _ta_module.trend.MACD(df_close, window_slow=int(slow), window_fast=int(fast), window_sign=int(signal))
+            # Build dataframe-like structure (pandas Series/Frame) if pandas available
             try:
                 import pandas as _pd
                 df_macd = _pd.DataFrame({
@@ -621,6 +408,7 @@ def _safe_stoch(df_high, df_low, df_close, k: int, d: int):
         if _PANDAS_TA_STYLE:
             return _ta_module.stoch(high=df_high, low=df_low, close=df_close, k=k, d=d)
         else:
+            # bukosabino StochasticOscillator: stoch()
             stoch_obj = _ta_module.momentum.StochasticOscillator(high=df_high, low=df_low, close=df_close, window=int(k), smooth_window=int(d))
             try:
                 import pandas as _pd
@@ -683,11 +471,21 @@ def _safe_bbands(df_close, length: int, std: float):
         return None
 
 
-# --------------------
-# TV rating & MTF alignment
-# --------------------
 def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
-    # Keep original logic but robustly handle missing pandas/pandas_ta
+    """
+    Compute a TradingView-like normalized score using pandas/ta or fallback 'ta' and the TECHNICAL_RATING-style cfg.
+    Inputs:
+      klines: normalized kline dicts (with 'close','open','high','low','volume')
+      cfg: TECHNICAL_RATING config dict (must contain 'indicators' etc.)
+      tf: optional timeframe string (not used by computation but kept for compatibility)
+      price: optional current price to apply to last close
+    Returns: (score, label)
+
+    This function prints concise debug messages to console describing why computation
+    may have returned a neutral score (missing libs, insufficient candles, conversion errors),
+    and prints the final computed score when successful.
+    """
+    # Debug start
     try:
         print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE} pandas_ta_style={_PANDAS_TA_STYLE}")
     except Exception:
@@ -731,6 +529,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             except Exception:
                 pass
 
+        # Indicators computation with debug markers using safe wrappers
         try:
             ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
             for l in ma_lengths:
@@ -742,10 +541,12 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
             macd_result = _safe_macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
             if macd_result is not None and hasattr(macd_result, "columns") and len(macd_result.columns) > 0:
+                # try to find a histogram-like column
                 macd_hist_col = next((c for c in macd_result.columns if "MACD" in str(c).upper() and ("H" in str(c).upper() or "diff" in str(c).lower())), None)
                 if macd_hist_col:
                     df["macd_hist"] = macd_result[macd_hist_col]
                 else:
+                    # fall back to last column
                     df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
                 df["macd_hist"] = 0.0
@@ -802,7 +603,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
             print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
             return 0.0, "Neutral"
 
-        # scoring (same as original logic)
+        # Scoring
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
@@ -884,6 +685,7 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
         elif score <= t["sell"]:
             label = "Sell"
 
+        # Final debug output
         try:
             print(f"[TV_DEBUG] tf={tf} score={score:.4f} label={label}")
         except Exception:
@@ -895,6 +697,13 @@ def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], 
 
 
 def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
+    """
+    Evaluate MTF alignment across timeframes.
+    get_closes_fn(tf) -> list of closes for that tf (most recent last).
+    price: include_price applied to MACD calculations.
+    mtf_tfs: list of TFs to evaluate (e.g., ["5","15","60","240","D"])
+    mtf_slope_lookback: lookback for daily slope
+    """
     tf_states: Dict[str, Dict[str, AnyT]] = {}
     negative_tfs: List[str] = []
     one_d_hist: List[float] = []
@@ -907,6 +716,7 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
         prev = hist[-2] if len(hist) >= 2 else None
         is_positive = cur is not None and cur > 0
         is_flip = (prev is not None and prev < 0 and cur is not None and cur > 0)
+
         tf_states[tf] = {"cur": cur, "prev": prev, "is_positive": is_positive, "is_flip": is_flip, "slope": None}
         if tf == "D":
             one_d_hist = hist
@@ -917,9 +727,9 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
         return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
 
     if negative_tfs == ["D"]:
-        if slope is not None:
-            one_d_slope = slope(one_d_hist, lookback=mtf_slope_lookback) if one_d_hist else None
-            if one_d_slope is not None and one_d_slope > 0:
-                tf_states["D"]["slope"] = one_d_slope
-                return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
+        one_d_slope = slope(one_d_hist, lookback=mtf_slope_lookback) if one_d_hist else None
+        if one_d_slope is not None and one_d_slope > 0:
+            tf_states["D"]["slope"] = one_d_slope
+            return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
+
     return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}

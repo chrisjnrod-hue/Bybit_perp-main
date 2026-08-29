@@ -144,18 +144,12 @@ class BybitClient:
 
         for iv in variants:
             try:
-                # Add category param (required/expected by some Bybit V5 endpoints)
-                params = {"symbol": symbol, "interval": iv, "limit": limit, "category": "linear"}
-                logger.debug("[V5_KLINE_REQ] %s %s params=%s", symbol, iv, params)
+                params = {"symbol": symbol, "interval": iv, "limit": limit}
+                logger.info("[V5_KLINE] %s %s limit=%d", symbol, iv, limit)
                 data = await self._get("/v5/market/kline", params=params)
                 
                 if not data:
-                    logger.debug("[V5_KLINE] Empty response for %s %s (raw None/empty)", symbol, iv)
-                    continue
-
-                # If API returned an error structure, surface it
-                if isinstance(data, dict) and data.get("ret_code", 0) != 0:
-                    logger.warning("[V5_KLINE] API returned error for %s %s: ret_code=%s ret_msg=%s raw=%s", symbol, iv, data.get("ret_code"), data.get("ret_msg"), json.dumps(data)[:1000])
+                    logger.debug("[V5_KLINE] Empty response for %s %s", symbol, iv)
                     continue
 
                 if isinstance(data, dict):
@@ -184,120 +178,70 @@ class BybitClient:
         try:
             params = {"symbol": symbol}
             data = await self._get("/v5/market/tickers", params=params)
-            
-            if not isinstance(data, dict):
-                logger.warning("[PRICE] get_latest_price: response is not dict for %s", symbol)
-                return None
-            
-            # Check ret_code for API errors
-            if data.get("ret_code") != 0:
-                logger.warning("[PRICE] get_latest_price: API error ret_code=%s for %s", data.get("ret_code"), symbol)
-                return None
-            
-            result = data.get("result")
-            if not result:
-                logger.warning("[PRICE] get_latest_price: no 'result' key in response for %s", symbol)
-                return None
-            
-            # Handle nested list structure: result = { "list": [{ "lastPrice": "...", ... }] }
-            entry = None
-            if isinstance(result, dict) and "list" in result:
-                lst = result["list"]
-                if isinstance(lst, list) and len(lst) > 0:
-                    entry = lst[0]
-            elif isinstance(result, list) and len(result) > 0:
-                entry = result[0]
-            elif isinstance(result, dict):
-                entry = result
-            
-            if not entry or not isinstance(entry, dict):
-                logger.warning("[PRICE] get_latest_price: could not extract entry from result for %s", symbol)
-                return None
-            
-            price = entry.get("lastPrice") or entry.get("last_price")
-            if price is None:
-                logger.warning("[PRICE] get_latest_price: no lastPrice field in entry for %s. Keys: %s", 
-                             symbol, list(entry.keys())[:10])
-                return None
-            
-            try:
-                price_float = float(price)
-                logger.debug("[PRICE] get_latest_price: %s = %.8f", symbol, price_float)
-                return price_float
-            except (ValueError, TypeError) as e:
-                logger.warning("[PRICE] get_latest_price: could not convert lastPrice to float for %s: %s (value=%s)", 
-                             symbol, e, price)
-                return None
+            if isinstance(data, dict) and "result" in data:
+                res = data["result"]
+                entry = None
+                if isinstance(res, list) and len(res) > 0:
+                    entry = res[0]
+                elif isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and len(res["list"]) > 0:
+                    entry = res["list"][0]
+                elif isinstance(res, dict):
+                    entry = res
                 
-        except Exception as e:
-            logger.exception("[PRICE] get_latest_price error for %s: %s", symbol, e)
-            return None
+                if entry and isinstance(entry, dict):
+                    for k in ("lastPrice", "last_price"):
+                        if k in entry and entry[k] is not None:
+                            try:
+                                return float(entry[k])
+                            except Exception:
+                                continue
+        except Exception:
+            logger.exception("get_latest_price error for %s", symbol)
+        return None
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Fetch 24h ticker using v5 API only"""
         try:
             params = {"symbol": symbol, "category": "linear"}
             data = await self._get("/v5/market/tickers", params=params)
-            
-            if not isinstance(data, dict):
-                logger.warning("[TICKER] get_24h_ticker: response is not dict for %s", symbol)
-                return None
-            
-            # Check ret_code for API errors
-            if data.get("ret_code") != 0:
-                logger.warning("[TICKER] get_24h_ticker: API error ret_code=%s for %s", data.get("ret_code"), symbol)
-                return None
-            
-            result = data.get("result")
-            if not result:
-                logger.warning("[TICKER] get_24h_ticker: no 'result' key in response for %s", symbol)
-                return None
-            
-            # Handle nested list structure: result = { "list": [{ ... }] }
-            entry = None
-            if isinstance(result, dict) and "list" in result:
-                lst = result["list"]
-                if isinstance(lst, list) and len(lst) > 0:
-                    entry = lst[0]
-            elif isinstance(result, list) and len(result) > 0:
-                entry = result[0]
-            elif isinstance(result, dict):
-                entry = result
-            
-            if not entry or not isinstance(entry, dict):
-                logger.warning("[TICKER] get_24h_ticker: could not extract entry from result for %s", symbol)
-                return None
-            
-            def _f(v):
-                try:
-                    return float(v) if v is not None else None
-                except Exception:
-                    return None
+            if isinstance(data, dict) and "result" in data:
+                res = data["result"]
+                entry = None
+                if isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and res["list"]:
+                    entry = res["list"][0]
+                elif isinstance(res, list) and res:
+                    entry = res[0]
+                elif isinstance(res, dict):
+                    entry = res
 
-            vol24h = _f(entry.get("volume24h"))
-            turnover24h = _f(entry.get("turnover24h"))
-            price_pct = _f(entry.get("price24hPcnt"))
-            prev_vol = _f(entry.get("prevVolume24h"))
+                if entry and isinstance(entry, dict):
+                    def _f(v):
+                        try:
+                            return float(v) if v is not None else None
+                        except Exception:
+                            return None
 
-            vol_pct = None
-            if vol24h is not None and prev_vol is not None and prev_vol > 0:
-                vol_pct = (vol24h - prev_vol) / prev_vol
+                    vol24h = _f(entry.get("volume24h"))
+                    turnover24h = _f(entry.get("turnover24h"))
+                    price_pct = _f(entry.get("price24hPcnt"))
+                    prev_vol = _f(entry.get("prevVolume24h"))
 
-            logger.debug("[TICKER] get_24h_ticker: %s vol24h=%.0f turnover24h=%.0f vol_pct=%s", 
-                        symbol, vol24h or 0, turnover24h or 0, vol_pct)
+                    vol_pct = None
+                    if vol24h is not None and prev_vol is not None and prev_vol > 0:
+                        vol_pct = (vol24h - prev_vol) / prev_vol
 
-            return {
-                "symbol": symbol,
-                "volume24h": vol24h,
-                "turnover24h": turnover24h,
-                "price24hPcnt": price_pct,
-                "volume24hPcnt": vol_pct,
-                "prevVolume24h": prev_vol,
-                "raw": entry,
-            }
-        except Exception as e:
-            logger.exception("[TICKER] get_24h_ticker error for %s: %s", symbol, e)
-            return None
+                    return {
+                        "symbol": symbol,
+                        "volume24h": vol24h,
+                        "turnover24h": turnover24h,
+                        "price24hPcnt": price_pct,
+                        "volume24hPcnt": vol_pct,
+                        "prevVolume24h": prev_vol,
+                        "raw": entry,
+                    }
+        except Exception:
+            logger.exception("get_24h_ticker error for %s", symbol)
+        return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
         """Fetch all perpetual instruments using v5 API with pagination"""

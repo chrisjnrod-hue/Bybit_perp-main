@@ -1,9 +1,8 @@
-# bybit_client.py - V5 API ONLY
+# bybit_client.py - V5 API ONLY (cleaned/robust)
 import os
 import asyncio
 import json
 import time
-import traceback
 from typing import List, Dict, Any, Optional
 from collections import defaultdict, deque
 
@@ -113,16 +112,9 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
-    # ===== V5 KLINES - NO V2 FALLBACK =====
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
-        """
-        Get klines using v5 API ONLY.
-        Interval format: numeric ("5", "15", "60", "240") or "D" for daily.
-        """
         variants = []
         s = str(interval).strip().lower()
-        
-        # Support both formats: "5" and "5m"
         if s.endswith("m"):
             variants.append(s)
             try:
@@ -135,23 +127,23 @@ class BybitClient:
                 variants.append(f"{int(s)}m")
             except Exception:
                 pass
-        
         if s in ("1d", "d", "day", "D"):
             variants.extend(["D", "1d", "d"])
-        
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
         for iv in variants:
             try:
-                params = {"symbol": symbol, "interval": iv, "limit": limit}
-                logger.info("[V5_KLINE] %s %s limit=%d", symbol, iv, limit)
+                # include category param to be compatible with v5
+                params = {"symbol": symbol, "interval": iv, "limit": limit, "category": "linear"}
+                logger.debug("[V5_KLINE_REQ] %s %s params=%s", symbol, iv, params)
                 data = await self._get("/v5/market/kline", params=params)
-                
                 if not data:
-                    logger.debug("[V5_KLINE] Empty response for %s %s", symbol, iv)
+                    logger.debug("[V5_KLINE] Empty response for %s %s (raw None/empty)", symbol, iv)
                     continue
-
+                if isinstance(data, dict) and data.get("ret_code", 0) != 0:
+                    logger.warning("[V5_KLINE] API returned error for %s %s: %s", symbol, iv, json.dumps(data)[:1000])
+                    continue
                 if isinstance(data, dict):
                     if "ret_code" in data and data.get("ret_code", 0) == 0 and "result" in data:
                         res = data["result"]
@@ -174,81 +166,104 @@ class BybitClient:
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
-        """Get latest price using v5 API only"""
         try:
             params = {"symbol": symbol}
             data = await self._get("/v5/market/tickers", params=params)
-            if isinstance(data, dict) and "result" in data:
-                res = data["result"]
-                entry = None
-                if isinstance(res, list) and len(res) > 0:
-                    entry = res[0]
-                elif isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and len(res["list"]) > 0:
-                    entry = res["list"][0]
-                elif isinstance(res, dict):
-                    entry = res
-                
-                if entry and isinstance(entry, dict):
-                    for k in ("lastPrice", "last_price"):
-                        if k in entry and entry[k] is not None:
-                            try:
-                                return float(entry[k])
-                            except Exception:
-                                continue
-        except Exception:
-            logger.exception("get_latest_price error for %s", symbol)
-        return None
+            if not isinstance(data, dict):
+                logger.warning("[PRICE] get_latest_price: response is not dict for %s", symbol)
+                return None
+            if data.get("ret_code") != 0:
+                logger.warning("[PRICE] get_latest_price: API error ret_code=%s for %s", data.get("ret_code"), symbol)
+                return None
+            result = data.get("result")
+            if not result:
+                logger.warning("[PRICE] get_latest_price: no 'result' key in response for %s", symbol)
+                return None
+            entry = None
+            if isinstance(result, dict) and "list" in result:
+                lst = result["list"]
+                if isinstance(lst, list) and len(lst) > 0:
+                    entry = lst[0]
+            elif isinstance(result, list) and len(result) > 0:
+                entry = result[0]
+            elif isinstance(result, dict):
+                entry = result
+            if not entry or not isinstance(entry, dict):
+                logger.warning("[PRICE] get_latest_price: could not extract entry from result for %s", symbol)
+                return None
+            price = entry.get("lastPrice") or entry.get("last_price")
+            if price is None:
+                logger.warning("[PRICE] get_latest_price: no lastPrice field in entry for %s. Keys: %s", symbol, list(entry.keys())[:10])
+                return None
+            try:
+                price_float = float(price)
+                logger.debug("[PRICE] get_latest_price: %s = %.8f", symbol, price_float)
+                return price_float
+            except (ValueError, TypeError) as e:
+                logger.warning("[PRICE] get_latest_price: could not convert lastPrice to float for %s: %s (value=%s)", symbol, e, price)
+                return None
+        except Exception as e:
+            logger.exception("[PRICE] get_latest_price error for %s: %s", symbol, e)
+            return None
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetch 24h ticker using v5 API only"""
         try:
             params = {"symbol": symbol, "category": "linear"}
             data = await self._get("/v5/market/tickers", params=params)
-            if isinstance(data, dict) and "result" in data:
-                res = data["result"]
-                entry = None
-                if isinstance(res, dict) and "list" in res and isinstance(res["list"], list) and res["list"]:
-                    entry = res["list"][0]
-                elif isinstance(res, list) and res:
-                    entry = res[0]
-                elif isinstance(res, dict):
-                    entry = res
+            if not isinstance(data, dict):
+                logger.warning("[TICKER] get_24h_ticker: response is not dict for %s", symbol)
+                return None
+            if data.get("ret_code") != 0:
+                logger.warning("[TICKER] get_24h_ticker: API error ret_code=%s for %s", data.get("ret_code"), symbol)
+                return None
+            result = data.get("result")
+            if not result:
+                logger.warning("[TICKER] get_24h_ticker: no 'result' key in response for %s", symbol)
+                return None
+            entry = None
+            if isinstance(result, dict) and "list" in result and isinstance(result["list"], list) and len(result["list"]) > 0:
+                entry = result["list"][0]
+            elif isinstance(result, list) and result:
+                entry = result[0]
+            elif isinstance(result, dict):
+                entry = result
+            if not entry or not isinstance(entry, dict):
+                logger.warning("[TICKER] get_24h_ticker: could not extract entry from result for %s", symbol)
+                return None
 
-                if entry and isinstance(entry, dict):
-                    def _f(v):
-                        try:
-                            return float(v) if v is not None else None
-                        except Exception:
-                            return None
+            def _f(v):
+                try:
+                    return float(v) if v is not None else None
+                except Exception:
+                    return None
 
-                    vol24h = _f(entry.get("volume24h"))
-                    turnover24h = _f(entry.get("turnover24h"))
-                    price_pct = _f(entry.get("price24hPcnt"))
-                    prev_vol = _f(entry.get("prevVolume24h"))
+            vol24h = _f(entry.get("volume24h"))
+            turnover24h = _f(entry.get("turnover24h"))
+            price_pct = _f(entry.get("price24hPcnt"))
+            prev_vol = _f(entry.get("prevVolume24h"))
 
-                    vol_pct = None
-                    if vol24h is not None and prev_vol is not None and prev_vol > 0:
-                        vol_pct = (vol24h - prev_vol) / prev_vol
+            vol_pct = None
+            if vol24h is not None and prev_vol is not None and prev_vol > 0:
+                vol_pct = (vol24h - prev_vol) / prev_vol
 
-                    return {
-                        "symbol": symbol,
-                        "volume24h": vol24h,
-                        "turnover24h": turnover24h,
-                        "price24hPcnt": price_pct,
-                        "volume24hPcnt": vol_pct,
-                        "prevVolume24h": prev_vol,
-                        "raw": entry,
-                    }
+            logger.debug("[TICKER] get_24h_ticker: %s vol24h=%.0f turnover24h=%.0f vol_pct=%s", symbol, vol24h or 0, turnover24h or 0, vol_pct)
+            return {
+                "symbol": symbol,
+                "volume24h": vol24h,
+                "turnover24h": turnover24h,
+                "price24hPcnt": price_pct,
+                "volume24hPcnt": vol_pct,
+                "prevVolume24h": prev_vol,
+                "raw": entry,
+            }
         except Exception:
-            logger.exception("get_24h_ticker error for %s", symbol)
-        return None
+            logger.exception("[TICKER] get_24h_ticker error for %s", symbol)
+            return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
-        """Fetch all perpetual instruments using v5 API with pagination"""
         try:
             all_instruments = []
             cursor = None
-
             while True:
                 params = {
                     "category": "linear",
@@ -257,32 +272,25 @@ class BybitClient:
                 }
                 if cursor:
                     params["cursor"] = cursor
-
                 logger.info("[V5_SYMBOLS] Fetching page (cursor=%s)", cursor)
                 data = await self._get("/v5/market/instruments-info", params=params)
-
                 if not isinstance(data, dict):
                     logger.warning("[V5_SYMBOLS] Invalid response type: %s", type(data))
                     break
-
                 result = data.get("result", {})
                 instruments = result.get("list", [])
-
                 if instruments:
                     all_instruments.extend(instruments)
                     logger.info("[V5_SYMBOLS] Page returned %d instruments, total=%d", len(instruments), len(all_instruments))
-
                 cursor = result.get("nextPageCursor")
                 if not cursor:
                     break
-
             if all_instruments:
                 logger.info("[V5_SYMBOLS_SUCCESS] Found %d total instruments", len(all_instruments))
                 return all_instruments
             else:
                 logger.warning("[V5_SYMBOLS] No instruments found")
                 return []
-
         except Exception:
             logger.exception("[V5_SYMBOLS_ERROR] get_symbols failed")
             return []
@@ -292,7 +300,6 @@ class BybitClient:
             syms = await self.get_symbols()
             if not syms:
                 return {}
-            
             target = None
             for it in syms:
                 if isinstance(it, dict):
@@ -300,22 +307,18 @@ class BybitClient:
                     if name and name.upper() == symbol.upper():
                         target = it
                         break
-
             if not target:
                 logger.warning("Symbol %s not found in instruments", symbol)
                 return {}
-
             info: Dict[str, Any] = {}
             if isinstance(target, dict):
                 step = None
                 min_qty = None
-                
                 for key in ("lotSizeFilter", "priceFilter"):
                     filt = target.get(key)
                     if isinstance(filt, dict):
                         step = step or filt.get("qtyStep")
                         min_qty = min_qty or filt.get("minOrderQty")
-                
                 try:
                     if step is not None:
                         step = float(step)
@@ -326,7 +329,6 @@ class BybitClient:
                         min_qty = float(min_qty)
                 except Exception:
                     min_qty = None
-
                 info["step"] = step
                 info["min_qty"] = min_qty
                 info["raw"] = target
@@ -336,7 +338,6 @@ class BybitClient:
             return {}
 
     async def get_balance(self, coin: str = "USDT") -> Optional[float]:
-        """Get wallet balance using v5 API"""
         try:
             params = {"coin": coin}
             data = await self._get("/v5/account/wallet-balance", params=params)
@@ -358,7 +359,6 @@ class BybitClient:
         return None
 
     async def create_order(self, symbol: str, side: str, qty: float, price: Optional[float] = None) -> Optional[Dict[str, Any]]:
-        """Create order using v5 API"""
         try:
             params = {
                 "category": "linear",
@@ -369,7 +369,6 @@ class BybitClient:
             }
             if price is not None:
                 params["price"] = str(price)
-            
             data = await self._get("/v5/order/create", params=params)
             if isinstance(data, dict) and data.get("ret_code") == 0:
                 return data.get("result")
@@ -377,7 +376,7 @@ class BybitClient:
             logger.exception("create_order error for %s %s %s", symbol, side, qty)
         return None
 
-    # ===== WEBSOCKET =====
+    # WEBSOCKET helpers (kept robust and defensive)
     def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
         s = str(tf).strip().lower()
         variants = [s]
@@ -388,7 +387,6 @@ class BybitClient:
                 variants.append(str(int(s[:-1])))
         except Exception:
             pass
-        
         tops = []
         for iv in variants:
             tops.extend([
@@ -396,7 +394,6 @@ class BybitClient:
                 f"klineV2.{iv}.{symbol}",
                 f"public.kline.{iv}.{symbol}",
             ])
-        
         seen = set()
         out = []
         for t in tops:
@@ -477,7 +474,6 @@ class BybitClient:
                     return True
                 except Exception as e:
                     logger.debug("WS subscribe failed for %s: %s", topic, e)
-        
         key = (symbol, tf)
         if key not in self._requested_subs:
             self._requested_subs.add(key)
@@ -494,13 +490,10 @@ class BybitClient:
                 except Exception:
                     pass
                 return
-
             topic = msg.get("topic") or msg.get("arg")
             data = msg.get("data")
-            
             if not data and isinstance(msg.get("result"), dict) and "data" in msg["result"]:
                 data = msg["result"]["data"]
-
             if topic and data:
                 parts = str(topic).split(".")
                 if len(parts) >= 3:
@@ -511,10 +504,8 @@ class BybitClient:
                         return
                     symbol = None
                     tf = None
-                
                 if not symbol or not tf:
                     return
-                
                 self._ensure_cache_slot(symbol, tf)
                 seq = data if isinstance(data, (list, tuple)) else [data]
                 for entry in seq:
@@ -565,17 +556,14 @@ class BybitClient:
                         self._ws_backoff = 1.0
                         connected = True
                         logger.info("WS connected to %s", ws_url)
-
                         pending = []
                         while not self._pending_subscribe.empty():
                             try:
                                 pending.append(self._pending_subscribe.get_nowait())
                             except Exception:
                                 break
-                        
                         for (sym, tf) in list(self._requested_subs):
                             pending.append(("subscribe", sym, tf))
-
                         for op, sym, tf in pending:
                             if op != "subscribe":
                                 continue
@@ -585,7 +573,6 @@ class BybitClient:
                                     logger.debug("WS subscribe: %s", topic)
                                 except Exception:
                                     logger.debug("Failed to subscribe to %s", topic, exc_info=True)
-
                         async def ping_loop():
                             try:
                                 while True:
@@ -596,9 +583,7 @@ class BybitClient:
                                         break
                             except asyncio.CancelledError:
                                 return
-
                         ping_task = asyncio.create_task(ping_loop())
-
                         async for raw in ws:
                             if raw.type == aiohttp.WSMsgType.TEXT:
                                 try:
@@ -612,12 +597,10 @@ class BybitClient:
                             elif raw.type == aiohttp.WSMsgType.CLOSED:
                                 logger.info("WS closed")
                                 break
-
                         try:
                             ping_task.cancel()
                         except Exception:
                             pass
-
                 except client_exceptions.WSServerHandshakeError as wh:
                     logger.warning("WS handshake failed for %s: %s", ws_url, wh)
                     continue
@@ -634,15 +617,12 @@ class BybitClient:
                     except Exception:
                         pass
                     self._ws = None
-
                 if connected:
                     break
-
             if not connected:
                 logger.error("All WS endpoints failed; backing off %.1fs", self._ws_backoff)
                 await asyncio.sleep(self._ws_backoff)
                 self._ws_backoff = min(self._ws_backoff * 2.0, 120.0)
-
         logger.info("WS loop exited")
 
     async def get_ws_klines(self, symbol: str, tf: str) -> List[Dict[str, Any]]:

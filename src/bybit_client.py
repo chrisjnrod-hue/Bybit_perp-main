@@ -183,8 +183,8 @@ class BybitClient:
                 logger.warning("[PRICE] get_latest_price: response is not dict for %s", symbol)
                 return None
             
-            # Check ret_code for API errors
-            if data.get("ret_code") != 0:
+            # Check ret_code for API errors if present
+            if "ret_code" in data and data.get("ret_code") != 0:
                 logger.warning("[PRICE] get_latest_price: API error ret_code=%s for %s", data.get("ret_code"), symbol)
                 return None
             
@@ -210,8 +210,8 @@ class BybitClient:
                 logger.warning("[PRICE] get_latest_price: could not extract entry from result for %s", symbol)
                 return None
             
-            # Extract price from the entry
-            price = entry.get("lastPrice") or entry.get("last_price")
+            # Extract price from the entry, support multiple key variants
+            price = entry.get("lastPrice") or entry.get("last_price") or entry.get("last") or entry.get("price")
             if price is None:
                 logger.warning("[PRICE] get_latest_price: no lastPrice field in entry for %s. Keys: %s", 
                              symbol, list(entry.keys())[:10])
@@ -241,7 +241,7 @@ class BybitClient:
                 return None
             
             # Check ret_code for API errors
-            if data.get("ret_code") != 0:
+            if "ret_code" in data and data.get("ret_code") != 0:
                 logger.warning("[TICKER] get_24h_ticker: API error ret_code=%s for %s", data.get("ret_code"), symbol)
                 return None
             
@@ -530,8 +530,14 @@ class BybitClient:
                     await self._ws.send_json({"op": "subscribe", "args": [topic]})
                     logger.debug("WS subscribed: %s", topic)
                     return True
-                except Exception as e:
-                    logger.debug("WS subscribe failed for %s: %s", topic, e)
+                except Exception:
+                    # log full stack and requeue the subscription to ensure retry
+                    logger.exception("WS subscribe failed for %s; requeueing subscription", topic)
+                    try:
+                        await self._pending_subscribe.put(("subscribe", symbol, tf))
+                    except Exception:
+                        logger.exception("Failed to requeue subscription for %s %s", symbol, tf)
+                    continue
         
         key = (symbol, tf)
         if key not in self._requested_subs:
@@ -541,13 +547,18 @@ class BybitClient:
 
     async def _handle_ws_message(self, msg: Dict[str, Any]):
         try:
+            # Log admin / request responses so we can see why subscription attempts succeed/fail
             if msg.get("success") is not None and "request" in msg:
+                try:
+                    logger.info("WS admin response: success=%s request=%s ret_msg=%s full=%s", msg.get("success"), msg.get("request"), msg.get("ret_msg", msg.get("error", None)), json.dumps(msg)[:1000])
+                except Exception:
+                    logger.info("WS admin response (small): %s", str(msg)[:500])
                 return
             if "ping" in msg:
                 try:
                     await self._ws.send_json({"pong": msg["ping"]})
                 except Exception:
-                    pass
+                    logger.exception("Failed to send WS pong")
                 return
 
             topic = msg.get("topic") or msg.get("arg")
@@ -639,7 +650,11 @@ class BybitClient:
                                     await ws.send_json({"op": "subscribe", "args": [topic]})
                                     logger.debug("WS subscribe: %s", topic)
                                 except Exception:
-                                    logger.debug("Failed to subscribe to %s", topic, exc_info=True)
+                                    logger.exception("Failed to subscribe to %s; requeueing", topic)
+                                    try:
+                                        await self._pending_subscribe.put(("subscribe", sym, tf))
+                                    except Exception:
+                                        logger.exception("Failed to requeue subscribe for %s %s", sym, tf)
 
                         async def ping_loop():
                             try:
@@ -648,6 +663,7 @@ class BybitClient:
                                     try:
                                         await ws.send_json({"op": "ping"})
                                     except Exception:
+                                        logger.exception("WS ping failed; breaking ping loop")
                                         break
                             except asyncio.CancelledError:
                                 return

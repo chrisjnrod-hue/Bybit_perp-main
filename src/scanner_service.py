@@ -77,27 +77,7 @@ class Scanner:
     def __init__(self):
         self.rate_limiter = TokenBucket(max(1.0, float(1)))
         self.client = BybitClient(rate_limiter=self.rate_limiter)
-
-        # Build TradeManager config mapping from existing module constants / env
-        tm_config = {
-            "STATE_FILE": os.getenv("TRADE_STATE_FILE", "open_trades.json"),
-            "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
-            "MIN_MARKET_CAP": MARKET_CAP_MIN or 0,
-            "TP_PERCENT": float(os.getenv("TP_PERCENT", "2.0")),
-            "SL_PERCENT": float(os.getenv("SL_PERCENT", "1.0")),
-            "BREAKEVEN_TRIGGER_PERCENT": float(os.getenv("BREAKEVEN_TRIGGER_PERCENT", "0.5")),
-            "BREAKEVEN_HIGHER_LOWS": os.getenv("BREAKEVEN_HIGHER_LOWS", "1") in ("1", "true", "True"),
-            "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-            "MAX_SPREAD_PERCENT": float(os.getenv("MAX_SPREAD_PERCENT", "0.1")),
-            "MAX_SLIPPAGE": float(os.getenv("MAX_SLIPPAGE", "0.2")),
-            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
-            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
-            # SIMULATED is true if TRADE_ENABLED is False or credentials missing
-            "SIMULATED": not bool(TRADE_ENABLED) or not bool(getattr(self.client, "api_key", None)) or not bool(getattr(self.client, "api_secret", None)),
-        }
-
-        self.trade_manager = TradeManager(self.client, tm_config)
-
+        self.trade_manager = TradeManager()
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
         self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
@@ -401,8 +381,7 @@ class Scanner:
                     except Exception:
                         txt = str(raw)
                     snippet_trunc = (txt[:500] + '...') if len(txt) > 500 else txt
-                    # CHANGED: raise visibility to warning so problematic raw responses show up in logs
-                    logger.warning("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
+                    logger.debug("Seeded 0 usable candles for %s %s. Raw response (truncated): %s", symbol, tf, snippet_trunc)
                     continue
 
                 try:
@@ -874,73 +853,7 @@ class Scanner:
                                 use_ws_current=True
                             )
 
-                            # Defensive normalization of hist for logging and fallback detection
-                            hist_list: List[float] = []
-                            try:
-                                if hist is None:
-                                    hist_list = []
-                                elif isinstance(hist, (list, tuple)):
-                                    hist_list = [float(x) for x in hist]
-                                else:
-                                    # try to convert numpy arrays or single numeric
-                                    try:
-                                        hist_list = list(map(float, hist))
-                                    except Exception:
-                                        # treat single numeric as one-element list
-                                        hist_list = [float(hist)] if isinstance(hist, (int, float)) else []
-                            except Exception:
-                                hist_list = []
-
-                            # Unconditional MACD snapshot logging for diagnostics
-                            try:
-                                logger.info(
-                                    "[SURGICAL_MACD_SNAPSHOT] %s %s macd=%s signal=%s hist_len=%d last2=%s",
-                                    sym, root,
-                                    ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
-                                    ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
-                                    len(hist_list),
-                                    str(hist_list[-2:]) if hist_list else "[]"
-                                )
-                            except Exception:
-                                logger.debug("Failed to log SURGICAL_MACD_SNAPSHOT for %s %s", sym, root, exc_info=True)
-
-                            # Primary flip detection via helper (best-effort, catch exceptions)
-                            flip = False
-                            try:
-                                flip = bool(self.detect_flip_current_open(hist_list, 0.0, symbol=sym, tf=root))
-                            except Exception:
-                                # fall back silently to our heuristic
-                                flip = False
-
-                            # If primary helper didn't detect a flip, try a conservative heuristic:
-                            # previous histogram < 0 and last histogram > 0 is a strong flip signal.
-                            if not flip:
-                                try:
-                                    if len(hist_list) >= 2:
-                                        prev_h = float(hist_list[-2])
-                                        last_h = float(hist_list[-1])
-                                        if prev_h < 0 and last_h > 0:
-                                            flip = True
-                                        # also detect a decisive jump from <=0 to significantly positive
-                                        elif prev_h <= 0 and last_h > 0 and abs(last_h) > 1e-6:
-                                            flip = True
-                                except Exception:
-                                    flip = False
-
-                            # Surgical logging for diagnostics
-                            if DEBUG_SURGICAL_LOGS:
-                                try:
-                                    logger.info(
-                                        "[SURGICAL_MACD] %s %s macd=%s signal=%s hist_len=%d last2=%s flip=%s",
-                                        sym, root,
-                                        ("%.6f" % macd_line) if isinstance(macd_line, (int, float)) else str(macd_line),
-                                        ("%.6f" % sig) if isinstance(sig, (int, float)) else str(sig),
-                                        len(hist_list),
-                                        str(hist_list[-2:]) if hist_list else "[]",
-                                        flip
-                                    )
-                                except Exception:
-                                    logger.debug("Failed surgical macd log for %s %s", sym, root, exc_info=True)
+                            flip = self.detect_flip_current_open(hist, 0.0, symbol=sym, tf=root)
 
                             logger.info(
                                 "[ROOT_SCAN_RESULT] %s %s: flip_detected=%s",
@@ -949,7 +862,7 @@ class Scanner:
                                 flip
                             )
 
-                            if hist_list and flip:
+                            if hist and flip:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
@@ -978,7 +891,7 @@ class Scanner:
                                     "symbol": sym,
                                     "root": root,
                                     "price": price,
-                                    "hist": hist_list,
+                                    "hist": hist,
                                     "vol_change": vol_change,
                                     "start_at": start_at,
                                     "tv_score": tv_score,
@@ -1296,37 +1209,58 @@ class Scanner:
                     eval["reason"] = "negvol_blocked"
                 continue
 
-            # Get account balance for TradeManager to compute allocation
             try:
                 balance = await self.client.get_balance("USDT")
             except Exception:
                 balance = None
-
-            # Let TradeManager perform checks and execution (or simulation). It returns structured result.
-            try:
-                tm_result = await self.trade_manager.open_trade(sym, "BUY", price, balance)
-            except Exception as e:
-                logger.exception("TradeManager.open_trade raised exception for %s: %s", sym, e)
-                tm_result = {"success": False, "error": str(e)}
-
-            eval = eval_map.get((sym, c["root"]))
-            if tm_result.get("success"):
-                # Opened successfully (or simulated)
-                if eval is not None:
-                    eval["accept"] = True
-                    eval["reason"] = "opened" if not tm_result.get("simulated") else "simulated"
-                    if "order" in tm_result:
-                        eval["order"] = tm_result.get("order")
-                    eval["trade_record"] = tm_result.get("trade_record")
-                # send_message already handled inside TradeManager.open_trade via send_telegram_alert
-            else:
-                # failed to open
-                err = tm_result.get("error", "open_failed")
+            symbol_info = await self.client.get_symbol_info(sym)
+            qty_raw = self.trade_manager.compute_qty_from_balance(balance, price, symbol_info)
+            qty = self._quantize_qty(qty_raw, symbol_info.get("step"), symbol_info.get("min_qty"))
+            if qty <= 0 or math.isclose(qty, 0.0):
                 c["accept"] = False
-                c["reason"] = err
+                c["reason"] = "zero_qty"
+                eval = eval_map.get((c["symbol"], c["root"]))
                 if eval is not None:
                     eval["accept"] = False
-                    eval["reason"] = err
+                    eval["reason"] = "zero_qty"
+                continue
+
+            side = "Buy"
+            reason_tag = c.get("reason", "signal")
+            if TRADE_ENABLED and self.client.api_key and self.client.api_secret:
+                try:
+                    order = await self.client.create_order(sym, side, qty)
+                    self.trade_manager.open_trade(sym, side, price, qty, {"order": order})
+                    eval = eval_map.get((sym, c["root"]))
+                    if eval is not None:
+                        eval["accept"] = True
+                        eval["reason"] = "opened"
+                        eval["order"] = order
+                    await send_message(
+                        f"✅ Trade Opened – {sym} {side}\n"
+                        f"Price: {price} | Qty: {qty:.6f}\n"
+                        f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
+                    )
+                except Exception:
+                    logger.exception("Failed to place order for %s", sym)
+                    c["accept"] = False
+                    c["reason"] = "order_failed"
+                    eval = eval_map.get((sym, c["root"]))
+                    if eval is not None:
+                        eval["accept"] = False
+                        eval["reason"] = "order_failed"
+            else:
+                self.trade_manager.open_trade(sym, side, price, qty, {"simulated": True, "score": c["score"], "tv_score": c.get("tv_score", 0.0)})
+                eval = eval_map.get((sym, c["root"]))
+                if eval is not None:
+                    eval["accept"] = True
+                    eval["reason"] = "simulated"
+                    eval["simulated"] = True
+                await send_message(
+                    f"🔔 Simulated Trade – {sym} {side}\n"
+                    f"Price: {price} | Qty: {qty:.6f}\n"
+                    f"Combined Score: {self._compute_combined_score(c):.2f} | TV Rating: {c.get('tv_score', 0.0):+.3f} | Reason: {reason_tag}"
+                )
 
             self._mtf_monitoring.pop(sym, None)
 

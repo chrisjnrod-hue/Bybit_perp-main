@@ -100,7 +100,11 @@ class Scanner:
 
         self.concurrent_sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.request_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
-        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(dict)
+        
+        # ===== FIXED: Use regular dict instead of defaultdict to prevent overwrites =====
+        self.kline_store: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        self._store_lock = asyncio.Lock()  # Prevent concurrent modifications
+        
         self.symbols: List[str] = []
         self._stop = False
         self._task: Optional[asyncio.Task] = None
@@ -411,26 +415,29 @@ class Scanner:
                 except Exception:
                     klines_sorted = valid
 
-                # ===== CRITICAL: Ensure store entry exists before assignment =====
-                if symbol not in self.kline_store:
-                    logger.info("[SEED_DIAG] Creating kline_store entry for %s", symbol)
-                    self.kline_store[symbol] = {}
-                
-                logger.info("[SEED_DIAG_PRE_ASSIGN] %s %s: About to assign %d candles. Store state before: %s", 
-                           symbol, tf, len(klines_sorted), list(self.kline_store.get(symbol, {}).keys()))
-                
-                self.kline_store[symbol][tf] = klines_sorted
-                
-                logger.info("[SEED_DIAG_POST_ASSIGN] %s %s: Successfully assigned. Verifying...", symbol, tf)
-                
-                # ===== VERIFICATION: Immediately check what was stored =====
-                stored = self.kline_store.get(symbol, {}).get(tf, [])
-                logger.info("[SEED_DIAG_VERIFY] %s %s: Stored count=%d, matches=%s", 
-                           symbol, tf, len(stored), len(stored) == len(klines_sorted))
-                
-                if len(stored) != len(klines_sorted):
-                    logger.error("[SEED_DIAG_ERROR] %s %s: MISMATCH! Expected %d, got %d", 
-                               symbol, tf, len(klines_sorted), len(stored))
+                # ===== THREAD-SAFE: Use lock for all store operations =====
+                async with self._store_lock:
+                    # Ensure symbol entry exists
+                    if symbol not in self.kline_store:
+                        logger.info("[SEED_DIAG] Creating kline_store entry for %s", symbol)
+                        self.kline_store[symbol] = {}
+                    
+                    logger.info("[SEED_DIAG_PRE_ASSIGN] %s %s: About to assign %d candles. Store state before: %s", 
+                               symbol, tf, len(klines_sorted), list(self.kline_store.get(symbol, {}).keys()))
+                    
+                    # Perform assignment
+                    self.kline_store[symbol][tf] = klines_sorted
+                    
+                    logger.info("[SEED_DIAG_POST_ASSIGN] %s %s: Successfully assigned. Verifying...", symbol, tf)
+                    
+                    # ===== VERIFICATION: Check immediately inside lock =====
+                    stored = self.kline_store.get(symbol, {}).get(tf, [])
+                    logger.info("[SEED_DIAG_VERIFY] %s %s: Stored count=%d, matches=%s", 
+                               symbol, tf, len(stored), len(stored) == len(klines_sorted))
+                    
+                    if len(stored) != len(klines_sorted):
+                        logger.error("[SEED_DIAG_ERROR] %s %s: MISMATCH! Expected %d, got %d", 
+                                   symbol, tf, len(klines_sorted), len(stored))
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -478,32 +485,35 @@ class Scanner:
                                 normalized = normalize_klines(data, tf) if data else []
 
                                 if normalized:
-                                    lst = self.kline_store.get(sym, {}).get(tf, [])
-                                    last_new = None
+                                    async with self._store_lock:
+                                        lst = self.kline_store.get(sym, {}).get(tf, [])
+                                        last_new = None
 
-                                    for c in reversed(normalized):
-                                        if c.get("close") is not None:
-                                            last_new = {
-                                                "start_at": c.get("start_at"),
-                                                "open": c.get("open"),
-                                                "high": c.get("high"),
-                                                "low": c.get("low"),
-                                                "close": float(c.get("close")),
-                                                "volume": c.get("volume")
-                                            }
-                                            break
+                                        for c in reversed(normalized):
+                                            if c.get("close") is not None:
+                                                last_new = {
+                                                    "start_at": c.get("start_at"),
+                                                    "open": c.get("open"),
+                                                    "high": c.get("high"),
+                                                    "low": c.get("low"),
+                                                    "close": float(c.get("close")),
+                                                    "volume": c.get("volume")
+                                                }
+                                                break
 
-                                    if last_new:
-                                        if lst:
-                                            try:
-                                                if lst[-1].get("start_at") == last_new.get("start_at"):
-                                                    lst[-1] = last_new
-                                                else:
-                                                    lst.append(last_new)
-                                            except Exception:
-                                                self.kline_store.setdefault(sym, {})[tf] = [last_new]
-                                        else:
-                                            self.kline_store.setdefault(sym, {})[tf] = [last_new]
+                                        if last_new:
+                                            if sym not in self.kline_store:
+                                                self.kline_store[sym] = {}
+                                            if lst:
+                                                try:
+                                                    if lst[-1].get("start_at") == last_new.get("start_at"):
+                                                        lst[-1] = last_new
+                                                    else:
+                                                        lst.append(last_new)
+                                                except Exception:
+                                                    self.kline_store[sym][tf] = [last_new]
+                                            else:
+                                                self.kline_store[sym][tf] = [last_new]
                         except Exception:
                             logger.debug("REST poll kline failed for %s %s", sym, tf, exc_info=True)
 
@@ -871,12 +881,13 @@ class Scanner:
                             logger.debug("[PRICE_FALLBACK] %s: REST get_latest_price returned None, trying kline fallback", sym)
                             try:
                                 # Try to extract price from the first ROOT_TF with cached klines
-                                for tf in ROOT_TFS:
-                                    last_candles = self.kline_store.get(sym, {}).get(tf, [])
-                                    if last_candles and last_candles[-1].get("close"):
-                                        price = float(last_candles[-1]["close"])
-                                        logger.info("[PRICE_FALLBACK_SUCCESS] %s: extracted from %s kline close: %.8f", sym, tf, price)
-                                        break
+                                async with self._store_lock:
+                                    for tf in ROOT_TFS:
+                                        last_candles = self.kline_store.get(sym, {}).get(tf, [])
+                                        if last_candles and last_candles[-1].get("close"):
+                                            price = float(last_candles[-1]["close"])
+                                            logger.info("[PRICE_FALLBACK_SUCCESS] %s: extracted from %s kline close: %.8f", sym, tf, price)
+                                            break
                             except Exception as e:
                                 logger.debug("[PRICE_FALLBACK_ERROR] %s: kline fallback failed: %s", sym, e)
                                 price = None
@@ -992,9 +1003,10 @@ class Scanner:
                                 vol_change = self.compute_24h_volume_change(sym)
                                 start_at = None
                                 try:
-                                    last_candles = self.kline_store.get(sym, {}).get(root, [])
-                                    if last_candles:
-                                        start_at = last_candles[-1].get("start_at")
+                                    async with self._store_lock:
+                                        last_candles = self.kline_store.get(sym, {}).get(root, [])
+                                        if last_candles:
+                                            start_at = last_candles[-1].get("start_at")
                                 except Exception:
                                     start_at = None
 

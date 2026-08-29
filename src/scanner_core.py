@@ -1,27 +1,32 @@
+# scanner_core.py
+
 """
 scanner_core.py
 
-Pure, synchronous helpers and deterministic computations used by the scanner.
-These routines do NOT perform network I/O so they can be unit-tested.
-"""
-from __future__ import annotations
+Pure, synchronous helpers and deterministic computations extracted from scanner.py.
 
+These functions:
+- Do NOT perform network I/O
+- Accept inputs (klines, closes, volume dicts, config) to be unit-testable
+- Preserve behavior of original helpers (normalization, MACD wrapper, TV rating, quantize, MTF alignment)
+"""
 import math
+import json
 import statistics
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Any as AnyT
 
 getcontext().prec = 28
 
-# Optional numerical libs
+# pandas/ta optional
 try:
-    import pandas as pd  # type: ignore
-    import numpy as np  # type: ignore
+    import pandas as pd
+    import numpy as np
 except Exception:
     pd = None  # type: ignore
     np = None  # type: ignore
 
-# Optional TA modules (pandas_ta or ta)
+# Try to import pandas_ta first (preferred API: ta.sma, ta.macd, etc.)
 _PANDAS_TA_AVAILABLE = False
 _PANDAS_TA_STYLE = False
 _ta_module = None
@@ -37,29 +42,18 @@ except Exception:
         _PANDAS_TA_AVAILABLE = True
         _PANDAS_TA_STYLE = False
     except Exception:
+        ta = None  # type: ignore
         _ta_module = None
         _PANDAS_TA_AVAILABLE = False
         _PANDAS_TA_STYLE = False
 
-# Try to import optional helpers (macd, slope). If missing, fallback implementations are provided below.
+# Import MACD helper and slope function from package (keeps same external dependency)
+# If you have a macd.py with macd_histogram and slope, keep it; otherwise fallback implementations below will handle MACD.
 try:
     from .macd import macd_histogram, slope  # type: ignore
 except Exception:
     macd_histogram = None
     slope = None  # type: ignore
-
-# Exported symbols
-__all__ = [
-    "tf_to_seconds",
-    "is_candle_age_acceptable",
-    "normalize_klines",
-    "quantize_qty",
-    "compute_macd_from_closes",
-    "detect_flip_current_open",
-    "compute_24h_volume_change_from",
-    "compute_tv_rating_from",
-    "compute_mtf_alignment",
-]
 
 # --------------------
 # Timeframe helpers
@@ -72,9 +66,9 @@ def tf_to_seconds(tf: str) -> int:
         if s.endswith("h"):
             return int(s[:-1]) * 3600
         if s == "D" or s.endswith("d"):
-            if s == "D":
-                return 24 * 3600
             try:
+                if s == "D":
+                    return 24 * 3600
                 return int(s[:-1]) * 86400
             except Exception:
                 return 24 * 3600
@@ -83,25 +77,23 @@ def tf_to_seconds(tf: str) -> int:
         return 60
 
 
-def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: Optional[int]) -> bool:
+def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: int) -> bool:
     """
-    Determine if a candle start_at is fresh enough compared to now.
-    - If max_age_sec is None or <=0: disabled -> return True.
-    - If start_at is None: cannot check -> return True.
-    Accept both seconds and milliseconds timestamps.
+    Check if the candle's start time is fresh enough compared to current time.
+    Behavior:
+    - If max_age_sec <= 0: check is disabled -> return True.
+    - If start_at is None/unparseable: return True.
+    - start_at may be seconds or milliseconds; detect and normalize.
     """
     try:
         if max_age_sec is None or int(max_age_sec) <= 0:
             return True
         if start_at is None:
             return True
-        # detect ms vs s
-        try:
-            si = int(start_at)
-        except Exception:
-            return True
-        start_sec = float(si) / 1000.0 if si > 1_000_000_0000 else float(si)
-        return (now - start_sec) <= float(max_age_sec)
+        # detect milliseconds quickly: epoch in ms > 10^10
+        start_sec = float(start_at) / 1000.0 if int(start_at) > 10000000000 else float(start_at)
+        age = now - start_sec
+        return age <= float(max_age_sec)
     except Exception:
         return True
 
@@ -109,31 +101,35 @@ def is_candle_age_acceptable(start_at: Optional[int], now: float, max_age_sec: O
 # --------------------
 # Normalization helpers
 # --------------------
-def normalize_klines(raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
+def normalize_klines(raw_klines: AnyT, tf: str) -> List[Dict[str, AnyT]]:
     """
-    Normalize many API kline shapes into a list of dicts:
-    { "start_at", "open", "high", "low", "close", "volume", "is_closed"(optional) }
+    Normalize various kline shapes into list of dicts:
+      {"start_at", "open", "high", "low", "close", "volume", "is_closed"(optional)}
+    Accepts dicts, lists, tuples and attempts to extract common fields.
     """
-    out: List[Dict[str, Any]] = []
+    out: List[Dict[str, AnyT]] = []
     if not raw_klines:
         return out
 
-    # unwrap common envelope shapes
     if isinstance(raw_klines, dict):
-        for key in ("list", "result", "data"):
-            if key in raw_klines and isinstance(raw_klines[key], (list, dict)):
-                raw_klines = raw_klines[key]
-                break
+        if "list" in raw_klines and isinstance(raw_klines["list"], (list, dict)):
+            raw_klines = raw_klines["list"]
+        elif "result" in raw_klines and isinstance(raw_klines["result"], (list, dict)):
+            raw_klines = raw_klines["result"]
+        elif "data" in raw_klines and isinstance(raw_klines["data"], (list, dict)):
+            raw_klines = raw_klines["data"]
 
     if not isinstance(raw_klines, (list, tuple)):
-        raw_seq = [raw_klines] if raw_klines else []
+        if isinstance(raw_klines, dict):
+            seq = [raw_klines]
+        else:
+            seq = [raw_klines] if raw_klines else []
     else:
-        raw_seq = raw_klines
+        seq = raw_klines
 
-    for item in raw_seq:
+    for item in seq:
         try:
             if isinstance(item, (list, tuple)):
-                # typical [start, open, high, low, close, volume, ...]
                 start = None
                 open_p = None
                 high = None
@@ -170,47 +166,92 @@ def normalize_klines(raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
                         vol = float(item[5])
                     except Exception:
                         vol = None
+
                 if close is not None:
-                    out.append({"start_at": start, "open": open_p, "high": high, "low": low, "close": close, "volume": vol})
+                    out.append({
+                        "start_at": start, "open": open_p, "high": high, "low": low,
+                        "close": close, "volume": vol
+                    })
                 continue
 
             if isinstance(item, dict):
-                start = item.get("start_at") or item.get("open_time") or item.get("t") or item.get("timestamp") or item.get("start") or item.get("time")
-                open_p = item.get("open") or item.get("openPrice") or item.get("o")
-                high = item.get("high") or item.get("h")
-                low = item.get("low") or item.get("l")
-                close = item.get("close") or item.get("close_price") or item.get("c") or item.get("last_price") or item.get("Close")
-                vol = item.get("volume") or item.get("vol") or item.get("turnover") or item.get("v") or item.get("quoteAsset")
+                start = (
+                    item.get("start_at")
+                    or item.get("open_time")
+                    or item.get("t")
+                    or item.get("timestamp")
+                    or item.get("start")
+                    or item.get("time")
+                )
+                open_p = (
+                    item.get("open")
+                    or item.get("openPrice")
+                    or item.get("o")
+                )
+                high = (
+                    item.get("high")
+                    or item.get("h")
+                )
+                low = (
+                    item.get("low")
+                    or item.get("l")
+                )
+                close = (
+                    item.get("close")
+                    or item.get("close_price")
+                    or item.get("c")
+                    or item.get("last_price")
+                    or item.get("Close")
+                )
+                vol = (
+                    item.get("volume")
+                    or item.get("vol")
+                    or item.get("turnover")
+                    or item.get("v")
+                    or item.get("quoteAsset")
+                )
                 is_closed = item.get("isClosed")
                 if is_closed is None:
                     is_closed = item.get("is_closed") or item.get("complete") or item.get("confirmed")
+
                 try:
                     if start is not None:
                         start = int(start)
                 except Exception:
                     start = None
-                for name, value in (("open", open_p), ("high", high), ("low", low), ("close", close), ("volume", vol)):
-                    try:
-                        if value is not None and name != "volume":
-                            locals()[name] = float(value)
-                        elif value is not None and name == "volume":
-                            vol = float(value)
-                    except Exception:
-                        if name == "open":
-                            open_p = None
-                        elif name == "high":
-                            high = None
-                        elif name == "low":
-                            low = None
-                        elif name == "close":
-                            close = None
-                        elif name == "volume":
-                            vol = None
+                try:
+                    if open_p is not None:
+                        open_p = float(open_p)
+                except Exception:
+                    open_p = None
+                try:
+                    if high is not None:
+                        high = float(high)
+                except Exception:
+                    high = None
+                try:
+                    if low is not None:
+                        low = float(low)
+                except Exception:
+                    low = None
+                try:
+                    if close is not None:
+                        close = float(close)
+                except Exception:
+                    close = None
+                try:
+                    if vol is not None:
+                        vol = float(vol)
+                except Exception:
+                    vol = None
+
                 if close is not None:
-                    out.append({"start_at": start, "open": open_p, "high": high, "low": low, "close": close, "volume": vol, "is_closed": is_closed})
+                    out.append({
+                        "start_at": start, "open": open_p, "high": high, "low": low,
+                        "close": close, "volume": vol, "is_closed": is_closed
+                    })
                 continue
         except Exception:
-            # skip malformed
             continue
 
     return out
@@ -219,7 +260,7 @@ def normalize_klines(raw_klines: Any, tf: str) -> List[Dict[str, Any]]:
 # --------------------
 # Quantize helper
 # --------------------
-def quantize_qty(qty: Optional[float], step: Optional[float], min_qty: Optional[float]) -> float:
+def quantize_qty(qty: float, step: Optional[float], min_qty: Optional[float]) -> float:
     if qty is None:
         return 0.0
     qty_d = Decimal(str(qty))
@@ -242,7 +283,7 @@ def quantize_qty(qty: Optional[float], step: Optional[float], min_qty: Optional[
 
 
 # --------------------
-# MACD helpers (pure-python fallback)
+# MACD computation (ROBUST & ENHANCED)
 # --------------------
 def _is_finite_number(x: Any) -> bool:
     try:
@@ -280,102 +321,150 @@ def _clean_hist(hist: Any) -> List[float]:
 
 
 def _fallback_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float], List[float]]:
-    """Simple EMA-based MACD fallback calculation. Returns (macd_series, signal_series, hist_series)."""
+    """
+    Pure-Python MACD calculation using EMA.
+    Robust implementation with better handling of edge cases.
+    """
     if not closes:
         return [], [], []
-
+    
     def ema(values: List[float], period: int) -> List[float]:
+        """Calculate EMA with proper initialization."""
         if not values or period < 1:
             return []
+        
         out: List[float] = []
         alpha = 2.0 / (period + 1.0)
-        # Initialize with simple SMA for first point if possible
-        if len(values) < period:
-            s = sum(values) / len(values)
-            out = [s for _ in values]
+        
+        # Initialize with SMA of first 'period' values
+        if len(values) >= period:
+            sma_val = sum(values[:period]) / period
+            out.append(sma_val)
+            prev = float(sma_val)
+            for v in values[period:]:
+                prev = (float(v) * alpha) + (prev * (1.0 - alpha))
+                out.append(prev)
             return out
-        sma = sum(values[:period]) / period
-        out.append(sma)
-        prev = sma
-        for v in values[period:]:
+        
+        # If fewer values than period: initialize with first value then compute EMA
+        prev = float(values[0])
+        out.append(prev)
+        for v in values[1:]:
             prev = (float(v) * alpha) + (prev * (1.0 - alpha))
             out.append(prev)
         return out
-
-    fast_ema = ema(closes, fast)
-    slow_ema = ema(closes, slow)
-    if not fast_ema or not slow_ema:
+    
+    try:
+        # Calculate EMAs
+        fast_ema = ema(closes, fast)
+        slow_ema = ema(closes, slow)
+        
+        min_len = min(len(fast_ema), len(slow_ema))
+        if min_len == 0:
+            print(f"[MACD_DEBUG] EMA result lengths insufficient: fast={len(fast_ema)}, slow={len(slow_ema)}")
+            return [], [], []
+        
+        # Calculate MACD line aligned by available lengths
+        macd_series = [fast_ema[i] - slow_ema[i] for i in range(min_len)]
+        
+        # Calculate Signal line (EMA of MACD)
+        signal_series = ema(macd_series, signal)
+        
+        min_len2 = min(len(macd_series), len(signal_series))
+        if min_len2 == 0:
+            print(f"[MACD_DEBUG] Signal EMA empty: macd_len={len(macd_series)}, signal_len={len(signal_series)}")
+            return [], [], []
+        
+        # Calculate Histogram aligned
+        hist_series = [macd_series[i] - signal_series[i] for i in range(min_len2)]
+        
+        print(f"[MACD_DEBUG] Fallback MACD calculated: closes={len(closes)}, macd={len(macd_series)}, signal={len(signal_series)}, hist={len(hist_series)}")
+        if hist_series:
+            print(f"[MACD_DEBUG] Last 3 histogram values: {hist_series[-3:] if len(hist_series) >= 3 else hist_series}")
+        
+        return macd_series, signal_series, hist_series
+    except Exception as e:
+        print(f"[MACD_ERROR] Fallback MACD failed: {e}")
         return [], [], []
-    # align lengths
-    length = min(len(fast_ema), len(slow_ema))
-    macd_series = [fast_ema[i] - slow_ema[i] for i in range(length)]
-    signal_series = ema(macd_series, signal) if macd_series else []
-    if not signal_series:
-        return [], [], []
-    hist_len = min(len(macd_series), len(signal_series))
-    hist_series = [macd_series[i] - signal_series[i] for i in range(hist_len)]
-    return macd_series[-hist_len:], signal_series[-hist_len:], hist_series
 
 
 def compute_macd_from_closes(closes: List[float], include_price: Optional[float] = None, fast: int = 12, slow: int = 26, signal: int = 9):
     """
     Returns (macd_last, signal_last, hist_list) where hist_list is oldest->newest plain list.
-    Uses optional external macd_histogram helper if available, otherwise uses the fallback.
+    
+    ENHANCED: Better validation, logging, and fallback handling.
     """
-    # validate closes
+    # ============ ENHANCED: Input validation ============
     data: List[float] = []
     for c in closes:
         try:
             if c is None:
                 continue
             val = float(c)
-            if math.isfinite(val):
+            if math.isfinite(val):  # Filter NaN/inf
                 data.append(val)
         except Exception:
             continue
-
-    if include_price is not None and data:
+    
+    print(f"[MACD_INPUT] Input closes: {len(closes)} raw, {len(data)} valid finite values")
+    
+    if include_price is not None:
         try:
-            p = float(include_price)
-            if math.isfinite(p):
-                data[-1] = p
+            current_price = float(include_price)
+            if math.isfinite(current_price):
+                # Replace last close with current price for real-time calculation
+                if data:
+                    data[-1] = current_price
+                else:
+                    data.append(current_price)
+                print(f"[MACD_INPUT] Included current price: {current_price}")
         except Exception:
             pass
-    elif include_price is not None and not data:
-        try:
-            p = float(include_price)
-            if math.isfinite(p):
-                data.append(p)
-        except Exception:
-            pass
 
-    # Try external helper if present
+    # ============ Try external macd_histogram helper first ============
     if macd_histogram is not None:
         try:
+            print(f"[MACD_ATTEMPT] Trying external macd_histogram helper with {len(data)} closes...")
             macd_line_raw, signal_line_raw, hist_raw = macd_histogram(data)
             hist_list = _clean_hist(hist_raw)
+            
             macd_last = None
             signal_last = None
+            
             try:
-                if hasattr(macd_line_raw, "__len__") and len(macd_line_raw):
-                    macd_last = float(macd_line_raw[-1])
+                macd_last = _safe_last(macd_line_raw)
             except Exception:
                 macd_last = None
+            
             try:
-                if hasattr(signal_line_raw, "__len__") and len(signal_line_raw):
-                    signal_last = float(signal_line_raw[-1])
+                signal_last = _safe_last(signal_line_raw)
             except Exception:
                 signal_last = None
-            return macd_last, signal_last, hist_list
-        except Exception:
-            # fallback silently
-            pass
+            
+            if hist_list:
+                print(f"[MACD_SUCCESS] External helper returned {len(hist_list)} histogram values")
+                print(f"[MACD_SUCCESS] Last 3 histogram: {hist_list[-3:] if len(hist_list) >= 3 else hist_list}")
+                return macd_last, signal_last, hist_list
+            else:
+                print(f"[MACD_FAIL] External helper returned empty histogram, falling back to pure Python")
+        except Exception as e:
+            print(f"[MACD_FAIL] External helper failed: {e}, falling back to pure Python")
 
+    # ============ Fallback to pure-python MACD ============
+    print(f"[MACD_FALLBACK] Using pure-Python MACD fallback with {len(data)} closes")
     macd_series, signal_series, hist_series = _fallback_macd(data, fast=fast, slow=slow, signal=signal)
+    
     if not hist_series:
+        print(f"[MACD_FAILURE] Pure-Python MACD also failed - returning empty")
         return None, None, []
+    
     macd_last = float(macd_series[-1]) if macd_series else None
     signal_last = float(signal_series[-1]) if signal_series else None
+    
+    print(f"[MACD_RESULT] Fallback MACD computed: hist_len={len(hist_series)}, macd_last={macd_last}, signal_last={signal_last}")
+    if hist_series:
+        print(f"[MACD_RESULT] Last 3 histogram: {hist_series[-3:] if len(hist_series) >= 3 else hist_series}")
+    
     return macd_last, signal_last, hist_series
 
 
@@ -386,61 +475,200 @@ def _safe_last(v: Any) -> Optional[float]:
         if hasattr(v, "iloc"):
             if len(v) == 0:
                 return None
-            return float(v.iloc[-1])
+            val = v.iloc[-1]
+            return float(val) if _is_finite_number(val) else None
         if hasattr(v, "tolist"):
             lst = v.tolist()
             if not lst:
                 return None
-            return float(lst[-1])
+            return float(lst[-1]) if _is_finite_number(lst[-1]) else None
         if isinstance(v, (list, tuple)):
             if not v:
                 return None
-            return float(v[-1])
+            return float(v[-1]) if _is_finite_number(v[-1]) else None
         return float(v) if _is_finite_number(v) else None
     except Exception:
         return None
 
 
 # --------------------
-# Flip detection
+# Flip detection (ROBUST)
 # --------------------
 def detect_flip_current_open(hist: List[float], hist_threshold: Optional[float] = None, std_mult: float = 0.05, abs_min: float = 1e-9, lookback: int = 1) -> bool:
     """
-    Return True when histogram flips from negative (prev) to positive (current) with a noise threshold.
+    Detect zero-cross flip from negative (or <=0) to positive on last candle, with noise gating.
+    ENHANCED: Better logging and threshold handling.
     """
     try:
         clean = _clean_hist(hist)
-        if not clean or len(clean) < (lookback + 1):
+        
+        if not clean:
+            print(f"[FLIP_DEBUG] Empty histogram after cleaning")
             return False
+        
+        if len(clean) < (lookback + 1):
+            print(f"[FLIP_DEBUG] Insufficient history: {len(clean)} < {lookback + 1}")
+            return False
+        
         prev = clean[-(lookback + 1)]
         cur = clean[-1]
+        
         if prev is None or cur is None:
+            print(f"[FLIP_DEBUG] None values: prev={prev}, cur={cur}")
             return False
+        
+        # Calculate threshold
         if hist_threshold is None:
             try:
                 hist_std = statistics.pstdev(clean) if len(clean) >= 2 else 0.0
             except Exception:
                 hist_std = 0.0
+            
             hist_threshold = max(abs_min, abs(hist_std) * std_mult)
-            hist_threshold = min(hist_threshold, 0.01)
-        return (prev < -1e-9) and (cur > hist_threshold)
-    except Exception:
+            hist_threshold = min(hist_threshold, 0.01)  # Cap at 1%
+        
+        # Detect flip: prev non-positive, cur positive above threshold
+        flip = (prev <= 0.0) and (cur > hist_threshold)
+        
+        print(f"[FLIP_DEBUG] prev={prev:.8f}, cur={cur:.8f}, threshold={hist_threshold:.8f}, flip={flip}")
+        
+        return flip
+    except Exception as e:
+        print(f"[FLIP_ERROR] {e}")
         return False
 
 
 # --------------------
-# Volume helper
+# Volume helper (unchanged)
 # --------------------
 def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Optional[float]:
     try:
         if not vol_data:
+            print("[VOL_DEBUG] compute_24h_volume_change: no vol_data provided")
             return None
         prev_vol = vol_data.get("previous", 0)
         curr_vol = vol_data.get("current", 0)
         if prev_vol <= 0:
+            print(f"[VOL_DEBUG] compute_24h_volume_change: prev_vol <= 0 (prev={prev_vol}, curr={curr_vol})")
             return None
         change = (curr_vol - prev_vol) / prev_vol
-        return min(change, 1.0)
+        result = min(change, 1.0)
+        try:
+            print(f"[VOL_DEBUG] prev={prev_vol:.0f}, curr={curr_vol:.0f}, change={change:.4f} => result_clamped={result:.4f}")
+        except Exception:
+            print(f"[VOL_DEBUG] prev={prev_vol}, curr={curr_vol}, change={change}")
+        return result
+    except Exception as e:
+        print(f"[VOL_DEBUG] compute_24h_volume_change error: {e}")
+        return None
+
+
+# --------------------
+# Indicator wrappers (unchanged)
+# --------------------
+def _safe_sma(df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.sma(df_close, length=length)
+        else:
+            return _ta_module.trend.SMAIndicator(df_close, window=int(length)).sma_indicator()
+    except Exception:
+        return None
+
+
+def _safe_macd(df_close, fast: int, slow: int, signal: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.macd(df_close, fast=fast, slow=slow, signal=signal)
+        else:
+            macd_obj = _ta_module.trend.MACD(df_close, window_slow=int(slow), window_fast=int(fast), window_sign=int(signal))
+            try:
+                import pandas as _pd
+                df_macd = _pd.DataFrame({
+                    "MACD": macd_obj.macd(),
+                    "MACD_signal": macd_obj.macd_signal(),
+                    "MACD_hist": macd_obj.macd_diff()
+                }, index=df_close.index)
+                return df_macd
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_rsi(df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.rsi(df_close, length=length)
+        else:
+            return _ta_module.momentum.RSIIndicator(df_close, window=int(length)).rsi()
+    except Exception:
+        return None
+
+
+def _safe_stoch(df_high, df_low, df_close, k: int, d: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.stoch(high=df_high, low=df_low, close=df_close, k=k, d=d)
+        else:
+            stoch_obj = _ta_module.momentum.StochasticOscillator(high=df_high, low=df_low, close=df_close, window=int(k), smooth_window=int(d))
+            try:
+                import pandas as _pd
+                df_st = _pd.DataFrame({
+                    "STOCHk": stoch_obj.stoch(),
+                    "STOCHd": stoch_obj.stoch_signal()
+                }, index=df_close.index)
+                return df_st
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_adx(df_high, df_low, df_close, length: int):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.adx(high=df_high, low=df_low, close=df_close, length=length)
+        else:
+            adx_obj = _ta_module.trend.ADXIndicator(high=df_high, low=df_low, close=df_close, window=int(length))
+            try:
+                import pandas as _pd
+                df_adx = _pd.DataFrame({
+                    "ADX": adx_obj.adx()
+                }, index=df_close.index)
+                return df_adx
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def _safe_obv(df_close, df_volume):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.obv(df_close, df_volume)
+        else:
+            return _ta_module.volume.OnBalanceVolumeIndicator(close=df_close, volume=df_volume).on_balance_volume()
+    except Exception:
+        return None
+
+
+def _safe_bbands(df_close, length: int, std: float):
+    try:
+        if _PANDAS_TA_STYLE:
+            return _ta_module.bbands(df_close, length=length, std=std)
+        else:
+            bb = _ta_module.volatility.BollingerBands(close=df_close, window=int(length), window_dev=float(std))
+            try:
+                import pandas as _pd
+                df_bb = _pd.DataFrame({
+                    "BB_bbm": bb.bollinger_mavg(),
+                    "BB_bbh": bb.bollinger_hband(),
+                    "BB_bbl": bb.bollinger_lband()
+                }, index=df_close.index)
+                return df_bb
+            except Exception:
+                return None
     except Exception:
         return None
 
@@ -448,37 +676,44 @@ def compute_24h_volume_change_from(vol_data: Optional[Dict[str, float]]) -> Opti
 # --------------------
 # TV rating & MTF alignment
 # --------------------
-def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
-    """
-    Compute a numeric TV-style technical rating. If pandas or indicators are missing,
-    return Neutral (0.0, "Neutral") to avoid failing imports.
-    cfg is expected to contain indicators, weights, tolerance, thresholds keys used below.
-    """
+def compute_tv_rating_from(klines: List[Dict[str, AnyT]], cfg: Dict[str, AnyT], tf: Optional[str] = None, price: Optional[float] = None) -> Tuple[float, str]:
+    # Keep original logic but robustly handle missing pandas/pandas_ta
     try:
-        if not cfg.get("enabled", True):
-            return 0.0, "Neutral"
+        print(f"[TV_DEBUG] compute_tv_rating start tf={tf} price={price} candles={len(klines) if klines is not None else 0} pandas_ta_available={_PANDAS_TA_AVAILABLE} pandas_ta_style={_PANDAS_TA_STYLE}")
+    except Exception:
+        pass
 
-        if not _PANDAS_TA_AVAILABLE or pd is None or np is None:
-            return 0.0, "Neutral"
+    if not cfg.get("enabled", True):
+        print("[TV_DEBUG] TECHNICAL_RATING disabled in config -> Neutral")
+        return 0.0, "Neutral"
 
-        # require enough candles
-        ma_pairs = cfg.get("indicators", {}).get("ma_pairs", [])
-        ma_max = max([n for pair in ma_pairs for n in pair]) if ma_pairs else 50
+    if not _PANDAS_TA_AVAILABLE or pd is None or np is None:
+        print("[TV_DEBUG] pandas/pandas_ta/ta not available -> returning Neutral")
+        return 0.0, "Neutral"
+
+    try:
+        ma_max = max([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]) if cfg["indicators"].get("ma_pairs") else 50
         min_candles = max(26, ma_max + 5)
+
         if not klines or len(klines) < min_candles:
+            print(f"[TV_DEBUG] insufficient candles for tf={tf}: have={len(klines) if klines else 0} need={min_candles}")
             return 0.0, "Neutral"
 
         df = pd.DataFrame(klines)
         for col in ("open", "high", "low", "close", "volume"):
             if col not in df.columns:
                 df[col] = np.nan
-        df = df.dropna(subset=["close"]).copy()
 
-        df["open"] = pd.to_numeric(df["open"], errors="coerce")
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+        df = df.dropna(subset=["close"]).copy()
+        try:
+            df["open"] = pd.to_numeric(df["open"], errors="coerce")
+            df["high"] = pd.to_numeric(df["high"], errors="coerce")
+            df["low"] = pd.to_numeric(df["low"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+        except Exception as e:
+            print(f"[TV_DEBUG] dtype conversion error for tf={tf}: {e}")
+            return 0.0, "Neutral"
 
         if price is not None:
             try:
@@ -486,98 +721,90 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
             except Exception:
                 pass
 
-        # moving averages
-        ma_lengths = sorted(set([n for pair in ma_pairs for n in pair])) if ma_pairs else []
-        for l in ma_lengths:
-            sma_series = None
-            try:
-                if _PANDAS_TA_STYLE:
-                    sma_series = _ta_module.sma(df["close"], length=int(l))
+        try:
+            ma_lengths = sorted(set([n for pair in cfg["indicators"]["ma_pairs"] for n in pair]))
+            for l in ma_lengths:
+                sma_series = _safe_sma(df["close"], length=int(l))
+                if sma_series is not None:
+                    df[f"sma_{l}"] = sma_series
+            print(f"[TV_DEBUG] computed SMAs: {ma_lengths}")
+
+            macd_cfg = cfg["indicators"].get("macd", [12, 26, 9])
+            macd_result = _safe_macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
+            if macd_result is not None and hasattr(macd_result, "columns") and len(macd_result.columns) > 0:
+                macd_hist_col = next((c for c in macd_result.columns if "MACD" in str(c).upper() and ("H" in str(c).upper() or "diff" in str(c).lower())), None)
+                if macd_hist_col:
+                    df["macd_hist"] = macd_result[macd_hist_col]
                 else:
-                    sma_series = _ta_module.trend.SMAIndicator(df["close"], window=int(l)).sma_indicator()
-            except Exception:
-                sma_series = None
-            if sma_series is not None:
-                df[f"sma_{l}"] = sma_series
-
-        # MACD
-        macd_cfg = cfg.get("indicators", {}).get("macd", [12, 26, 9])
-        macd_res = None
-        try:
-            if _PANDAS_TA_STYLE:
-                macd_res = _ta_module.macd(df["close"], fast=int(macd_cfg[0]), slow=int(macd_cfg[1]), signal=int(macd_cfg[2]))
+                    df["macd_hist"] = macd_result.iloc[:, -1] if len(macd_result.columns) > 0 else 0.0
             else:
-                macd_obj = _ta_module.trend.MACD(df["close"], window_slow=int(macd_cfg[1]), window_fast=int(macd_cfg[0]), window_sign=int(macd_cfg[2]))
-                import pandas as _pd  # local
-                macd_res = _pd.DataFrame({
-                    "MACD": macd_obj.macd(),
-                    "MACD_signal": macd_obj.macd_signal(),
-                    "MACD_hist": macd_obj.macd_diff()
-                }, index=df.index)
-        except Exception:
-            macd_res = None
-        if macd_res is not None and hasattr(macd_res, "columns"):
-            hist_col = next((c for c in macd_res.columns if "H" in str(c).upper() or "diff" in str(c).lower()), None)
-            if hist_col:
-                df["macd_hist"] = macd_res[hist_col]
-            else:
-                df["macd_hist"] = macd_res.iloc[:, -1] if len(macd_res.columns) > 0 else 0.0
-        else:
-            df["macd_hist"] = 0.0
+                df["macd_hist"] = 0.0
+            print(f"[TV_DEBUG] computed MACD (macd_result columns: {list(macd_result.columns) if macd_result is not None and hasattr(macd_result,'columns') else 'n/a'})")
 
-        # RSI
-        rsi_period = int(cfg.get("indicators", {}).get("rsi_period", 14))
-        rsi_series = None
-        try:
-            if _PANDAS_TA_STYLE:
-                rsi_series = _ta_module.rsi(df["close"], length=rsi_period)
-            else:
-                rsi_series = _ta_module.momentum.RSIIndicator(df["close"], window=rsi_period).rsi()
-        except Exception:
-            rsi_series = None
-        df["rsi"] = rsi_series
+            rsi_series = _safe_rsi(df["close"], length=int(cfg["indicators"].get("rsi_period", 14)))
+            df["rsi"] = rsi_series
+            print("[TV_DEBUG] computed RSI")
 
-        # other indicators are optional: stoch, adx, obv, bbands
-        try:
-            stoch_cfg = cfg.get("indicators", {}).get("stochastic", [14, 3, 3])
-            st = None
+            stoch_cfg = cfg["indicators"].get("stochastic", [14, 3, 3])
             try:
-                if _PANDAS_TA_STYLE:
-                    st = _ta_module.stoch(high=df["high"], low=df["low"], close=df["close"], k=int(stoch_cfg[0]), d=int(stoch_cfg[1]))
-                else:
-                    st = _ta_module.momentum.StochasticOscillator(high=df["high"], low=df["low"], close=df["close"], window=int(stoch_cfg[0]), smooth_window=int(stoch_cfg[1]))
+                st = _safe_stoch(df["high"], df["low"], df["close"], k=int(stoch_cfg[0]), d=int(stoch_cfg[1]))
+                if st is not None and hasattr(st, "columns"):
+                    stoch_k_col = next((c for c in st.columns if "STOCH" in str(c).upper() or "k" in str(c).lower()), None)
+                    if stoch_k_col:
+                        df["stoch_k"] = st[stoch_k_col]
+                print("[TV_DEBUG] computed Stochastic (k)")
             except Exception:
-                st = None
-            if st is not None and hasattr(st, "columns"):
-                st_col = next((c for c in st.columns if "STOCH" in str(c).upper() or "k" in str(c).lower()), None)
-                if st_col:
-                    df["stoch_k"] = st[st_col]
-        except Exception:
-            pass
+                print("[TV_DEBUG] stoch calc failed (continuing)")
 
-        try:
-            obv = None
-            if _PANDAS_TA_STYLE:
-                obv = _ta_module.obv(df["close"], df["volume"])
-            else:
-                obv = _ta_module.volume.OnBalanceVolumeIndicator(close=df["close"], volume=df["volume"]).on_balance_volume()
-            df["obv"] = obv
-        except Exception:
-            df["obv"] = None
+            try:
+                adx_result = _safe_adx(df["high"], df["low"], df["close"], length=int(cfg["indicators"].get("adx_period", 14)))
+                if adx_result is not None and hasattr(adx_result, "columns"):
+                    adx_col = next((c for c in adx_result.columns if "ADX" in str(c).upper()), None)
+                    if adx_col:
+                        df["adx"] = adx_result[adx_col]
+                    else:
+                        df["adx"] = np.nan
+                else:
+                    df["adx"] = np.nan
+                print("[TV_DEBUG] computed ADX")
+            except Exception:
+                df["adx"] = np.nan
+                print("[TV_DEBUG] adx calc failed (continuing)")
 
-        # score calculation (match original logic)
+            obv_series = _safe_obv(df["close"], df["volume"])
+            df["obv"] = obv_series
+            try:
+                print(f"[TV_DEBUG] computed OBV (length={len(df['obv'].dropna())})")
+            except Exception:
+                print("[TV_DEBUG] computed OBV")
+
+            try:
+                boll_cfg = cfg["indicators"].get("bollinger", [20, 2])
+                bb = _safe_bbands(df["close"], length=int(boll_cfg[0]), std=float(boll_cfg[1]))
+                if bb is not None and hasattr(bb, "columns"):
+                    for c in bb.columns:
+                        df[c] = bb[c]
+                print("[TV_DEBUG] computed Bollinger Bands")
+            except Exception:
+                print("[TV_DEBUG] bb calc failed (continuing)")
+
+        except Exception as e:
+            print(f"[TV_DEBUG] indicator computation error for tf={tf}: {e}")
+            return 0.0, "Neutral"
+
+        # scoring (same as original logic)
         last = df.iloc[-1]
         scores: List[Tuple[float, float]] = []
         weights = cfg.get("weights", {})
 
-        for pair in cfg.get("indicators", {}).get("ma_pairs", []):
+        for pair in cfg["indicators"]["ma_pairs"]:
             short, long = pair
             s = last.get(f"sma_{short}")
             l = last.get(f"sma_{long}")
             if pd.isna(s) or pd.isna(l) or l == 0:
                 continue
             pct = (s - l) / l
-            tol = cfg.get("tolerance", {}).get("ma_pair_pct", 0.002)
+            tol = cfg["tolerance"].get("ma_pair_pct", 0.002)
             if abs(pct) <= tol:
                 sub = 0.0
             else:
@@ -609,23 +836,24 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
             sub = max(-1.0, min(1.0, sub))
             scores.append((sub, weights.get("stochastic", 0.8)))
 
-        obv_series = df["obv"].dropna() if "obv" in df.columns and df["obv"] is not None else []
-        if len(obv_series) >= cfg.get("tolerance", {}).get("obv_slope_lookback", 5):
-            lb = cfg.get("tolerance", {}).get("obv_slope_lookback", 5)
-            slope_val = obv_series.iloc[-1] - obv_series.iloc[-lb]
-            pct_change_std = obv_series.pct_change().std()
+        obv = df["obv"].dropna()
+        if len(obv) >= cfg["tolerance"].get("obv_slope_lookback", 5):
+            lb = cfg["tolerance"].get("obv_slope_lookback", 5)
+            slope_val = obv.iloc[-1] - obv.iloc[-lb]
+            pct_change_std = obv.pct_change().std()
             denom = pct_change_std if pct_change_std not in (0, None) else 1.0
             sub = float(np.tanh((slope_val / (denom if denom != 0 else 1.0)) * 0.5))
             scores.append((sub, weights.get("obv", 1.0)))
 
         if not scores:
+            print("[TV_DEBUG] no indicator scores computed -> Neutral")
             return 0.0, "Neutral"
 
         num = sum(s * w for (s, w) in scores)
         denom = sum(abs(w) for (_, w) in scores) or 1.0
         score = float(num / denom)
 
-        adx = last.get("adx") if "adx" in last else None
+        adx = last.get("adx")
         if adx is not None and not pd.isna(adx):
             adx_cfg = cfg.get("adx", {})
             thr = adx_cfg.get("threshold", 25)
@@ -635,24 +863,29 @@ def compute_tv_rating_from(klines: List[Dict[str, Any]], cfg: Dict[str, Any], tf
 
         score = max(-2.0, min(2.0, score))
 
-        thresholds = cfg.get("thresholds", {"strong_buy": 0.6, "buy": 0.25, "sell": -0.25, "strong_sell": -0.6})
+        t = cfg.get("thresholds", {"strong_buy": 0.6, "buy": 0.25, "sell": -0.25, "strong_sell": -0.6})
         label = "Neutral"
-        if score >= thresholds["strong_buy"]:
+        if score >= t["strong_buy"]:
             label = "Strong Buy"
-        elif score >= thresholds["buy"]:
+        elif score >= t["buy"]:
             label = "Buy"
-        elif score <= thresholds["strong_sell"]:
+        elif score <= t["strong_sell"]:
             label = "Strong Sell"
-        elif score <= thresholds["sell"]:
+        elif score <= t["sell"]:
             label = "Sell"
 
+        try:
+            print(f"[TV_DEBUG] tf={tf} score={score:.4f} label={label}")
+        except Exception:
+            print(f"[TV_DEBUG] tf={tf} score={score} label={label}")
         return score, label
-    except Exception:
+    except Exception as e:
+        print(f"[TV_DEBUG] compute_tv_rating error: {e}")
         return 0.0, "Neutral"
 
 
-def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, Any]:
-    tf_states: Dict[str, Dict[str, Any]] = {}
+def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: float, mtf_tfs: List[str], mtf_slope_lookback: int = 3) -> Dict[str, AnyT]:
+    tf_states: Dict[str, Dict[str, AnyT]] = {}
     negative_tfs: List[str] = []
     one_d_hist: List[float] = []
 
@@ -673,10 +906,10 @@ def compute_mtf_alignment(get_closes_fn: Callable[[str], List[float]], price: fl
     if not negative_tfs:
         return {"status": "aligned", "tfs": tf_states, "negative_tfs": [], "one_d_slope": None}
 
-    if negative_tfs == ["D"] and slope is not None:
-        one_d_slope = slope(one_d_hist, lookback=mtf_slope_lookback) if one_d_hist else None
-        if one_d_slope is not None and one_d_slope > 0:
-            tf_states["D"]["slope"] = one_d_slope
-            return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
-
+    if negative_tfs == ["D"]:
+        if slope is not None:
+            one_d_slope = slope(one_d_hist, lookback=mtf_slope_lookback) if one_d_hist else None
+            if one_d_slope is not None and one_d_slope > 0:
+                tf_states["D"]["slope"] = one_d_slope
+                return {"status": "daily_rising", "tfs": tf_states, "negative_tfs": ["D"], "one_d_slope": one_d_slope}
     return {"status": "monitoring", "tfs": tf_states, "negative_tfs": negative_tfs, "one_d_slope": None}

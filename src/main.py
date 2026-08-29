@@ -125,6 +125,16 @@ async def debug_symbol(request: web.Request):
     """
     Debug endpoint with enhanced diagnostics for null values:
     GET /debug/symbol/{symbol}?tf=5&include_traces=1&api_key=...
+    
+    Provides detailed reasons for why fields are null:
+    - last_price: null reason (REST failed, WS unavailable, price extraction failed)
+    - 24h_volume: null reason (ticker API unavailable, missing field, extraction failed)
+    - klines_count: reasons for 0 (seed failed, API returned empty, normalization failed)
+    
+    - Requires DEBUG_API_KEY to be set in ENV to be enabled.
+      * DEBUG_API_KEY == ""  -> anonymous allowed
+      * DEBUG_API_KEY == "secret" -> must provide ?api_key=secret
+      * DEBUG_API_KEY is None -> endpoint disabled (returns 404)
     """
     # If disabled, return 404 to avoid accidental exposure
     if DEBUG_API_KEY is None:
@@ -159,7 +169,7 @@ async def debug_symbol(request: web.Request):
     vol_data = scanner._24h_volumes.get(symbol)
     vol_change = None
     volume_reason = None
-
+    
     if vol_data is None:
         volume_reason = "24h volume never updated – ticker API call failed or not yet attempted"
     else:
@@ -172,7 +182,7 @@ async def debug_symbol(request: web.Request):
 
     # ---- DIAGNOSE KLINES NULL/ZERO REASONS ----
     klines_reason = None
-    if not klines:
+    if len(klines) == 0:
         if symbol not in scanner.kline_store or not scanner.kline_store.get(symbol):
             klines_reason = "Symbol not in kline_store – seed_klines_for_symbol never called or failed completely"
         elif tf not in scanner.kline_store.get(symbol, {}):
@@ -183,7 +193,7 @@ async def debug_symbol(request: web.Request):
     # compute macd via scanner wrapper (keeps identical behavior)
     try:
         macd_line, signal_line, hist = scanner.compute_macd_for(symbol, tf, include_price=last_price)
-    except Exception:
+    except Exception as e:
         logger.exception("MACD compute failed in debug endpoint for %s %s", symbol, tf)
         macd_line, signal_line, hist = None, None, None
 
@@ -207,8 +217,7 @@ async def debug_symbol(request: web.Request):
                     v = float(x)
                     if math.isnan(v):
                         continue
-                    if math.isfinite(v):
-                        hist_list.append(v)
+                    hist_list.append(v)
                 except Exception:
                     continue
     except Exception:
@@ -238,19 +247,17 @@ async def debug_symbol(request: web.Request):
     try:
         last_candles = scanner.kline_store.get(symbol, {}).get(tf, [])
         if last_candles:
-            start_at = last_candles[-1].get("start_at")
-            if start_at is not None:
-                start_at = int(start_at)
+            start_at = int(last_candles[-1].get("start_at") or 0)
     except Exception:
         start_at = None
-
     candle_age_ok = scanner._is_candle_age_acceptable(start_at, now)
-
+    
     candle_age_reason = None
     if start_at is None:
         candle_age_reason = "No candles in store – cannot determine age"
     elif not candle_age_ok:
-        age_sec = now - (start_at if start_at else now)
+        age_sec = now - start_at
+        # Use config constant rather than scanner._config (which does not exist)
         candle_age_reason = f"Candle too old: {age_sec:.0f} sec ago (max allowed: {FLIP_CANDLE_AGE_MAX_SEC} sec)"
     else:
         age_sec = now - start_at
@@ -277,12 +284,12 @@ async def debug_symbol(request: web.Request):
     # tv rating & mtf alignment
     try:
         tv_score, tv_label = scanner.compute_tv_rating(symbol, tf, price=last_price)
-    except Exception:
+    except Exception as e:
         tv_score, tv_label = 0.0, "Error"
-
+    
     try:
         mtf_align = scanner._compute_mtf_alignment(symbol, last_price or 0.0)
-    except Exception:
+    except Exception as e:
         mtf_align = {"status": "error", "tfs": {}, "negative_tfs": []}
 
     out = {
@@ -296,7 +303,7 @@ async def debug_symbol(request: web.Request):
         "klines_count": len(klines),
         "klines_reason": klines_reason,
         "last_candle_start_at": start_at,
-        "candle_age_seconds": (now - start_at) if start_at is not None else None,
+        "candle_age_seconds": (now - start_at) if start_at else None,
         "candle_age_ok": candle_age_ok,
         "candle_age_reason": candle_age_reason,
         "macd": {

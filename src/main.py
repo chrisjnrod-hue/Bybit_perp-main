@@ -11,7 +11,7 @@ import math
 from typing import Optional
 from aiohttp import web
 from .logger import get_logger
-from .scanner_service import Scanner
+from .scanner import Scanner
 from .ratelimiter import TokenBucket
 from .config import RATE_LIMIT_RPS, SIGNAL_DEDUP_WINDOW, FLIP_CANDLE_AGE_MAX_SEC
 
@@ -56,6 +56,11 @@ def _dedupe_peek(scanner: Scanner, symbol: str, tf: str, candle_open_time: Optio
 
 
 async def debug_symbols(request: web.Request):
+    """
+    Returns a summary of discovered symbols and kline counts cached in the scanner.
+    Requires DEBUG_API_KEY to be set (empty-string allows anonymous).
+    Usage: GET /debug/symbols?api_key=secret
+    """
     if DEBUG_API_KEY is None:
         return web.Response(status=404, text="Debug endpoint disabled. Set DEBUG_API_KEY env to enable ('' for anonymous or a secret).")
 
@@ -86,6 +91,12 @@ async def debug_symbols(request: web.Request):
 
 
 async def debug_seed_symbol(request: web.Request):
+    """
+    Trigger a background seed_klines_for_symbol(symbol) to populate kline cache.
+    Useful when a symbol shows 0 cached candles in the debug view.
+    Access control same as other debug endpoints.
+    Usage: GET /debug/seed/BTCUSDT?api_key=secret
+    """
     if DEBUG_API_KEY is None:
         return web.Response(status=404, text="Debug endpoint disabled. Set DEBUG_API_KEY env to enable ('' for anonymous or a secret).")
 
@@ -101,6 +112,7 @@ async def debug_seed_symbol(request: web.Request):
     if not scanner:
         return web.Response(status=500, text="Scanner not initialized")
 
+    # spawn background seeding so the request returns quickly
     try:
         asyncio.create_task(scanner.seed_klines_for_symbol(symbol))
         return web.json_response({"status": "seeding_started", "symbol": symbol})
@@ -111,13 +123,15 @@ async def debug_seed_symbol(request: web.Request):
 
 async def debug_symbol(request: web.Request):
     """
+    Debug endpoint with enhanced diagnostics for null values:
     GET /debug/symbol/{symbol}?tf=5&include_traces=1&api_key=...
-    Detailed diagnostics for last-price, volume, klines, MACD, flip/dedupe, tv rating, mtf alignment.
     """
+    # If disabled, return 404 to avoid accidental exposure
     if DEBUG_API_KEY is None:
         return web.Response(status=404, text="Debug endpoint disabled. Set DEBUG_API_KEY env to enable ('' for anonymous or a secret).")
 
     api_key = request.query.get("api_key", "")
+    # enforce key if DEBUG_API_KEY non-empty
     if DEBUG_API_KEY != "" and api_key != DEBUG_API_KEY:
         return web.Response(status=403, text="Forbidden - invalid debug api_key")
 
@@ -158,7 +172,7 @@ async def debug_symbol(request: web.Request):
 
     # ---- DIAGNOSE KLINES NULL/ZERO REASONS ----
     klines_reason = None
-    if len(klines) == 0:
+    if not klines:
         if symbol not in scanner.kline_store or not scanner.kline_store.get(symbol):
             klines_reason = "Symbol not in kline_store – seed_klines_for_symbol never called or failed completely"
         elif tf not in scanner.kline_store.get(symbol, {}):
@@ -166,13 +180,14 @@ async def debug_symbol(request: web.Request):
         else:
             klines_reason = f"TF '{tf}' seeded but returned 0 valid candles – API returned empty list, null closes, or normalization filtered all"
 
-    # compute macd via scanner wrapper
+    # compute macd via scanner wrapper (keeps identical behavior)
     try:
         macd_line, signal_line, hist = scanner.compute_macd_for(symbol, tf, include_price=last_price)
     except Exception:
+        logger.exception("MACD compute failed in debug endpoint for %s %s", symbol, tf)
         macd_line, signal_line, hist = None, None, None
 
-    # build cleaned hist_list (mirror scanner logic)
+    # build cleaned hist_list (mirror scanner logic: remove None/NaN/unconvertible)
     hist_list = []
     raw_len = 0
     try:
@@ -192,7 +207,8 @@ async def debug_symbol(request: web.Request):
                     v = float(x)
                     if math.isnan(v):
                         continue
-                    hist_list.append(v)
+                    if math.isfinite(v):
+                        hist_list.append(v)
                 except Exception:
                     continue
     except Exception:
@@ -222,16 +238,19 @@ async def debug_symbol(request: web.Request):
     try:
         last_candles = scanner.kline_store.get(symbol, {}).get(tf, [])
         if last_candles:
-            start_at = int(last_candles[-1].get("start_at") or 0)
+            start_at = last_candles[-1].get("start_at")
+            if start_at is not None:
+                start_at = int(start_at)
     except Exception:
         start_at = None
+
     candle_age_ok = scanner._is_candle_age_acceptable(start_at, now)
 
     candle_age_reason = None
     if start_at is None:
         candle_age_reason = "No candles in store – cannot determine age"
     elif not candle_age_ok:
-        age_sec = now - start_at
+        age_sec = now - (start_at if start_at else now)
         candle_age_reason = f"Candle too old: {age_sec:.0f} sec ago (max allowed: {FLIP_CANDLE_AGE_MAX_SEC} sec)"
     else:
         age_sec = now - start_at
@@ -277,7 +296,7 @@ async def debug_symbol(request: web.Request):
         "klines_count": len(klines),
         "klines_reason": klines_reason,
         "last_candle_start_at": start_at,
-        "candle_age_seconds": (now - start_at) if start_at else None,
+        "candle_age_seconds": (now - start_at) if start_at is not None else None,
         "candle_age_ok": candle_age_ok,
         "candle_age_reason": candle_age_reason,
         "macd": {
@@ -297,6 +316,7 @@ async def debug_symbol(request: web.Request):
     }
 
     if include_traces:
+        # include recent klines (trimmed for size)
         try:
             out["klines_sample"] = klines[-50:] if klines else []
         except Exception:
@@ -306,17 +326,21 @@ async def debug_symbol(request: web.Request):
 
 
 async def start_background_tasks(app: web.Application):
+    # Create scanner and run it in the background
     scanner = Scanner()
+    # Replace scanner rate limiter with one configured from env
     scanner.rate_limiter = TokenBucket(max(1.0, float(RATE_LIMIT_RPS)))
     scanner.client.rate_limiter = scanner.rate_limiter
     app["scanner"] = scanner
     app["scanner_task"] = asyncio.create_task(scanner.run())
     logger.info("Scanner task started")
 
+    # Log registered routes so we can confirm debug route is present
     try:
         routes_info = []
         for r in app.router.routes():
             try:
+                # route may have .method and .path attributes
                 method = getattr(r, "method", None) or getattr(r, "methods", None) or ""
                 path = getattr(r, "path", None) or (getattr(getattr(r, "resource", None), "canonical", None) if getattr(r, "resource", None) else None) or str(r)
                 routes_info.append(f"{method} {path}")
@@ -343,6 +367,7 @@ async def cleanup_background_tasks(app: web.Application):
 def make_app():
     app = web.Application()
     app.router.add_get("/", health)
+    # add debug routes (registered regardless; behavior controlled by DEBUG_API_KEY)
     app.router.add_get("/debug/symbol/{symbol}", debug_symbol)
     app.router.add_get("/debug/symbols", debug_symbols)
     app.router.add_get("/debug/seed/{symbol}", debug_seed_symbol)
@@ -356,10 +381,13 @@ def run():
     app = make_app()
 
     loop = asyncio.get_event_loop()
+
+    # handle signals gracefully
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(app, s)))
         except NotImplementedError:
+            # Windows or restricted environments may not support add_signal_handler
             pass
 
     web.run_app(app, host="0.0.0.0", port=port)

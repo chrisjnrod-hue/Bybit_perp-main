@@ -1,8 +1,10 @@
-# bybit_client.py - V5 API ONLY (cleaned/robust)
+# bybit_client.py - V5 API ONLY (updated: robust POST, optional v5 signing, improved parsing)
 import os
 import asyncio
 import json
 import time
+import hmac
+import hashlib
 from typing import List, Dict, Any, Optional
 from collections import defaultdict, deque
 
@@ -112,9 +114,72 @@ class BybitClient:
                 await asyncio.sleep(wait)
         return None
 
+    async def _post(self, path: str, json_payload: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Optional[Dict[str, Any]]:
+        """
+        POST helper with retries and optional Bybit v5 signing.
+        """
+        session = await self._session_obj()
+        url = self.rest_base + path
+        body_text = json.dumps(json_payload) if json_payload is not None else ""
+        for attempt in range(self._max_retries):
+            await self.rate_limiter.acquire()
+            headers = {"Content-Type": "application/json"}
+            # If API key/secret available, sign request (Bybit v5 style)
+            if self.api_key and self.api_secret:
+                try:
+                    timestamp = str(int(time.time() * 1000))
+                    method = "POST"
+                    # Prehash path should be the request path (not the full URL)
+                    prehash = timestamp + method + path + body_text
+                    signature = hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+                    headers.update({
+                        "X-BAPI-API-KEY": self.api_key,
+                        "X-BAPI-TIMESTAMP": timestamp,
+                        "X-BAPI-SIGN": signature,
+                    })
+                except Exception:
+                    logger.exception("Failed to sign request; continuing without signature")
+            try:
+                async with session.post(url, data=body_text.encode() if body_text else None, headers=headers, timeout=timeout) as resp:
+                    status = resp.status
+                    text = await resp.text()
+                    if status == 429 or (500 <= status < 600):
+                        wait = self._backoff_base * (2 ** attempt)
+                        logger.warning("HTTP %s from %s – backoff %.1fs (attempt %d/%d)", status, url, wait, attempt + 1, self._max_retries)
+                        await asyncio.sleep(wait)
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        snippet = (text[:2000] + '...') if len(text) > 2000 else text
+                        logger.warning("Bybit returned non-JSON (status=%s) from %s. Body:\n%s", status, url, snippet)
+                        return None
+                    if status >= 400:
+                        snippet = (text[:400] + '...') if len(text) > 400 else text
+                        logger.error("Bybit POST %s returned %s: %s", url, status, snippet)
+                        return None
+                    return data
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if attempt + 1 >= self._max_retries:
+                    logger.exception("POST %s failed after %d attempts: %s", url, attempt + 1, e)
+                    return None
+                wait = self._backoff_base * (2 ** attempt)
+                logger.warning("POST request error for %s: %s. Retrying in %.1fs (attempt %d/%d)", url, e, wait, attempt + 1, self._max_retries)
+                await asyncio.sleep(wait)
+        return None
+
+    # ===== V5 KLINES - NO V2 FALLBACK =====
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[Any]:
+        """
+        Get klines using v5 API ONLY.
+        Interval format: numeric ("5", "15", "60", "240") or "D" for daily.
+        """
         variants = []
         s = str(interval).strip().lower()
+
+        # Support both formats: "5" and "5m"
         if s.endswith("m"):
             variants.append(s)
             try:
@@ -127,23 +192,29 @@ class BybitClient:
                 variants.append(f"{int(s)}m")
             except Exception:
                 pass
+
         if s in ("1d", "d", "day", "D"):
             variants.extend(["D", "1d", "d"])
+
         seen = set()
         variants = [v for v in variants if not (v in seen or seen.add(v))]
 
         for iv in variants:
             try:
-                # include category param to be compatible with v5
+                # Add category param (required/expected by some Bybit V5 endpoints)
                 params = {"symbol": symbol, "interval": iv, "limit": limit, "category": "linear"}
                 logger.debug("[V5_KLINE_REQ] %s %s params=%s", symbol, iv, params)
                 data = await self._get("/v5/market/kline", params=params)
+
                 if not data:
                     logger.debug("[V5_KLINE] Empty response for %s %s (raw None/empty)", symbol, iv)
                     continue
+
+                # If API returned an error structure, surface it
                 if isinstance(data, dict) and data.get("ret_code", 0) != 0:
-                    logger.warning("[V5_KLINE] API returned error for %s %s: %s", symbol, iv, json.dumps(data)[:1000])
+                    logger.warning("[V5_KLINE] API returned error for %s %s: ret_code=%s ret_msg=%s", symbol, iv, data.get("ret_code"), data.get("ret_msg"))
                     continue
+
                 if isinstance(data, dict):
                     if "ret_code" in data and data.get("ret_code", 0) == 0 and "result" in data:
                         res = data["result"]
@@ -166,19 +237,26 @@ class BybitClient:
         return None
 
     async def get_latest_price(self, symbol: str) -> Optional[float]:
+        """Get latest price using v5 API only"""
         try:
             params = {"symbol": symbol}
             data = await self._get("/v5/market/tickers", params=params)
+
             if not isinstance(data, dict):
                 logger.warning("[PRICE] get_latest_price: response is not dict for %s", symbol)
                 return None
-            if data.get("ret_code") != 0:
+
+            # Check ret_code for API errors
+            if data.get("ret_code") is not None and data.get("ret_code") != 0:
                 logger.warning("[PRICE] get_latest_price: API error ret_code=%s for %s", data.get("ret_code"), symbol)
                 return None
-            result = data.get("result")
+
+            result = data.get("result") if isinstance(data, dict) else None
             if not result:
                 logger.warning("[PRICE] get_latest_price: no 'result' key in response for %s", symbol)
                 return None
+
+            # Normalize result shapes
             entry = None
             if isinstance(result, dict) and "list" in result:
                 lst = result["list"]
@@ -188,45 +266,60 @@ class BybitClient:
                 entry = result[0]
             elif isinstance(result, dict):
                 entry = result
+
             if not entry or not isinstance(entry, dict):
                 logger.warning("[PRICE] get_latest_price: could not extract entry from result for %s", symbol)
                 return None
-            price = entry.get("lastPrice") or entry.get("last_price")
+
+            # Extract price from the entry
+            price = entry.get("lastPrice") or entry.get("last_price") or entry.get("price")
             if price is None:
-                logger.warning("[PRICE] get_latest_price: no lastPrice field in entry for %s. Keys: %s", symbol, list(entry.keys())[:10])
+                logger.warning("[PRICE] get_latest_price: no lastPrice field in entry for %s. Keys: %s",
+                             symbol, list(entry.keys())[:10])
                 return None
+
             try:
                 price_float = float(price)
                 logger.debug("[PRICE] get_latest_price: %s = %.8f", symbol, price_float)
                 return price_float
             except (ValueError, TypeError) as e:
-                logger.warning("[PRICE] get_latest_price: could not convert lastPrice to float for %s: %s (value=%s)", symbol, e, price)
+                logger.warning("[PRICE] get_latest_price: could not convert lastPrice to float for %s: %s (value=%s)",
+                               symbol, e, price)
                 return None
+
         except Exception as e:
             logger.exception("[PRICE] get_latest_price error for %s: %s", symbol, e)
             return None
 
     async def get_24h_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch 24h ticker using v5 API only"""
         try:
             params = {"symbol": symbol, "category": "linear"}
             data = await self._get("/v5/market/tickers", params=params)
+
             if not isinstance(data, dict):
                 logger.warning("[TICKER] get_24h_ticker: response is not dict for %s", symbol)
                 return None
-            if data.get("ret_code") != 0:
+
+            if data.get("ret_code") is not None and data.get("ret_code") != 0:
                 logger.warning("[TICKER] get_24h_ticker: API error ret_code=%s for %s", data.get("ret_code"), symbol)
                 return None
+
             result = data.get("result")
             if not result:
                 logger.warning("[TICKER] get_24h_ticker: no 'result' key in response for %s", symbol)
                 return None
+
             entry = None
-            if isinstance(result, dict) and "list" in result and isinstance(result["list"], list) and len(result["list"]) > 0:
-                entry = result["list"][0]
-            elif isinstance(result, list) and result:
+            if isinstance(result, dict) and "list" in result:
+                lst = result["list"]
+                if isinstance(lst, list) and len(lst) > 0:
+                    entry = lst[0]
+            elif isinstance(result, list) and len(result) > 0:
                 entry = result[0]
             elif isinstance(result, dict):
                 entry = result
+
             if not entry or not isinstance(entry, dict):
                 logger.warning("[TICKER] get_24h_ticker: could not extract entry from result for %s", symbol)
                 return None
@@ -237,8 +330,8 @@ class BybitClient:
                 except Exception:
                     return None
 
-            vol24h = _f(entry.get("volume24h"))
-            turnover24h = _f(entry.get("turnover24h"))
+            vol24h = _f(entry.get("volume24h") or entry.get("volume"))
+            turnover24h = _f(entry.get("turnover24h") or entry.get("turnover"))
             price_pct = _f(entry.get("price24hPcnt"))
             prev_vol = _f(entry.get("prevVolume24h"))
 
@@ -246,7 +339,9 @@ class BybitClient:
             if vol24h is not None and prev_vol is not None and prev_vol > 0:
                 vol_pct = (vol24h - prev_vol) / prev_vol
 
-            logger.debug("[TICKER] get_24h_ticker: %s vol24h=%.0f turnover24h=%.0f vol_pct=%s", symbol, vol24h or 0, turnover24h or 0, vol_pct)
+            logger.debug("[TICKER] get_24h_ticker: %s vol24h=%s turnover24h=%s vol_pct=%s",
+                         symbol, vol24h or 0, turnover24h or 0, vol_pct)
+
             return {
                 "symbol": symbol,
                 "volume24h": vol24h,
@@ -256,14 +351,16 @@ class BybitClient:
                 "prevVolume24h": prev_vol,
                 "raw": entry,
             }
-        except Exception:
-            logger.exception("[TICKER] get_24h_ticker error for %s", symbol)
+        except Exception as e:
+            logger.exception("[TICKER] get_24h_ticker error for %s: %s", symbol, e)
             return None
 
     async def get_symbols(self) -> List[Dict[str, Any]]:
+        """Fetch all perpetual instruments using v5 API with pagination"""
         try:
             all_instruments = []
             cursor = None
+
             while True:
                 params = {
                     "category": "linear",
@@ -272,25 +369,32 @@ class BybitClient:
                 }
                 if cursor:
                     params["cursor"] = cursor
+
                 logger.info("[V5_SYMBOLS] Fetching page (cursor=%s)", cursor)
                 data = await self._get("/v5/market/instruments-info", params=params)
+
                 if not isinstance(data, dict):
                     logger.warning("[V5_SYMBOLS] Invalid response type: %s", type(data))
                     break
+
                 result = data.get("result", {})
                 instruments = result.get("list", [])
+
                 if instruments:
                     all_instruments.extend(instruments)
                     logger.info("[V5_SYMBOLS] Page returned %d instruments, total=%d", len(instruments), len(all_instruments))
+
                 cursor = result.get("nextPageCursor")
                 if not cursor:
                     break
+
             if all_instruments:
                 logger.info("[V5_SYMBOLS_SUCCESS] Found %d total instruments", len(all_instruments))
                 return all_instruments
             else:
                 logger.warning("[V5_SYMBOLS] No instruments found")
                 return []
+
         except Exception:
             logger.exception("[V5_SYMBOLS_ERROR] get_symbols failed")
             return []
@@ -300,6 +404,7 @@ class BybitClient:
             syms = await self.get_symbols()
             if not syms:
                 return {}
+
             target = None
             for it in syms:
                 if isinstance(it, dict):
@@ -307,18 +412,22 @@ class BybitClient:
                     if name and name.upper() == symbol.upper():
                         target = it
                         break
+
             if not target:
                 logger.warning("Symbol %s not found in instruments", symbol)
                 return {}
+
             info: Dict[str, Any] = {}
             if isinstance(target, dict):
                 step = None
                 min_qty = None
+
                 for key in ("lotSizeFilter", "priceFilter"):
                     filt = target.get(key)
                     if isinstance(filt, dict):
                         step = step or filt.get("qtyStep")
                         min_qty = min_qty or filt.get("minOrderQty")
+
                 try:
                     if step is not None:
                         step = float(step)
@@ -329,6 +438,7 @@ class BybitClient:
                         min_qty = float(min_qty)
                 except Exception:
                     min_qty = None
+
                 info["step"] = step
                 info["min_qty"] = min_qty
                 info["raw"] = target
@@ -338,6 +448,7 @@ class BybitClient:
             return {}
 
     async def get_balance(self, coin: str = "USDT") -> Optional[float]:
+        """Get wallet balance using v5 API"""
         try:
             params = {"coin": coin}
             data = await self._get("/v5/account/wallet-balance", params=params)
@@ -359,8 +470,9 @@ class BybitClient:
         return None
 
     async def create_order(self, symbol: str, side: str, qty: float, price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Create order using v5 API (POST). Returns result dict or None."""
         try:
-            params = {
+            payload = {
                 "category": "linear",
                 "symbol": symbol,
                 "side": side,
@@ -368,15 +480,19 @@ class BybitClient:
                 "qty": str(qty),
             }
             if price is not None:
-                params["price"] = str(price)
-            data = await self._get("/v5/order/create", params=params)
+                payload["price"] = str(price)
+
+            data = await self._post("/v5/order/create", json_payload=payload)
             if isinstance(data, dict) and data.get("ret_code") == 0:
                 return data.get("result")
+            # if API returned non-zero ret_code, log and return None
+            if isinstance(data, dict):
+                logger.warning("create_order failed: ret_code=%s ret_msg=%s", data.get("ret_code"), data.get("ret_msg"))
         except Exception:
             logger.exception("create_order error for %s %s %s", symbol, side, qty)
         return None
 
-    # WEBSOCKET helpers (kept robust and defensive)
+    # ===== WEBSOCKET =====
     def _candidate_topics(self, symbol: str, tf: str) -> List[str]:
         s = str(tf).strip().lower()
         variants = [s]
@@ -387,6 +503,7 @@ class BybitClient:
                 variants.append(str(int(s[:-1])))
         except Exception:
             pass
+
         tops = []
         for iv in variants:
             tops.extend([
@@ -394,6 +511,7 @@ class BybitClient:
                 f"klineV2.{iv}.{symbol}",
                 f"public.kline.{iv}.{symbol}",
             ])
+
         seen = set()
         out = []
         for t in tops:
@@ -474,6 +592,7 @@ class BybitClient:
                     return True
                 except Exception as e:
                     logger.debug("WS subscribe failed for %s: %s", topic, e)
+
         key = (symbol, tf)
         if key not in self._requested_subs:
             self._requested_subs.add(key)
@@ -490,10 +609,18 @@ class BybitClient:
                 except Exception:
                     pass
                 return
-            topic = msg.get("topic") or msg.get("arg")
+
+            topic = msg.get("topic")
+            # some bybit shapes put args.topic inside "arg" or "request"
+            if not topic:
+                arg = msg.get("arg") or msg.get("request")
+                if isinstance(arg, dict):
+                    topic = arg.get("topic") or arg.get("op")
             data = msg.get("data")
+
             if not data and isinstance(msg.get("result"), dict) and "data" in msg["result"]:
                 data = msg["result"]["data"]
+
             if topic and data:
                 parts = str(topic).split(".")
                 if len(parts) >= 3:
@@ -504,8 +631,10 @@ class BybitClient:
                         return
                     symbol = None
                     tf = None
+
                 if not symbol or not tf:
                     return
+
                 self._ensure_cache_slot(symbol, tf)
                 seq = data if isinstance(data, (list, tuple)) else [data]
                 for entry in seq:
@@ -556,14 +685,17 @@ class BybitClient:
                         self._ws_backoff = 1.0
                         connected = True
                         logger.info("WS connected to %s", ws_url)
+
                         pending = []
                         while not self._pending_subscribe.empty():
                             try:
                                 pending.append(self._pending_subscribe.get_nowait())
                             except Exception:
                                 break
+
                         for (sym, tf) in list(self._requested_subs):
                             pending.append(("subscribe", sym, tf))
+
                         for op, sym, tf in pending:
                             if op != "subscribe":
                                 continue
@@ -573,6 +705,7 @@ class BybitClient:
                                     logger.debug("WS subscribe: %s", topic)
                                 except Exception:
                                     logger.debug("Failed to subscribe to %s", topic, exc_info=True)
+
                         async def ping_loop():
                             try:
                                 while True:
@@ -583,7 +716,9 @@ class BybitClient:
                                         break
                             except asyncio.CancelledError:
                                 return
+
                         ping_task = asyncio.create_task(ping_loop())
+
                         async for raw in ws:
                             if raw.type == aiohttp.WSMsgType.TEXT:
                                 try:
@@ -597,10 +732,12 @@ class BybitClient:
                             elif raw.type == aiohttp.WSMsgType.CLOSED:
                                 logger.info("WS closed")
                                 break
+
                         try:
                             ping_task.cancel()
                         except Exception:
                             pass
+
                 except client_exceptions.WSServerHandshakeError as wh:
                     logger.warning("WS handshake failed for %s: %s", ws_url, wh)
                     continue
@@ -617,12 +754,15 @@ class BybitClient:
                     except Exception:
                         pass
                     self._ws = None
+
                 if connected:
                     break
+
             if not connected:
                 logger.error("All WS endpoints failed; backing off %.1fs", self._ws_backoff)
                 await asyncio.sleep(self._ws_backoff)
                 self._ws_backoff = min(self._ws_backoff * 2.0, 120.0)
+
         logger.info("WS loop exited")
 
     async def get_ws_klines(self, symbol: str, tf: str) -> List[Dict[str, Any]]:

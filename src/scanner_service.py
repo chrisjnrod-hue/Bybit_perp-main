@@ -322,6 +322,8 @@ class Scanner:
             logger.warning("SEED_KLINES_LIMIT is very low (%d); MACD requires >=26 for stability", SEED_KLINES_LIMIT)
 
         tfs = list(set(ROOT_TFS + MTF_TFS + MTF_ALIGN_TFS))
+        logger.info("[SEED_DIAG] %s: Starting seed for TFs: %s", symbol, tfs)
+        
         for tf in tfs:
             try:
                 logger.debug("seed_klines_for_symbol: requesting %s %s with limit=%d", symbol, tf, SEED_KLINES_LIMIT)
@@ -408,7 +410,27 @@ class Scanner:
                     klines_sorted = sorted(valid, key=lambda x: x.get("start_at") or 0)
                 except Exception:
                     klines_sorted = valid
+
+                # ===== CRITICAL: Ensure store entry exists before assignment =====
+                if symbol not in self.kline_store:
+                    logger.info("[SEED_DIAG] Creating kline_store entry for %s", symbol)
+                    self.kline_store[symbol] = {}
+                
+                logger.info("[SEED_DIAG_PRE_ASSIGN] %s %s: About to assign %d candles. Store state before: %s", 
+                           symbol, tf, len(klines_sorted), list(self.kline_store.get(symbol, {}).keys()))
+                
                 self.kline_store[symbol][tf] = klines_sorted
+                
+                logger.info("[SEED_DIAG_POST_ASSIGN] %s %s: Successfully assigned. Verifying...", symbol, tf)
+                
+                # ===== VERIFICATION: Immediately check what was stored =====
+                stored = self.kline_store.get(symbol, {}).get(tf, [])
+                logger.info("[SEED_DIAG_VERIFY] %s %s: Stored count=%d, matches=%s", 
+                           symbol, tf, len(stored), len(stored) == len(klines_sorted))
+                
+                if len(stored) != len(klines_sorted):
+                    logger.error("[SEED_DIAG_ERROR] %s %s: MISMATCH! Expected %d, got %d", 
+                               symbol, tf, len(klines_sorted), len(stored))
 
                 logger.warning("[SEED_COMPLETE] %s %s: seeded with %d candles", symbol, tf, len(klines_sorted))
 
@@ -844,7 +866,7 @@ class Scanner:
                         async with self.request_sem:
                             price = await self.client.get_latest_price(sym)
 
-                        # ===== CRITICAL FALLBACK: Extract price from cached klines if REST fails =====
+                        # ===== CRITICAL FALLBACK CHAIN: Extract price from multiple sources =====
                         if price is None:
                             logger.debug("[PRICE_FALLBACK] %s: REST get_latest_price returned None, trying kline fallback", sym)
                             try:
